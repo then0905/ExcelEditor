@@ -18,59 +18,103 @@ class DataManager:
 
     def _load_config(self, path):
         if not os.path.exists(path):
-            return {} # 回傳空字典，後續讀取 Excel 時會補上
-        with open(path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            return {} 
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            return {}
 
     def load_excel(self, file_path):
         self.excel_path = file_path
         xl = pd.ExcelFile(file_path)
-        self.need_config_alert = False # 重置標記
+        self.need_config_alert = False 
         
+        self.master_dfs = {}
+        self.sub_dfs = {}
+
         # 讀取 Sheet 名稱
         for sheet in xl.sheet_names:
             if sheet.endswith(".json"):
-                self.master_dfs[sheet] = pd.read_excel(xl, sheet).fillna("")
-                # 如果這個母表不在配置檔裡，建立預設配置
+                # 母表：強制轉字串
+                self.master_dfs[sheet] = pd.read_excel(xl, sheet, dtype=str).fillna("")
+                
+                # 初始化配置
                 if sheet not in self.config:
                     self.config[sheet] = {
-                        "classification_key": self.master_dfs[sheet].columns[0], # 預設第一欄
+                        "classification_key": self.master_dfs[sheet].columns[0],
                         "primary_key": self.master_dfs[sheet].columns[0],
                         "columns": {col: {"type": "string"} for col in self.master_dfs[sheet].columns},
                         "sub_sheets": {}
                     }
-                    self.need_config_alert = True # 觸發提醒
+                    self.need_config_alert = True 
+            
             elif "#" in sheet:
-                self.sub_dfs[sheet] = pd.read_excel(xl, sheet).fillna("")
+                self.sub_dfs[sheet] = pd.read_excel(xl, sheet, dtype=str).fillna("")
 
         if self.need_config_alert:
-            self.save_config() # 存下生成的預設檔
+            self.save_config() 
 
     def save_config(self):
         with open(self.config_path, 'w', encoding='utf-8') as f:
             json.dump(self.config, f, indent=4, ensure_ascii=False)
 
-    def _write_df_to_sheet(self, book, sheet_name, df):
-        # 如果 Sheet 不存在則建立，存在則清空內容重寫
-        if sheet_name not in book.sheetnames:
-            ws = book.create_sheet(sheet_name)
-        else:
-            ws = book[sheet_name]
-            ws.delete_rows(2, ws.max_row) # 保留標題列，刪除數據
-
-        # 寫入數據
-        for row in dataframe_to_rows(df, index=False, header=False):
-            ws.append(row)
-
+    def save_excel(self):
+        """ 儲存檔案 """
+        if not self.excel_path: return
+        
+        # 建立一個新的 Excel Writer
+        with pd.ExcelWriter(self.excel_path, engine='openpyxl') as writer:
+            # 寫入母表
+            for sheet, df in self.master_dfs.items():
+                df.to_excel(writer, sheet_name=sheet, index=False)
+            
+            # 寫入子表
+            for sheet, df in self.sub_dfs.items():
+                df.to_excel(writer, sheet_name=sheet, index=False)
+    
     def update_cell(self, is_sub, sheet_name, row_idx, col_name, value):
-        """ 當 UI 修改時呼叫此方法更新 DataFrame """
+        """ 
+        當 UI 修改時呼叫此方法更新 DataFrame 
+        修正：依照 Config 的設定來轉型，而不是依賴 DataFrame 原本的 type
+        """
         target_dict = self.sub_dfs if is_sub else self.master_dfs
+        
         if sheet_name in target_dict:
             df = target_dict[sheet_name]
-            # 確保型別正確 (簡單處理)
+            
+            # 依照 Config 決定儲存型別
             try:
-                if df[col_name].dtype == 'int64': value = int(value)
-                elif df[col_name].dtype == 'float64': value = float(value)
-            except:
-                pass 
+                # 取得該欄位的目標類型
+                col_type = "string"
+                
+                if not is_sub:
+                    # 母表配置
+                    if sheet_name in self.config:
+                        col_type = self.config[sheet_name]["columns"].get(col_name, {}).get("type", "string")
+                else:
+                    # 子表配置 (需解析 sheet_name: "Master#Sub")
+                    master_name = sheet_name.split("#")[0]
+                    sub_name = sheet_name.split("#")[1]
+                    if master_name in self.config:
+                         col_type = self.config[master_name]["sub_sheets"].get(sub_name, {}) \
+                                        .get("columns", {}).get(col_name, {}).get("type", "string")
+
+                # 進行轉型
+                if col_type == "int":
+                    value = int(value)
+                elif col_type == "float":
+                    value = float(value)
+                elif col_type == "bool":
+                    # 處理布林值的多種輸入可能
+                    if isinstance(value, str):
+                        value = value.lower() in ['true', '1', 'yes']
+                    else:
+                        value = bool(value)
+                        
+            except Exception as e:
+                # 轉型失敗就維持字串，避免崩潰
+                pass # print(f"轉型失敗: {col_name} -> {value} ({e})")
+            
+            # 更新 DataFrame
             df.at[row_idx, col_name] = value

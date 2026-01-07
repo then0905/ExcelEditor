@@ -50,8 +50,11 @@ class SheetEditor(ctk.CTkFrame):
         
         # 右下：子表資料 (Tabs)
         ctk.CTkLabel(self.frame_right, text="[子表資料]").pack(pady=2)
-        self.tab_sub_tables = ctk.CTkTabview(self.frame_right)
-        self.tab_sub_tables.pack(fill="both", expand=True, padx=5, pady=5)
+        self.scroll_tab_sub_tables_x = ctk.CTkScrollableFrame(self.frame_right,orientation="horizontal")
+        self.scroll_tab_sub_tables_x.pack(fill="both", expand=True, padx=5, pady=5)
+
+        self.scroll_tab_sub_tables_y = ctk.CTkScrollableFrame(self.scroll_tab_sub_tables_x, orientation="vertical")
+        self.scroll_tab_sub_tables_y.pack(fill="both", expand=True)
 
     def load_classification_list(self):
         """ 讀取分類欄位的唯一值 """
@@ -117,85 +120,95 @@ class SheetEditor(ctk.CTkFrame):
         self.load_sub_tables(current_pk)
 
     def load_sub_tables(self, master_id):
-        # 1. 安全刪除舊分頁 (防止 RuntimeError: dictionary changed size during iteration)
-        tab_names = list(self.tab_sub_tables._tab_dict.keys())
-        for t in tab_names: 
-            self.tab_sub_tables.delete(t)
-            
-        # 2. 找出關聯子表 (規則：母表名稱#子表名稱)
+        # 安全刪除舊分頁
+        for w in self.scroll_tab_sub_tables_x.winfo_children(): w.destroy()
+        
         related_sheets = [s for s in self.manager.sub_dfs if s.startswith(self.sheet_name + "#")]
-            
+        
         for sheet in related_sheets:
             short_name = sheet.split("#")[1]
-            self.tab_sub_tables.add(short_name)
-            tab = self.tab_sub_tables.tab(short_name)
-            
-            # --- 關鍵改進：加入支援雙向捲動的框架 ---
-            # orientation="both" 可確保欄位過多時出現橫向卷軸
-            scroll_container = ctk.CTkScrollableFrame(tab, orientation="both")
-            scroll_container.pack(fill="both", expand=True, padx=2, pady=2)
-
+        
             sub_df = self.manager.sub_dfs[sheet]
-            
-            # 取得該子表在配置檔中的定義
             sub_cfg = self.cfg.get("sub_sheets", {}).get(short_name, {})
             sub_cols_cfg = sub_cfg.get("columns", {})
-            
-            # 取得關聯鍵 (Foreign Key)，若未設定則預設使用母表的 PK
+        
+            # 取得關聯鍵
             fk = sub_cfg.get("foreign_key", self.pk_key)
-            
+        
             if fk not in sub_df.columns:
-                ctk.CTkLabel(scroll_container, text=f"錯誤: 子表找不到關聯欄位 {fk}", text_color="red").pack()
+                ctk.CTkLabel(self.scroll_tab_sub_tables_x, text=f"錯誤: 子表找不到關聯欄位 {fk}", text_color="red").pack()
                 continue
-                
-            filtered_rows = sub_df[sub_df[fk] == master_id]
+        
+            try:
+                mask = sub_df[fk].astype(str) == str(master_id)
+                filtered_rows = sub_df[mask]
+            except Exception as e:
+                print(f"篩選錯誤: {e}")
+                filtered_rows = sub_df.head(0)
+
             headers = list(sub_df.columns)
 
-            # --- 3. 繪製標題列 ---
-            # 使用固定寬度 width=120 確保標題與下方的輸入框對齊
-            h_frame = ctk.CTkFrame(scroll_container, fg_color="gray25")
-            h_frame.pack(fill="x", pady=(0, 5))
-            for h in headers:
-                ctk.CTkLabel(h_frame, text=h, width=120, font=("微軟正黑體", 12, "bold")).pack(side="left", padx=2)
+            # 預先計算每個欄位的寬度
+            import tkinter.font as tkfont
+            header_font = tkfont.Font(family="微軟正黑體", size=12, weight="bold")
+            scaling = self._get_widget_scaling()
+        
+            column_widths = {}
+            for col in headers:
+                text_width_pixels = header_font.measure(col)  # 測量欄位名稱
+                text_width_scaled = text_width_pixels / scaling
+                target_width = text_width_scaled * 1.1 + 10
+                column_widths[col] = max(120, int(target_width))  # 最小寬度 120
 
-            # --- 4. 繪製資料列 ---
+            # 標題列
+            h_frame = ctk.CTkFrame(self.scroll_tab_sub_tables_x, fg_color="gray25")
+            h_frame.pack(fill="x", pady=(0, 5))
+        
+            for col in headers:
+                label = ctk.CTkLabel(
+                    h_frame, 
+                    text=col, 
+                    width=column_widths[col],
+                    font=("微軟正黑體", 12, "bold")
+                )
+                label.pack(side="left", padx=5)
+
+            # 若無資料，顯示提示
+            if filtered_rows.empty:
+                ctk.CTkLabel(self.scroll_tab_sub_tables_x, text="(此項目無子表資料)", text_color="gray").pack(pady=10)
+
+            # 資料清單
             for s_idx, s_row in filtered_rows.iterrows():
-                r_frame = ctk.CTkFrame(scroll_container)
-                r_frame.pack(fill="x", pady=1)
-                
+                r_frame = ctk.CTkFrame(self.scroll_tab_sub_tables_x)
+                r_frame.pack(fill="x", pady=5)
+            
                 for col in headers:
                     val = s_row[col]
-                    # 取得子表特定欄位的配置類型
                     c_info = sub_cols_cfg.get(col, {"type": "string"})
                     col_type = c_info.get("type", "string")
-                    
-                    # 根據配置檔設定呈現不同的 UI 元件
+                
+                    target_width = column_widths[col]
+
                     if col_type == "enum":
-                        # 下拉選單
                         menu = ctk.CTkOptionMenu(
                             r_frame, 
                             values=c_info.get("options", ["None"]), 
-                            width=120,
+                            width=target_width,
                             command=lambda v, r=s_idx, c=col, s=sheet: self.manager.update_cell(True, s, r, c, v)
                         )
                         menu.set(str(val))
-                        menu.pack(side="left", padx=2)
-                        
+                        menu.pack(side="left", padx=5)
                     elif col_type == "bool":
-                        # 勾選框
                         var = ctk.BooleanVar(value=bool(val) if val != "" else False)
                         chk = ctk.CTkCheckBox(
-                            r_frame, text="", variable=var, width=120,
+                            r_frame, text="", variable=var, width=target_width,
                             command=lambda r=s_idx, c=col, s=sheet, v=var: self.manager.update_cell(True, s, r, c, v.get())
                         )
-                        chk.pack(side="left", padx=2)
-                        
+                        chk.pack(side="left", padx=5)
                     else:
-                        # 一般輸入框 (string, float, int)
                         var = ctk.StringVar(value=str(val))
-                        entry = ctk.CTkEntry(r_frame, textvariable=var, width=120)
-                        entry.pack(side="left", padx=2)
-                        # 即時監聽變更並更新至 DataManager
+                        entry = ctk.CTkEntry(r_frame, textvariable=var, width=target_width)
+                        entry.pack(side="left", padx=5)
                         var.trace_add("write", lambda *args, s=sheet, r=s_idx, c=col, v=var: self.manager.update_cell(True, s, r, c, v.get()))
 
 class ConfigEditorWindow(ctk.CTkToplevel):
