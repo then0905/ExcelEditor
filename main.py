@@ -377,7 +377,7 @@ class App(ctk.CTk):
 
     def refresh_ui(self):
         # 根據母表數量建立 Tabs
-        for tab_name in self.main_tabs._tab_dict:
+        for tab_name in list(self.main_tabs._tab_dict.keys()):
             self.main_tabs.delete(tab_name)
             
         for sheet_name in self.manager.master_dfs:
