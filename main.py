@@ -359,6 +359,7 @@ class App(ctk.CTk):
         
         ctk.CTkButton(self.top_bar, text="讀取 Excel", command=self.load_file).pack(side="left", padx=5)
         ctk.CTkButton(self.top_bar, text="儲存 Excel", command=self.save_file, fg_color="green").pack(side="left", padx=5)
+        ctk.CTkButton(self.top_bar, text="配置設定", command=self.open_configwnd, fg_color="gray").pack(side="right", padx=5)
 
         # 內容區 (Tabview 存放不同的母表)
         self.main_tabs = ctk.CTkTabview(self)
@@ -374,7 +375,7 @@ class App(ctk.CTk):
             # 關鍵：判斷是否需要提示使用者
             if self.manager.need_config_alert:
                 messagebox.showinfo("提示", "偵測到新資料表，請先設定【分類參數】與【欄位格式】")
-                config_win = ConfigEditorWindow(self, self.manager)
+                self.open_configwnd()
             else:
                 self.refresh_ui()
             
@@ -399,6 +400,12 @@ class App(ctk.CTk):
             # 實例化單一 Sheet 編輯器
             editor = SheetEditor(parent, sheet_name, self.manager)
             editor.pack(fill="both", expand=True)
+
+    def open_configwnd(self):
+        if not self.manager.master_dfs:
+            messagebox.showinfo("提示", "請先匯入Excel後再進行參數的配置")
+            return
+        _ = ConfigEditorWindow(self, self.manager)
 
 if __name__ == "__main__":
     app = App()
