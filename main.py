@@ -202,7 +202,14 @@ class ConfigEditorWindow(ctk.CTkToplevel):
     def __init__(self, parent, manager):
         super().__init__(parent)
         self.title("配置詳細設定")
-        self.geometry("900x700")
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+
+        # 視窗用螢幕的 85%
+        win_w = int(screen_w * 0.60)
+        win_h = int(screen_h * 0.50)
+
+        self.geometry(f"{win_w}x{win_h}")
         self.manager = manager
         self.grab_set() 
         
