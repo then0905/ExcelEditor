@@ -45,7 +45,7 @@ class SheetEditor(ctk.CTkFrame):
         
         # 右上：母表資料
         ctk.CTkLabel(self.frame_right, text="[母表資料]").pack(pady=2)
-        self.scroll_master_edit = ctk.CTkScrollableFrame(self.frame_right, height=300)
+        self.scroll_master_edit = ctk.CTkScrollableFrame(self.frame_right, height=150)
         self.scroll_master_edit.pack(fill="x", expand=False, padx=5, pady=5)
         
         # 右下：子表資料 (Tabs)
