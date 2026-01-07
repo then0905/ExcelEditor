@@ -47,14 +47,68 @@ class SheetEditor(ctk.CTkFrame):
         ctk.CTkLabel(self.frame_right, text="[母表資料]").pack(pady=2)
         self.scroll_master_edit = ctk.CTkScrollableFrame(self.frame_right, height=150)
         self.scroll_master_edit.pack(fill="x", expand=False, padx=5, pady=5)
-        
-        # 右下：子表資料 (Tabs)
-        ctk.CTkLabel(self.frame_right, text="[子表資料]").pack(pady=2)
-        self.scroll_tab_sub_tables_x = ctk.CTkScrollableFrame(self.frame_right,orientation="horizontal")
-        self.scroll_tab_sub_tables_x.pack(fill="both", expand=True, padx=5, pady=5)
 
-        self.scroll_tab_sub_tables_y = ctk.CTkScrollableFrame(self.scroll_tab_sub_tables_x, orientation="vertical")
-        self.scroll_tab_sub_tables_y.pack(fill="both", expand=True)
+        # 右下：子表資料
+        ctk.CTkLabel(self.frame_right, text="[子表資料]").pack(pady=2)
+
+        # 建立容器來放置捲軸和內容
+        scroll_container = ctk.CTkFrame(self.frame_right)
+        scroll_container.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # 建立 Canvas 作為可捲動區域
+        self.sub_tables_canvas = ctk.CTkCanvas(scroll_container, bg="#2b2b2b", highlightthickness=0)
+
+        # 建立垂直和水平捲軸
+        self.scroll_v = ctk.CTkScrollbar(
+            scroll_container, 
+            orientation="vertical", 
+            command=self.sub_tables_canvas.yview
+        )
+        self.scroll_h = ctk.CTkScrollbar(
+            scroll_container, 
+            orientation="horizontal", 
+            command=self.sub_tables_canvas.xview
+        )
+
+        # 配置 Canvas 捲軸
+        self.sub_tables_canvas.configure(
+            yscrollcommand=self.scroll_v.set,
+            xscrollcommand=self.scroll_h.set
+        )
+
+        # Pack 捲軸和 Canvas（順序很重要）
+        self.scroll_v.pack(side="right", fill="y")
+        self.scroll_h.pack(side="bottom", fill="x")
+        self.sub_tables_canvas.pack(side="left", fill="both", expand=True)
+
+        # 在 Canvas 內建立 Frame 來放置內容
+        self.scroll_tab_sub_tables = ctk.CTkFrame(self.sub_tables_canvas, fg_color="transparent")
+        self.canvas_frame = self.sub_tables_canvas.create_window(
+            (0, 0), 
+            window=self.scroll_tab_sub_tables, 
+            anchor="nw"
+        )
+
+        # 更新捲動區域的函數
+        def update_scroll_region(event=None):
+            self.sub_tables_canvas.update_idletasks()
+            # 取得內容的實際大小
+            bbox = self.sub_tables_canvas.bbox("all")
+            if bbox:
+                self.sub_tables_canvas.configure(scrollregion=bbox)
+
+        # 綁定配置事件
+        self.scroll_tab_sub_tables.bind("<Configure>", update_scroll_region)
+
+        # 綁定滑鼠滾輪事件
+        # def _on_mousewheel(event):
+        #     self.sub_tables_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+
+        # def _on_shift_mousewheel(event):
+        #     self.sub_tables_canvas.xview_scroll(int(-1*(event.delta/120)), "units")
+
+        # self.sub_tables_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        # self.sub_tables_canvas.bind_all("<Shift-MouseWheel>", _on_shift_mousewheel)
 
     def load_classification_list(self):
         """ 讀取分類欄位的唯一值 """
@@ -120,25 +174,29 @@ class SheetEditor(ctk.CTkFrame):
         self.load_sub_tables(current_pk)
 
     def load_sub_tables(self, master_id):
-        # 安全刪除舊分頁
-        for w in self.scroll_tab_sub_tables_x.winfo_children(): w.destroy()
-        
+        # 安全刪除舊內容
+        for w in self.scroll_tab_sub_tables.winfo_children(): 
+            w.destroy()
+    
         related_sheets = [s for s in self.manager.sub_dfs if s.startswith(self.sheet_name + "#")]
-        
+    
         for sheet in related_sheets:
             short_name = sheet.split("#")[1]
-        
+    
             sub_df = self.manager.sub_dfs[sheet]
             sub_cfg = self.cfg.get("sub_sheets", {}).get(short_name, {})
             sub_cols_cfg = sub_cfg.get("columns", {})
-        
-            # 取得關聯鍵
+    
             fk = sub_cfg.get("foreign_key", self.pk_key)
-        
+    
             if fk not in sub_df.columns:
-                ctk.CTkLabel(self.scroll_tab_sub_tables_x, text=f"錯誤: 子表找不到關聯欄位 {fk}", text_color="red").pack()
+                ctk.CTkLabel(
+                    self.scroll_tab_sub_tables,
+                    text=f"錯誤: 子表找不到關聯欄位 {fk}", 
+                    text_color="red"
+                ).pack(anchor="w")  # 改用 anchor
                 continue
-        
+    
             try:
                 mask = sub_df[fk].astype(str) == str(master_id)
                 filtered_rows = sub_df[mask]
@@ -148,22 +206,30 @@ class SheetEditor(ctk.CTkFrame):
 
             headers = list(sub_df.columns)
 
-            # 預先計算每個欄位的寬度
+            # 預先計算欄位寬度
             import tkinter.font as tkfont
             header_font = tkfont.Font(family="微軟正黑體", size=12, weight="bold")
             scaling = self._get_widget_scaling()
-        
+    
             column_widths = {}
+            total_width = 0  # 計算總寬度
             for col in headers:
-                text_width_pixels = header_font.measure(col)  # 測量欄位名稱
+                text_width_pixels = header_font.measure(col)
                 text_width_scaled = text_width_pixels / scaling
                 target_width = text_width_scaled * 1.1 + 10
-                column_widths[col] = max(120, int(target_width))  # 最小寬度 120
+                column_widths[col] = max(120, int(target_width))
+                total_width += column_widths[col] + 10  # 加上 padx
 
-            # 標題列
-            h_frame = ctk.CTkFrame(self.scroll_tab_sub_tables_x, fg_color="gray25")
-            h_frame.pack(fill="x", pady=(0, 5))
-        
+            # 標題列 - 不使用 fill="x"，改用固定寬度
+            h_frame = ctk.CTkFrame(
+                self.scroll_tab_sub_tables,
+                fg_color="gray25",
+                width=total_width,  # 設定固定寬度
+                height=40
+            )
+            h_frame.pack(anchor="w", pady=(0, 5))  # 改用 anchor="w"
+            h_frame.pack_propagate(False)  # 防止自動調整大小
+    
             for col in headers:
                 label = ctk.CTkLabel(
                     h_frame, 
@@ -173,20 +239,30 @@ class SheetEditor(ctk.CTkFrame):
                 )
                 label.pack(side="left", padx=5)
 
-            # 若無資料，顯示提示
+            # 若無資料
             if filtered_rows.empty:
-                ctk.CTkLabel(self.scroll_tab_sub_tables_x, text="(此項目無子表資料)", text_color="gray").pack(pady=10)
+                ctk.CTkLabel(
+                    self.scroll_tab_sub_tables,
+                    text="(此項目無子表資料)", 
+                    text_color="gray"
+                ).pack(anchor="w", pady=10)
+                continue
 
-            # 資料清單
+            # 資料列 - 同樣不使用 fill="x"
             for s_idx, s_row in filtered_rows.iterrows():
-                r_frame = ctk.CTkFrame(self.scroll_tab_sub_tables_x)
-                r_frame.pack(fill="x", pady=5)
-            
+                r_frame = ctk.CTkFrame(
+                    self.scroll_tab_sub_tables,
+                    width=total_width,  # 設定固定寬度
+                    height=40
+                )
+                r_frame.pack(anchor="w", pady=5)  # 改用 anchor="w"
+                r_frame.pack_propagate(False)  # 防止自動調整大小
+        
                 for col in headers:
                     val = s_row[col]
                     c_info = sub_cols_cfg.get(col, {"type": "string"})
                     col_type = c_info.get("type", "string")
-                
+            
                     target_width = column_widths[col]
 
                     if col_type == "enum":
@@ -210,6 +286,15 @@ class SheetEditor(ctk.CTkFrame):
                         entry = ctk.CTkEntry(r_frame, textvariable=var, width=target_width)
                         entry.pack(side="left", padx=5)
                         var.trace_add("write", lambda *args, s=sheet, r=s_idx, c=col, v=var: self.manager.update_cell(True, s, r, c, v.get()))
+    
+        # 強制更新捲動區域
+        self.scroll_tab_sub_tables.update_idletasks()
+        self.sub_tables_canvas.update_idletasks()
+    
+        # 手動設定 scrollregion
+        bbox = self.sub_tables_canvas.bbox("all")
+        if bbox:
+            self.sub_tables_canvas.configure(scrollregion=bbox)
 
 class ConfigEditorWindow(ctk.CTkToplevel):
     def __init__(self, parent, manager):
