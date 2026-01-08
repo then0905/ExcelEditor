@@ -51,6 +51,10 @@ class SheetEditor(ctk.CTkFrame):
         # 右下：子表資料
         ctk.CTkLabel(self.frame_right, text="[子表資料]").pack(pady=2)
 
+        # 建立 TabView 用於子表切換
+        self.sub_tables_tabs = ctk.CTkTabview(self.frame_right)
+        self.sub_tables_tabs.pack(fill="both", expand=True, padx=5, pady=5)
+
         # 建立容器來放置捲軸和內容
         scroll_container = ctk.CTkFrame(self.frame_right)
         scroll_container.pack(fill="both", expand=True, padx=5, pady=5)
@@ -174,29 +178,47 @@ class SheetEditor(ctk.CTkFrame):
         self.load_sub_tables(current_pk)
 
     def load_sub_tables(self, master_id):
-        # 安全刪除舊內容
-        for w in self.scroll_tab_sub_tables.winfo_children(): 
-            w.destroy()
+        # 1. 刪除所有舊的 Tab
+        for tab_name in list(self.sub_tables_tabs._tab_dict.keys()):
+            self.sub_tables_tabs.delete(tab_name)
     
         related_sheets = [s for s in self.manager.sub_dfs if s.startswith(self.sheet_name + "#")]
     
+        # 如果沒有子表，顯示提示
+        if not related_sheets:
+            self.sub_tables_tabs.add("無子表")
+            tab_frame = self.sub_tables_tabs.tab("無子表")
+            ctk.CTkLabel(
+                tab_frame,
+                text="此表單無子表資料",
+                text_color="gray"
+            ).pack(pady=20)
+            return
+    
+        # 2. 為每個子表建立一個 Tab
         for sheet in related_sheets:
             short_name = sheet.split("#")[1]
-    
+        
+            # 建立 Tab
+            self.sub_tables_tabs.add(short_name)
+            tab_frame = self.sub_tables_tabs.tab(short_name)
+        
+            # 取得子表資料和配置
             sub_df = self.manager.sub_dfs[sheet]
             sub_cfg = self.cfg.get("sub_sheets", {}).get(short_name, {})
             sub_cols_cfg = sub_cfg.get("columns", {})
-    
+        
+            # 取得關聯鍵
             fk = sub_cfg.get("foreign_key", self.pk_key)
-    
+        
             if fk not in sub_df.columns:
                 ctk.CTkLabel(
-                    self.scroll_tab_sub_tables,
+                    tab_frame,
                     text=f"錯誤: 子表找不到關聯欄位 {fk}", 
                     text_color="red"
-                ).pack(anchor="w")  # 改用 anchor
+                ).pack(pady=10)
                 continue
-    
+        
             try:
                 mask = sub_df[fk].astype(str) == str(master_id)
                 filtered_rows = sub_df[mask]
@@ -210,26 +232,43 @@ class SheetEditor(ctk.CTkFrame):
             import tkinter.font as tkfont
             header_font = tkfont.Font(family="微軟正黑體", size=12, weight="bold")
             scaling = self._get_widget_scaling()
-    
+        
             column_widths = {}
-            total_width = 0  # 計算總寬度
+            total_width = 0
             for col in headers:
                 text_width_pixels = header_font.measure(col)
                 text_width_scaled = text_width_pixels / scaling
                 target_width = text_width_scaled * 1.1 + 10
                 column_widths[col] = max(120, int(target_width))
-                total_width += column_widths[col] + 10  # 加上 padx
+                total_width += column_widths[col] + 10
 
-            # 標題列 - 不使用 fill="x"，改用固定寬度
+            # ========== 3. 標題列容器（固定在頂部，可水平捲動但不顯示捲軸）==========
+            header_scroll_container = ctk.CTkFrame(tab_frame)
+            header_scroll_container.pack(fill="x", pady=(0, 5))
+        
+            # 建立標題用的 Canvas（不建立捲軸）
+            header_canvas = ctk.CTkCanvas(
+                header_scroll_container, 
+                bg="#2b2b2b", 
+                highlightthickness=0,
+                height=50  # 固定標題區高度
+            )
+            header_canvas.pack(side="top", fill="x")
+        
+            # 標題內容 Frame
+            header_content = ctk.CTkFrame(header_canvas, fg_color="transparent")
+            header_canvas.create_window((0, 0), window=header_content, anchor="nw")
+        
+            # 繪製標題列
             h_frame = ctk.CTkFrame(
-                self.scroll_tab_sub_tables,
+                header_content,
                 fg_color="gray25",
-                width=total_width,  # 設定固定寬度
+                width=total_width,
                 height=40
             )
-            h_frame.pack(anchor="w", pady=(0, 5))  # 改用 anchor="w"
-            h_frame.pack_propagate(False)  # 防止自動調整大小
-    
+            h_frame.pack(anchor="w")
+            h_frame.pack_propagate(False)
+        
             for col in headers:
                 label = ctk.CTkLabel(
                     h_frame, 
@@ -237,32 +276,111 @@ class SheetEditor(ctk.CTkFrame):
                     width=column_widths[col],
                     font=("微軟正黑體", 12, "bold")
                 )
-                label.pack(side="left", padx=5)
+                label.pack(side="left", padx=5, pady=5)
+        
+            # 更新標題 Canvas 的 scrollregion
+            header_content.update_idletasks()
+            header_canvas.configure(scrollregion=header_canvas.bbox("all"))
 
-            # 若無資料
+            # ========== 4. 資料區容器（可雙向捲動）==========
+            data_scroll_container = ctk.CTkFrame(tab_frame)
+            data_scroll_container.pack(fill="both", expand=True)
+
+            # 建立資料用的 Canvas 和捲軸
+            data_canvas = ctk.CTkCanvas(
+                data_scroll_container, 
+                bg="#2b2b2b", 
+                highlightthickness=0
+            )
+        
+            data_scroll_v = ctk.CTkScrollbar(
+                data_scroll_container, 
+                orientation="vertical", 
+                command=data_canvas.yview
+            )
+            data_scroll_h = ctk.CTkScrollbar(
+                data_scroll_container, 
+                orientation="horizontal"
+            )
+        
+            data_canvas.configure(
+                yscrollcommand=data_scroll_v.set,
+                xscrollcommand=data_scroll_h.set
+            )
+        
+            # Pack 資料捲軸和 Canvas
+            data_scroll_v.pack(side="right", fill="y")
+            data_scroll_h.pack(side="bottom", fill="x")
+            data_canvas.pack(side="left", fill="both", expand=True)
+        
+            # 建立資料內容 Frame
+            data_content = ctk.CTkFrame(data_canvas, fg_color="transparent")
+            data_canvas_window = data_canvas.create_window((0, 0), window=data_content, anchor="nw")
+        
+            # 更新資料區捲動範圍
+            def make_update_scroll(canvas):
+                def update_scroll(event=None):
+                    canvas.update_idletasks()
+                    bbox = canvas.bbox("all")
+                    if bbox:
+                        canvas.configure(scrollregion=bbox)
+                return update_scroll
+        
+            data_content.bind("<Configure>", make_update_scroll(data_canvas))
+        
+            # ========== 5. 同步標題和資料的水平捲動（使用閉包捕獲各自的 canvas）==========
+            def make_sync_scroll_command(header_c, data_c):
+                def sync_command(*args):
+                    data_c.xview(*args)
+                    header_c.xview(*args)
+                return sync_command
+        
+            # 配置水平捲軸的 command
+            data_scroll_h.configure(command=make_sync_scroll_command(header_canvas, data_canvas))
+        
+            # ========== 6. 綁定滑鼠滾輪（只針對該 Tab 的 canvas，不使用 bind_all）==========
+            def make_mousewheel_handler(canvas):
+                def handler(event):
+                    canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+                return handler
+        
+            def make_shift_mousewheel_handler(header_c, data_c):
+                def handler(event):
+                    data_c.xview_scroll(int(-1*(event.delta/120)), "units")
+                    header_c.xview_scroll(int(-1*(event.delta/120)), "units")
+                return handler
+        
+            # 綁定到 data_canvas（不用 bind_all）
+            data_canvas.bind("<MouseWheel>", make_mousewheel_handler(data_canvas))
+            data_canvas.bind("<Shift-MouseWheel>", make_shift_mousewheel_handler(header_canvas, data_canvas))
+        
+            # 也綁定到 data_content 讓整個區域都能響應
+            data_content.bind("<MouseWheel>", make_mousewheel_handler(data_canvas))
+            data_content.bind("<Shift-MouseWheel>", make_shift_mousewheel_handler(header_canvas, data_canvas))
+
+            # ========== 7. 繪製資料列 ==========
             if filtered_rows.empty:
                 ctk.CTkLabel(
-                    self.scroll_tab_sub_tables,
-                    text="(此項目無子表資料)", 
+                    data_content,
+                    text="(此項目無資料)", 
                     text_color="gray"
                 ).pack(anchor="w", pady=10)
                 continue
 
-            # 資料列 - 同樣不使用 fill="x"
             for s_idx, s_row in filtered_rows.iterrows():
                 r_frame = ctk.CTkFrame(
-                    self.scroll_tab_sub_tables,
-                    width=total_width,  # 設定固定寬度
-                    height=40
+                    data_content,
+                    width=total_width,
+                    height=45
                 )
-                r_frame.pack(anchor="w", pady=5)  # 改用 anchor="w"
-                r_frame.pack_propagate(False)  # 防止自動調整大小
-        
+                r_frame.pack(anchor="w", pady=5)
+                r_frame.pack_propagate(False)
+            
                 for col in headers:
                     val = s_row[col]
                     c_info = sub_cols_cfg.get(col, {"type": "string"})
                     col_type = c_info.get("type", "string")
-            
+                
                     target_width = column_widths[col]
 
                     if col_type == "enum":
@@ -270,31 +388,31 @@ class SheetEditor(ctk.CTkFrame):
                             r_frame, 
                             values=c_info.get("options", ["None"]), 
                             width=target_width,
+                            height=35,
                             command=lambda v, r=s_idx, c=col, s=sheet: self.manager.update_cell(True, s, r, c, v)
                         )
                         menu.set(str(val))
-                        menu.pack(side="left", padx=5)
+                        menu.pack(side="left", padx=5, pady=5)
                     elif col_type == "bool":
                         var = ctk.BooleanVar(value=bool(val) if val != "" else False)
                         chk = ctk.CTkCheckBox(
                             r_frame, text="", variable=var, width=target_width,
+                            height=35,
                             command=lambda r=s_idx, c=col, s=sheet, v=var: self.manager.update_cell(True, s, r, c, v.get())
                         )
-                        chk.pack(side="left", padx=5)
+                        chk.pack(side="left", padx=5, pady=5)
                     else:
                         var = ctk.StringVar(value=str(val))
-                        entry = ctk.CTkEntry(r_frame, textvariable=var, width=target_width)
-                        entry.pack(side="left", padx=5)
+                        entry = ctk.CTkEntry(r_frame, textvariable=var, width=target_width, height=35)
+                        entry.pack(side="left", padx=5, pady=5)
                         var.trace_add("write", lambda *args, s=sheet, r=s_idx, c=col, v=var: self.manager.update_cell(True, s, r, c, v.get()))
-    
-        # 強制更新捲動區域
-        self.scroll_tab_sub_tables.update_idletasks()
-        self.sub_tables_canvas.update_idletasks()
-    
-        # 手動設定 scrollregion
-        bbox = self.sub_tables_canvas.bbox("all")
-        if bbox:
-            self.sub_tables_canvas.configure(scrollregion=bbox)
+        
+            # 更新資料區捲動範圍
+            data_content.update_idletasks()
+            data_canvas.update_idletasks()
+            bbox = data_canvas.bbox("all")
+            if bbox:
+                data_canvas.configure(scrollregion=bbox)
 
 class ConfigEditorWindow(ctk.CTkToplevel):
     def __init__(self, parent, manager):
