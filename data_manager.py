@@ -60,18 +60,30 @@ class DataManager:
             json.dump(self.config, f, indent=4, ensure_ascii=False)
 
     def save_excel(self):
-        """ 儲存檔案 """
-        if not self.excel_path: return
+        """ 儲存檔案，同時保留未被編輯的原始工作表 """
+        if not self.excel_path: 
+            return
         
-        # 建立一個新的 Excel Writer
-        with pd.ExcelWriter(self.excel_path, engine='openpyxl') as writer:
-            # 寫入母表
-            for sheet, df in self.master_dfs.items():
-                df.to_excel(writer, sheet_name=sheet, index=False)
-            
-            # 寫入子表
-            for sheet, df in self.sub_dfs.items():
-                df.to_excel(writer, sheet_name=sheet, index=False)
+        # 檢查檔案是否存在
+        if os.path.exists(self.excel_path):
+            # 使用 append 模式 ('a')，並設定如果工作表已存在則替換 ('replace')
+            # 這樣只會更新 master_dfs 和 sub_dfs 裡有的工作表，其餘的會被保留
+            with pd.ExcelWriter(self.excel_path, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+                self._write_to_sheets(writer)
+        else:
+            # 如果檔案不存在，則直接新建
+            with pd.ExcelWriter(self.excel_path, engine='openpyxl', mode='w') as writer:
+                self._write_to_sheets(writer)
+
+    def _write_to_sheets(self, writer):
+        """ 輔助方法：將 DataFrame 寫入工作表 """
+        # 寫入母表
+        for sheet, df in self.master_dfs.items():
+            df.to_excel(writer, sheet_name=sheet, index=False)
+        
+        # 寫入子表
+        for sheet, df in self.sub_dfs.items():
+            df.to_excel(writer, sheet_name=sheet, index=False)
     
     def update_cell(self, is_sub, sheet_name, row_idx, col_name, value):
         """ 
