@@ -42,6 +42,8 @@ class DataManager:
                 # 初始化配置
                 if sheet not in self.config:
                     self.config[sheet] = {
+                        "use_icon":"False",
+                        "image_path": "",
                         "classification_key": self.master_dfs[sheet].columns[0],
                         "primary_key": self.master_dfs[sheet].columns[0],
                         "columns": {col: {"type": "string"} for col in self.master_dfs[sheet].columns},

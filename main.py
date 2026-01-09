@@ -1,6 +1,8 @@
 import customtkinter as ctk
 from tkinter import messagebox, filedialog
 from data_manager import DataManager
+import os
+from PIL import Image
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
@@ -26,6 +28,7 @@ class SheetEditor(ctk.CTkFrame):
         self.current_cls_val = None      # 目前點選的分類
         self.current_master_idx = None   # 目前點選的母表 index
         self.current_master_pk = None    # 目前母表的 Primary Key (用於子表新增)
+        self.current_image_ref = None # 防止圖片被回收
 
         self.setup_layout()
         self.load_classification_list()
@@ -68,14 +71,14 @@ class SheetEditor(ctk.CTkFrame):
         
         # 右上：母表資料
         ctk.CTkLabel(self.frame_right, text="[母表資料]", font=("微軟正黑體", 12, "bold")).pack(pady=2)
-        self.scroll_master_edit = ctk.CTkScrollableFrame(self.frame_right, height=150)
-        self.scroll_master_edit.pack(fill="x", expand=False, padx=5, pady=5)
+        self.top_container = ctk.CTkFrame(self.frame_right, height=100, fg_color="transparent")
+        self.top_container.pack(fill="x", expand=False, padx=5, pady=5)
 
         # 右下：子表資料 (標題區含新增按鈕)
         sub_header_frame = ctk.CTkFrame(self.frame_right, fg_color="transparent")
         sub_header_frame.pack(fill="x", pady=2, padx=5)
         
-        ctk.CTkLabel(sub_header_frame, text="[子表資料]", font=("微軟正黑體", 12, "bold")).pack(side="left")
+        ctk.CTkLabel(sub_header_frame, text="[子表資料]", font=("微軟正黑體", 12, "bold")).pack(pady=2)
         # 子表新增按鈕
         ctk.CTkButton(sub_header_frame, text="+ 新增子表資料", width=100, height=24, fg_color="green", 
                       command=self.add_sub_item).pack(side="right")
@@ -126,7 +129,6 @@ class SheetEditor(ctk.CTkFrame):
         self.load_classification_list()
         # 清空右側
         for w in self.scroll_items.winfo_children(): w.destroy()
-        for w in self.scroll_master_edit.winfo_children(): w.destroy()
         self.load_sub_tables(None)
 
     def add_master_item(self):
@@ -169,7 +171,6 @@ class SheetEditor(ctk.CTkFrame):
         
         self.current_master_idx = None
         self.load_items_by_group(self.current_cls_val)
-        for w in self.scroll_master_edit.winfo_children(): w.destroy()
         self.load_sub_tables(None)
 
     def add_sub_item(self):
@@ -262,58 +263,106 @@ class SheetEditor(ctk.CTkFrame):
             btn.pack(fill="x", pady=2)
 
     def load_editor(self, row_idx):
-        """ 載入右側編輯區 """
-        self.current_master_idx = row_idx
+            self.current_master_idx = row_idx
         
-        # 刷新中間以顯示高亮
-        if self.current_cls_val:
-            # 為了效能這裡可以優化，但為了簡單先保留刷新
-            for widget in self.scroll_items.winfo_children():
-                # 簡單檢查按鈕文字或 command 來變色會比較快，但這裡直接重刷最穩
-                pass
-            self.load_items_by_group(self.current_cls_val)
+            # 1. 刷新清單高亮
+            if self.current_cls_val:
+                for child in self.scroll_items.winfo_children(): child.destroy() # 簡單暴力刷新
+                self.load_items_by_group(self.current_cls_val)
 
-        # 1. 清空舊 UI
-        for w in self.scroll_master_edit.winfo_children(): w.destroy()
+            # 2. 清空頂部容器
+            for w in self.top_container.winfo_children(): w.destroy()
         
-        if row_idx not in self.df.index: return # 防止刪除後的索引錯誤
+            if row_idx not in self.df.index: return 
+            row_data = self.df.loc[row_idx]
+            self.current_master_pk = row_data[self.pk_key]
 
-        # 2. 生成母表欄位
-        row_data = self.df.loc[row_idx]
-        self.current_master_pk = row_data[self.pk_key] # [新增功能] 記住 PK
-
-        cols_cfg = self.cfg.get("columns", {})
+            # 3. 讀取 Config 設定
+            # 注意：這裡假設 ConfigWindow 已經把 'use_icon' 和 'image_path' 寫入 manager.config[sheet_name]
+            # 或者如果是全域設定，可能是 manager.config['global']，這裡暫設為與 sheet 同級或上一層
+            # 為了保險，先從 sheet config 找，沒有再找全域 (如果有設計全域的話)
         
-        for col in self.df.columns:
-            f = ctk.CTkFrame(self.scroll_master_edit, fg_color="transparent")
-            f.pack(fill="x", pady=2)
-            ctk.CTkLabel(f, text=col, width=100, anchor="w").pack(side="left")
+            use_icon = self.cfg.get("use_icon", False)
+            img_base_path = self.cfg.get("image_path", "")
+
+            # 4. 建立編輯區容器 (scroll_master_edit)
+            # 如果要顯示圖片，把 top_container 分成左右兩邊
+        
+            edit_target_frame = None
+
+            if use_icon:
+                # --- 啟用圖片模式：左圖右文 ---
             
-            val = row_data[col]
-            col_type = cols_cfg.get(col, {}).get("type", "string")
+                # 左側圖片區塊
+                img_frame = ctk.CTkFrame(self.top_container, width=150, height=100)
+                img_frame.pack(side="left", fill="y", padx=(0, 5))
+                img_frame.pack_propagate(False) # 固定大小
             
-            # 建立輸入元件並綁定更新事件
-            if col_type == "bool":
-                var = ctk.BooleanVar(value=bool(val))
-                widget = ctk.CTkCheckBox(f, text="", variable=var, 
-                                         command=lambda c=col, v=var: self.manager.update_cell(False, self.sheet_name, row_idx, c, v.get()))
-                widget.pack(side="left")
-            elif col_type == "enum":
-                opts = cols_cfg.get(col, {}).get("options", [])
-                widget = ctk.CTkOptionMenu(f, values=opts, 
-                                           command=lambda v, c=col: self.manager.update_cell(False, self.sheet_name, row_idx, c, v))
-                widget.set(str(val))
-                widget.pack(side="left", fill="x", expand=True)
+                # 組出圖片路徑規則
+                # 分類是最後一層資料夾名稱
+                # 詳細清單名稱是檔名
+                img_folder = f"{img_base_path}/{self.current_cls_val}"
+                img_file = f"{self.current_master_pk}.png"
+            
+                img_label = ctk.CTkLabel(img_frame, text="No Image")
+                img_label.pack(expand=True)
+
+                if img_file and img_folder:
+                    full_path = os.path.join(img_folder, img_file)
+                
+                    if os.path.exists(full_path):
+                        try:
+                            pil_img = Image.open(full_path)
+                            # 保持比例縮放
+                            pil_img.thumbnail((128, 128)) 
+                            ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=pil_img.size)
+                        
+                            img_label.configure(image=ctk_img, text="")
+                            self.current_image_ref = ctk_img # 必須保留引用
+                        except Exception as e:
+                            img_label.configure(text="Error")
+                            print(f"Load Image Error: {e}")
+                    else:
+                        img_label.configure(text=f"File not found\n{img_file}")
+                else:
+                    img_label.configure(text="No Icon Col")
+
+                # 右側編輯區
+                edit_target_frame = ctk.CTkScrollableFrame(self.top_container, height=100)
+                edit_target_frame.pack(side="right", fill="both", expand=True)
+            
             else:
-                var = ctk.StringVar(value=str(val))
-                widget = ctk.CTkEntry(f, textvariable=var)
-                widget.pack(side="left", fill="x", expand=True)
-                # 使用 trace 監聽輸入變更
-                var.trace_add("write", lambda *args, c=col, v=var: self.manager.update_cell(False, self.sheet_name, row_idx, c, v.get()))
+                # --- 原始模式：全寬編輯 ---
+                edit_target_frame = ctk.CTkScrollableFrame(self.top_container, height=100)
+                edit_target_frame.pack(fill="both", expand=True)
 
-        # 3. 載入子表 (根據當前母表 ID)
-        current_pk = row_data[self.pk_key]
-        self.load_sub_tables(current_pk)
+            # 5. 生成欄位輸入框 (填入 edit_target_frame)
+            cols_cfg = self.cfg.get("columns", {})
+            for col in self.df.columns:
+                f = ctk.CTkFrame(edit_target_frame, fg_color="transparent")
+                f.pack(fill="x", pady=2)
+                ctk.CTkLabel(f, text=col, width=100, anchor="w").pack(side="left")
+            
+                val = row_data[col]
+                col_type = cols_cfg.get(col, {}).get("type", "string")
+            
+                if col_type == "bool":
+                    var = ctk.BooleanVar(value=bool(val))
+                    ctk.CTkCheckBox(f, text="", variable=var, 
+                                    command=lambda c=col, v=var: self.manager.update_cell(False, self.sheet_name, row_idx, c, v.get())).pack(side="left")
+                elif col_type == "enum":
+                    opts = cols_cfg.get(col, {}).get("options", [])
+                    w = ctk.CTkOptionMenu(f, values=opts, 
+                                          command=lambda v, c=col: self.manager.update_cell(False, self.sheet_name, row_idx, c, v))
+                    w.set(str(val))
+                    w.pack(side="left", fill="x", expand=True)
+                else:
+                    var = ctk.StringVar(value=str(val))
+                    ctk.CTkEntry(f, textvariable=var).pack(side="left", fill="x", expand=True)
+                    var.trace_add("write", lambda *args, c=col, v=var: self.manager.update_cell(False, self.sheet_name, row_idx, c, v.get()))
+
+            # 6. 載入子表
+            self.load_sub_tables(self.current_master_pk)
 
     def load_sub_tables(self, master_id):
         # 1. 刪除所有舊的 Tab
@@ -364,7 +413,7 @@ class SheetEditor(ctk.CTkFrame):
             for col in headers:
                 text_width_pixels = header_font.measure(col)
                 text_width_scaled = text_width_pixels / scaling
-                target_width = text_width_scaled * 1.1 + 10
+                target_width = text_width_scaled
                 column_widths[col] = max(120, int(target_width))
                 total_width += column_widths[col] + 10
 
@@ -372,13 +421,13 @@ class SheetEditor(ctk.CTkFrame):
             header_scroll_container = ctk.CTkFrame(tab_frame)
             header_scroll_container.pack(fill="x", pady=(0, 5))
             
-            header_canvas = ctk.CTkCanvas(header_scroll_container, bg="#2b2b2b", highlightthickness=0, height=50)
+            header_canvas = ctk.CTkCanvas(header_scroll_container, bg="#2b2b2b", highlightthickness=0, height=25)
             header_canvas.pack(side="top", fill="x")
             
             header_content = ctk.CTkFrame(header_canvas, fg_color="transparent")
             header_canvas.create_window((0, 0), window=header_content, anchor="nw")
             
-            h_frame = ctk.CTkFrame(header_content, fg_color="gray25", width=total_width, height=40)
+            h_frame = ctk.CTkFrame(header_content, fg_color="gray25", width=total_width, height=25)
             h_frame.pack(anchor="w")
             h_frame.pack_propagate(False)
             
@@ -447,7 +496,7 @@ class SheetEditor(ctk.CTkFrame):
                 continue
 
             for s_idx, s_row in filtered_rows.iterrows():
-                r_frame = ctk.CTkFrame(data_content, width=total_width, height=45)
+                r_frame = ctk.CTkFrame(data_content, width=total_width, height=25)
                 r_frame.pack(anchor="w", pady=5)
                 r_frame.pack_propagate(False)
                 
@@ -463,19 +512,19 @@ class SheetEditor(ctk.CTkFrame):
                     target_width = column_widths[col]
 
                     if col_type == "enum":
-                        menu = ctk.CTkOptionMenu(r_frame, values=c_info.get("options", ["None"]), width=target_width, height=35,
+                        menu = ctk.CTkOptionMenu(r_frame, values=c_info.get("options", ["None"]), width=target_width, height=25,
                                                  command=lambda v, r=s_idx, c=col, s=sheet: self.manager.update_cell(True, s, r, c, v))
                         menu.set(str(val))
-                        menu.pack(side="left", padx=5, pady=5)
+                        menu.pack(side="left", padx=5, pady=0)
                     elif col_type == "bool":
                         var = ctk.BooleanVar(value=bool(val) if val != "" else False)
-                        chk = ctk.CTkCheckBox(r_frame, text="", variable=var, width=target_width, height=35,
+                        chk = ctk.CTkCheckBox(r_frame, text="", variable=var, width=target_width, height=25,
                                               command=lambda r=s_idx, c=col, s=sheet, v=var: self.manager.update_cell(True, s, r, c, v.get()))
-                        chk.pack(side="left", padx=5, pady=5)
+                        chk.pack(side="left", padx=5, pady=0)
                     else:
                         var = ctk.StringVar(value=str(val))
-                        entry = ctk.CTkEntry(r_frame, textvariable=var, width=target_width, height=35)
-                        entry.pack(side="left", padx=5, pady=5)
+                        entry = ctk.CTkEntry(r_frame, textvariable=var, width=target_width, height=25)
+                        entry.pack(side="left", padx=5, pady=0)
                         var.trace_add("write", lambda *args, s=sheet, r=s_idx, c=col, v=var: self.manager.update_cell(True, s, r, c, v.get()))
             
             # 更新範圍
@@ -488,46 +537,129 @@ class ConfigEditorWindow(ctk.CTkToplevel):
     def __init__(self, parent, manager):
         super().__init__(parent)
         self.title("配置詳細設定")
+        self.manager = manager
+        self.grab_set()
+
+        # 固定視窗大小（你要可調就拿掉 resizable）
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
-
-        # 視窗用螢幕的 85%
         win_w = int(screen_w * 0.60)
         win_h = int(screen_h * 0.50)
-
         self.geometry(f"{win_w}x{win_h}")
-        self.manager = manager
-        self.grab_set() 
-        
-        # 標題
-        ctk.CTkLabel(self, text="偵測到資料表變動，請確認各表配置", font=("微軟正黑體", 16, "bold")).pack(pady=10)
+        self.resizable(False, False)
 
-        # 建立 Tabview
-        self.tab_view = ctk.CTkTabview(self)
-        self.tab_view.pack(fill="both", expand=True, padx=10, pady=10)
+        # === 整個視窗只用 grid ===
+        self.grid_rowconfigure(0, weight=0)  # Header
+        self.grid_rowconfigure(1, weight=1)  # Scroll 區（唯一會動）
+        self.grid_rowconfigure(2, weight=0)  # Footer
+        self.grid_columnconfigure(0, weight=1)
 
-        # 遍歷目前 DataManager 裡所有的母表資料
+        # ========= Header =========
+        header = ctk.CTkFrame(self)
+        header.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 5))
+        header.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            header,
+            text="偵測到資料表變動，請確認各表配置",
+            font=("微軟正黑體", 16, "bold")
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        # BooleanVar
+        self.var_use_icon = ctk.BooleanVar(
+            value=self.manager.config.get("use_icon", False)
+        )
+
+        icon_block = ctk.CTkFrame(header, fg_color="transparent")
+        icon_block.grid(row=1, column=0, sticky="w")
+
+        self.chk_use_icon = ctk.CTkCheckBox(
+            icon_block,
+            text="啟用圖示顯示 (需有 'Icon' 或 'Image' 欄位)",
+            variable=self.var_use_icon,
+            command=self.toggle_icon_input
+        )
+        self.chk_use_icon.grid(row=0, column=0, sticky="w")
+
+        self.frame_img_path = ctk.CTkFrame(icon_block, fg_color="transparent")
+        self.frame_img_path.grid(row=1, column=0, sticky="w", padx=20, pady=5)
+
+        ctk.CTkLabel(
+            self.frame_img_path,
+            text="圖片讀取路徑 (資料夾):"
+        ).grid(row=0, column=0, sticky="w")
+
+        self.entry_img_path = ctk.CTkEntry(self.frame_img_path, width=300)
+        self.entry_img_path.grid(row=0, column=1, padx=5)
+        self.entry_img_path.insert(
+            0, self.manager.config.get("image_path", "")
+        )
+        self.entry_img_path.bind("<KeyRelease>", self.on_image_path_change)
+
+
+        self.toggle_icon_input()
+
+        # ========= Center（唯一會伸縮） =========
+        center = ctk.CTkFrame(self)
+        center.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
+        center.grid_rowconfigure(0, weight=1)
+        center.grid_columnconfigure(0, weight=1)
+
+        self.tab_view = ctk.CTkTabview(center)
+        self.tab_view.grid(row=0, column=0, sticky="nsew")
+
+        # 建立每個母表 Tab
         for sheet_name in self.manager.master_dfs.keys():
-            # 確保 config 字典裡有這個 key，如果沒有才初始化
             if sheet_name not in self.manager.config:
                 self.manager.config[sheet_name] = {
-                    "classification_key": self.manager.master_dfs[sheet_name].columns[0],
-                    "primary_key": self.manager.master_dfs[sheet_name].columns[0],
-                    "columns": {col: {"type": "string"} for col in self.manager.master_dfs[sheet_name].columns},
+                    "use_icon": self.manager.master_dfs[sheet_name].use_icon,
+                    "image_path": self.manager.master_dfs[sheet_name].image_path,
+                    "classification_key": self.manager.master_dfs[sheet_name].classification_key,
+                    "primary_key": self.manager.master_dfs[sheet_name].primary_key,
+                    "columns": {
+                        col: {"type": "string"}
+                        for col in self.manager.master_dfs[sheet_name].columns
+                    },
                     "sub_sheets": {}
                 }
-            
+
             tab = self.tab_view.add(sheet_name)
             self.build_tab_content(tab, sheet_name)
 
-        # 底部按鈕
-        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.pack(fill="x", pady=10)
-        ctk.CTkButton(btn_frame, text="儲存配置並刷新介面", fg_color="#28a745", hover_color="#218838",
-                      command=self.save_and_close).pack(side="bottom", pady=5)
+        # ========= Footer =========
+        footer = ctk.CTkFrame(self)
+        footer.grid(row=2, column=0, sticky="ew", padx=10, pady=(5, 10))
+
+        ctk.CTkButton(
+            footer,
+            text="儲存配置並刷新介面",
+            fg_color="#28a745",
+            hover_color="#218838",
+            command=self.save_and_close
+        ).pack(pady=5)
+
+    # ================== UI 行為 ==================
+
+    def toggle_icon_input(self):
+        if hasattr(self, "tab_view"):
+            current_tab = self.tab_view.get()
+            self.manager.config[current_tab]["use_icon"] = self.var_use_icon.get()
+
+        if self.var_use_icon.get():
+            self.frame_img_path.grid()
+        else:
+            self.frame_img_path.grid_remove()
+
+    def on_image_path_change(self, event=None):
+        if hasattr(self, "tab_view"):
+            sheet_name = self.tab_view.get()
+            path = self.entry_img_path.get()
+
+            self.manager.config[sheet_name]["image_path"] = path
+
+    # ================== Tab 內容 ==================
 
     def build_tab_content(self, tab, sheet_name):
-        # 加入全域卷軸，解決你提到的「沒有卷軸」問題
         main_scroll = ctk.CTkScrollableFrame(tab)
         main_scroll.pack(fill="both", expand=True)
 
@@ -537,28 +669,47 @@ class ConfigEditorWindow(ctk.CTkToplevel):
         # --- 母表基本設定 ---
         base_frame = ctk.CTkFrame(main_scroll)
         base_frame.pack(fill="x", padx=5, pady=5)
-        
-        ctk.CTkLabel(base_frame, text="母表分類參數 (Classification):", font=("微軟正黑體", 12, "bold")).grid(row=0, column=0, padx=5, pady=5)
-        cls_menu = ctk.CTkOptionMenu(base_frame, values=all_cols,
-                                     command=lambda v: cfg.update({"classification_key": v}))
+
+        ctk.CTkLabel(
+            base_frame,
+            text="母表分類參數 (Classification):",
+            font=("微軟正黑體", 12, "bold")
+        ).grid(row=0, column=0, padx=5, pady=5)
+
+        cls_menu = ctk.CTkOptionMenu(
+            base_frame,
+            values=all_cols,
+            command=lambda v: cfg.update({"classification_key": v})
+        )
         cls_menu.set(cfg.get("classification_key", all_cols[0]))
         cls_menu.grid(row=0, column=1, padx=5, pady=5)
 
-        # --- 母表欄位格式設定 ---
-        ctk.CTkLabel(main_scroll, text="母表欄位類型設定", font=("微軟正黑體", 13, "bold"), text_color="#3B8ED0").pack(pady=5)
-        
+        # --- 母表欄位 ---
+        ctk.CTkLabel(
+            main_scroll,
+            text="母表欄位類型設定",
+            font=("微軟正黑體", 13, "bold"),
+            text_color="#3B8ED0"
+        ).pack(pady=5)
+
         for col in all_cols:
             line = ctk.CTkFrame(main_scroll, fg_color="transparent")
             line.pack(fill="x", padx=20, pady=1)
-            ctk.CTkLabel(line, text=col, width=150, anchor="w").pack(side="left")
-            
-            # 確保該欄位在 config 裡有配置
-            if col not in cfg["columns"]: cfg["columns"][col] = {"type": "string"}
-            
-            t_var = cfg["columns"][col].get("type", "string")
-            t_menu = ctk.CTkOptionMenu(line, values=["string", "float", "int", "bool", "enum"], width=100,
-                                       command=lambda v, c=col: self.set_col_type(sheet_name, c, v))
-            t_menu.set(t_var)
+
+            ctk.CTkLabel(
+                line, text=col, width=150, anchor="w"
+            ).pack(side="left")
+
+            if col not in cfg["columns"]:
+                cfg["columns"][col] = {"type": "string"}
+
+            t_menu = ctk.CTkOptionMenu(
+                line,
+                values=["string", "float", "int", "bool", "enum"],
+                width=100,
+                command=lambda v, c=col: self.set_col_type(sheet_name, c, v)
+            )
+            t_menu.set(cfg["columns"][col]["type"])
             t_menu.pack(side="right")
 
         # --- 子表欄位格式設定 ---
@@ -592,6 +743,8 @@ class ConfigEditorWindow(ctk.CTkToplevel):
                     st_menu.set(st_var)
                     st_menu.pack(side="right")
 
+    # ================== Config 操作 ==================
+
     def set_col_type(self, sheet_name, col, val):
         self.manager.config[sheet_name]["columns"][col]["type"] = val
         if val == "enum":
@@ -603,6 +756,10 @@ class ConfigEditorWindow(ctk.CTkToplevel):
         if val == "enum":
             res = ctk.CTkInputDialog(text=f"子表 {s_name} 欄位 {col} 選項:", title="Enum設定").get_input()
             if res: self.manager.config[m_name]["sub_sheets"][s_name]["columns"][col]["options"] = [x.strip() for x in res.split(",")]
+            res = ctk.CTkInputDialog(
+                text=f"請輸入 {col} 的選項(逗號隔開):",
+                title="Enum設定"
+            ).get_input()
 
     def save_and_close(self):
         self.manager.save_config()
