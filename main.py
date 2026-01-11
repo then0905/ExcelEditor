@@ -129,28 +129,48 @@ class SheetEditor(ctk.CTkFrame):
         self.load_sub_tables(None)
 
     def add_master_item(self):
-        """ 新增項目到當前分類 """
+        """ 新增項目到當前分類（插在該分類最後） """
         if not self.current_cls_val:
             messagebox.showwarning("提示", "請先選擇左側分類")
             return
-        
+
         dialog = ctk.CTkInputDialog(text="請輸入新項目 ID:", title="新增項目")
         new_id = dialog.get_input()
-        if not new_id: return
-        
+        if not new_id:
+            return
+
         if new_id in self.df[self.pk_key].astype(str).values:
             messagebox.showerror("錯誤", "ID 已存在")
             return
 
+        # 建立新列
         new_row = {col: "" for col in self.df.columns}
         new_row[self.cls_key] = self.current_cls_val
         new_row[self.pk_key] = new_id
-        
-        self.df = pd.concat([self.df, pd.DataFrame([new_row])], ignore_index=True)
+
+        # 找出該分類最後一筆的位置
+        cls_rows = self.df[self.df[self.cls_key] == self.current_cls_val]
+
+        if cls_rows.empty:
+            insert_idx = len(self.df)
+        else:
+            insert_idx = cls_rows.index.max() + 1
+
+        # 插入資料（不是 concat）
+        top = self.df.iloc[:insert_idx]
+        bottom = self.df.iloc[insert_idx:]
+
+        self.df = pd.concat(
+            [top, pd.DataFrame([new_row]), bottom],
+            ignore_index=True
+        )
+
         self.manager.master_dfs[self.sheet_name] = self.df
-        
+
+        # 重新載入該分類
         self.load_items_by_group(self.current_cls_val)
-        # 自動選取新增的那一筆
+
+        # 選取新增那筆
         new_idx = self.df[self.df[self.pk_key].astype(str) == str(new_id)].index[0]
         self.load_editor(new_idx)
 
@@ -171,32 +191,51 @@ class SheetEditor(ctk.CTkFrame):
         self.load_sub_tables(None)
 
     def add_sub_item(self):
-        """ 新增子表資料 """
+        """ 新增子表資料（插在該母表最後） """
         if self.current_master_pk is None:
             messagebox.showwarning("提示", "請先選擇母表資料")
             return
-        
+
         try:
             current_tab = self.sub_tables_tabs.get()
-        except: return
+        except:
+            return
 
-        if current_tab == "無子表": return
+        if current_tab == "無子表":
+            return
 
         full_sub_name = f"{self.sheet_name}#{current_tab}"
         sub_df = self.manager.sub_dfs.get(full_sub_name)
-        if sub_df is None: return
+        if sub_df is None:
+            return
 
         sub_cfg = self.cfg.get("sub_sheets", {}).get(current_tab, {})
         fk_key = sub_cfg.get("foreign_key", self.pk_key)
 
-        # 建立新列，自動填入 FK
+        # 建立新列
         new_row = {col: "" for col in sub_df.columns}
         new_row[fk_key] = self.current_master_pk
-        
-        sub_df = pd.concat([sub_df, pd.DataFrame([new_row])], ignore_index=True)
+
+        # 找出該母表最後一筆子資料的位置
+        siblings = sub_df[sub_df[fk_key] == self.current_master_pk]
+
+        if siblings.empty:
+            insert_idx = len(sub_df)
+        else:
+            insert_idx = siblings.index.max() + 1
+
+        # 插入資料
+        top = sub_df.iloc[:insert_idx]
+        bottom = sub_df.iloc[insert_idx:]
+
+        sub_df = pd.concat(
+            [top, pd.DataFrame([new_row]), bottom],
+            ignore_index=True
+        )
+
         self.manager.sub_dfs[full_sub_name] = sub_df
-        
-        # 重新載入並保持在當前 Tab
+
+        # 重新載入子表，停留在原 tab
         self.load_sub_tables(self.current_master_pk)
         self.sub_tables_tabs.set(current_tab)
 
