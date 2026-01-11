@@ -320,7 +320,22 @@ class SheetEditor(ctk.CTkFrame):
                             img_label.configure(text="Error")
                             print(f"Load Image Error: {e}")
                     else:
-                        img_label.configure(text=f"File not found\n{img_file}")
+                        # 圖片第二規則: 沒有加上分類的路徑
+                        full_path = os.path.join(f"{img_base_path}", img_file)
+                        if os.path.exists(full_path):
+                            try:
+                                pil_img = Image.open(full_path)
+                                # 保持比例縮放
+                                pil_img.thumbnail((128, 128))
+                                ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=pil_img.size)
+
+                                img_label.configure(image=ctk_img, text="")
+                                self.current_image_ref = ctk_img  # 必須保留引用
+                            except Exception as e:
+                                img_label.configure(text="Error")
+                                print(f"Load Image Error: {e}")
+                        else:
+                            img_label.configure(text=f"File not found\n{img_file}")
                 else:
                     img_label.configure(text="No Icon Col")
 
