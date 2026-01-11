@@ -537,7 +537,7 @@ class ConfigEditorWindow(ctk.CTkToplevel):
         self.manager = manager
         self.grab_set()
 
-        # 固定視窗大小
+        # ===== 視窗 =====
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
         win_w = int(screen_w * 0.60)
@@ -545,11 +545,8 @@ class ConfigEditorWindow(ctk.CTkToplevel):
         self.geometry(f"{win_w}x{win_h}")
         self.resizable(False, False)
 
-        # === 整個視窗只用 grid ===
-        self.grid_rowconfigure(0, weight=0)  # Header
-        self.grid_rowconfigure(1, weight=1)  # Scroll 區（唯一會動）
-        self.grid_rowconfigure(2, weight=0)  # Footer
         self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
 
         # ========= Header =========
         header = ctk.CTkFrame(self)
@@ -560,13 +557,13 @@ class ConfigEditorWindow(ctk.CTkToplevel):
             header,
             text="偵測到資料表變動，請確認各表配置",
             font=("微軟正黑體", 16, "bold")
-        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
-        self.var_use_icon = ctk.BooleanVar(
-            value=False
-        )
+        ).grid(row=0, column=0, sticky="w", pady=(0, 5))
+
+        # ========= 圖片設定（固定在上方，不進 Scroll） =========
+        self.var_use_icon = ctk.BooleanVar(value=False)
 
         icon_block = ctk.CTkFrame(header, fg_color="transparent")
-        icon_block.grid(row=1, column=0, sticky="w")
+        icon_block.grid(row=1, column=0, sticky="w", pady=(0, 5))
 
         self.chk_use_icon = ctk.CTkCheckBox(
             icon_block,
@@ -584,31 +581,28 @@ class ConfigEditorWindow(ctk.CTkToplevel):
             text="圖片讀取路徑 (資料夾):"
         ).grid(row=0, column=0, sticky="w")
 
-        self.entry_img_path = ctk.CTkEntry(self.frame_img_path, width=300)
+        self.entry_img_path = ctk.CTkEntry(self.frame_img_path, width=320)
         self.entry_img_path.grid(row=0, column=1, padx=5)
-        self.entry_img_path.insert(
-            0, ""
-        )
         self.entry_img_path.bind("<KeyRelease>", self.on_image_path_change)
 
-
-        self.toggle_icon_input()
-
-        # ========= Center（唯一會伸縮） =========
+        # ========= Tabs =========
         center = ctk.CTkFrame(self)
-        center.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
+        center.grid(row=2, column=0, sticky="nsew", padx=10, pady=5)
         center.grid_rowconfigure(0, weight=1)
         center.grid_columnconfigure(0, weight=1)
 
-        self.tab_view = ctk.CTkTabview(center)
+        self.tab_view = ctk.CTkTabview(
+            center,
+            command=self.on_tab_changed
+        )
         self.tab_view.grid(row=0, column=0, sticky="nsew")
 
-        # 建立每個母表 Tab
+        # ===== 初始化 config + Tabs =====
         for sheet_name in self.manager.master_dfs.keys():
             if sheet_name not in self.manager.config:
                 self.manager.config[sheet_name] = {
-                    "use_icon": self.manager.master_dfs[sheet_name].use_icon,
-                    "image_path": self.manager.master_dfs[sheet_name].image_path,
+                    "use_icon": False,
+                    "image_path": "",
                     "classification_key": self.manager.master_dfs[sheet_name].classification_key,
                     "primary_key": self.manager.master_dfs[sheet_name].primary_key,
                     "columns": {
@@ -621,12 +615,11 @@ class ConfigEditorWindow(ctk.CTkToplevel):
             tab = self.tab_view.add(sheet_name)
             self.build_tab_content(tab, sheet_name)
 
-        # 配置檔讀取完成 同步初始化一次圖片相關設定
-        self.sync_icon_setting_from_tab()
+        self.after(10, self.sync_icon_setting_from_tab)
 
         # ========= Footer =========
         footer = ctk.CTkFrame(self)
-        footer.grid(row=2, column=0, sticky="ew", padx=10, pady=(5, 10))
+        footer.grid(row=3, column=0, sticky="ew", padx=10, pady=(5, 10))
 
         ctk.CTkButton(
             footer,
@@ -636,33 +629,14 @@ class ConfigEditorWindow(ctk.CTkToplevel):
             command=self.save_and_close
         ).pack(pady=5)
 
-    # ================== UI 行為 ==================
+    # ================== 圖片設定同步 ==================
 
-    def toggle_icon_input(self):
-        if hasattr(self, "tab_view"):
-            current_tab = self.tab_view.get()
-            self.manager.config[current_tab]["use_icon"] = self.var_use_icon.get()
-
-        if self.var_use_icon.get():
-            self.frame_img_path.grid()
-        else:
-            self.frame_img_path.grid_remove()
-
-    def on_image_path_change(self, event=None):
-        if hasattr(self, "tab_view"):
-            sheet_name = self.tab_view.get()
-            path = self.entry_img_path.get()
-
-            self.manager.config[sheet_name]["image_path"] = path
+    def on_tab_changed(self):
+        self.sync_icon_setting_from_tab()
 
     def sync_icon_setting_from_tab(self):
-        """
-        在讀取配置檔後 同步初始化圖片相關設定
-        :return:
-        """
-
-        current_tab = self.tab_view.get()
-        cfg = self.manager.config.get(current_tab, {})
+        sheet = self.tab_view.get()
+        cfg = self.manager.config.get(sheet, {})
 
         self.var_use_icon.set(cfg.get("use_icon", False))
 
@@ -670,6 +644,19 @@ class ConfigEditorWindow(ctk.CTkToplevel):
         self.entry_img_path.insert(0, cfg.get("image_path", ""))
 
         self.toggle_icon_input()
+
+    def toggle_icon_input(self):
+        sheet = self.tab_view.get()
+        self.manager.config[sheet]["use_icon"] = self.var_use_icon.get()
+
+        if self.var_use_icon.get():
+            self.frame_img_path.grid()
+        else:
+            self.frame_img_path.grid_remove()
+
+    def on_image_path_change(self, event=None):
+        sheet = self.tab_view.get()
+        self.manager.config[sheet]["image_path"] = self.entry_img_path.get()
 
     # ================== Tab 內容 ==================
 
@@ -680,7 +667,7 @@ class ConfigEditorWindow(ctk.CTkToplevel):
         cfg = self.manager.config[sheet_name]
         all_cols = list(self.manager.master_dfs[sheet_name].columns)
 
-        # --- 母表基本設定 ---
+        # --- 母表設定 ---
         base_frame = ctk.CTkFrame(main_scroll)
         base_frame.pack(fill="x", padx=5, pady=5)
 
@@ -710,9 +697,7 @@ class ConfigEditorWindow(ctk.CTkToplevel):
             line = ctk.CTkFrame(main_scroll, fg_color="transparent")
             line.pack(fill="x", padx=20, pady=1)
 
-            ctk.CTkLabel(
-                line, text=col, width=150, anchor="w"
-            ).pack(side="left")
+            ctk.CTkLabel(line, text=col, width=150, anchor="w").pack(side="left")
 
             if col not in cfg["columns"]:
                 cfg["columns"][col] = {"type": "string"}
@@ -726,54 +711,61 @@ class ConfigEditorWindow(ctk.CTkToplevel):
             t_menu.set(cfg["columns"][col]["type"])
             t_menu.pack(side="right")
 
-        # --- 子表欄位格式設定 ---
+        # --- 子表 ---
         related_subs = [s for s in self.manager.sub_dfs if s.startswith(sheet_name + "#")]
         if related_subs:
-            ctk.CTkLabel(main_scroll, text="子表欄位類型設定", font=("微軟正黑體", 13, "bold"), text_color="#E38D2D").pack(pady=10)
-            
-            for sub_full_name in related_subs:
-                short_name = sub_full_name.split("#")[1]
+            ctk.CTkLabel(
+                main_scroll,
+                text="子表欄位類型設定",
+                font=("微軟正黑體", 13, "bold"),
+                text_color="#E38D2D"
+            ).pack(pady=10)
+
+            for sub_full in related_subs:
+                short = sub_full.split("#")[1]
                 sub_group = ctk.CTkFrame(main_scroll, border_width=1, border_color="gray")
                 sub_group.pack(fill="x", padx=10, pady=5)
-                
-                ctk.CTkLabel(sub_group, text=f"子表: {short_name}", font=("微軟正黑體", 12, "bold")).pack(anchor="w", padx=5)
-                
-                # 初始化子表配置結構
-                if short_name not in cfg["sub_sheets"]:
-                    cfg["sub_sheets"][short_name] = {"foreign_key": cfg["primary_key"], "columns": {}}
-                
-                sub_cols = list(self.manager.sub_dfs[sub_full_name].columns)
+
+                ctk.CTkLabel(
+                    sub_group, text=f"子表: {short}",
+                    font=("微軟正黑體", 12, "bold")
+                ).pack(anchor="w", padx=5)
+
+                if short not in cfg["sub_sheets"]:
+                    cfg["sub_sheets"][short] = {
+                        "foreign_key": cfg["primary_key"],
+                        "columns": {}
+                    }
+
+                sub_cols = list(self.manager.sub_dfs[sub_full].columns)
                 for s_col in sub_cols:
                     s_line = ctk.CTkFrame(sub_group, fg_color="transparent")
                     s_line.pack(fill="x", padx=15, pady=1)
-                    ctk.CTkLabel(s_line, text=s_col, width=150, anchor="w").pack(side="left")
-                    
-                    if s_col not in cfg["sub_sheets"][short_name]["columns"]:
-                        cfg["sub_sheets"][short_name]["columns"][s_col] = {"type": "string"}
-                    
-                    st_var = cfg["sub_sheets"][short_name]["columns"][s_col].get("type", "string")
-                    st_menu = ctk.CTkOptionMenu(s_line, values=["string", "float", "int", "bool", "enum"], width=100,
-                                                command=lambda v, sn=short_name, sc=s_col: self.set_sub_col_type(sheet_name, sn, sc, v))
-                    st_menu.set(st_var)
+
+                    ctk.CTkLabel(
+                        s_line, text=s_col, width=150, anchor="w"
+                    ).pack(side="left")
+
+                    if s_col not in cfg["sub_sheets"][short]["columns"]:
+                        cfg["sub_sheets"][short]["columns"][s_col] = {"type": "string"}
+
+                    st_menu = ctk.CTkOptionMenu(
+                        s_line,
+                        values=["string", "float", "int", "bool", "enum"],
+                        width=100,
+                        command=lambda v, sn=short, sc=s_col:
+                        self.set_sub_col_type(sheet_name, sn, sc, v)
+                    )
+                    st_menu.set(cfg["sub_sheets"][short]["columns"][s_col]["type"])
                     st_menu.pack(side="right")
 
     # ================== Config 操作 ==================
 
     def set_col_type(self, sheet_name, col, val):
         self.manager.config[sheet_name]["columns"][col]["type"] = val
-        if val == "enum":
-            res = ctk.CTkInputDialog(text=f"請輸入 {col} 的選項(逗號隔開):", title="Enum設定").get_input()
-            if res: self.manager.config[sheet_name]["columns"][col]["options"] = [x.strip() for x in res.split(",")]
 
-    def set_sub_col_type(self, m_name, s_name, col, val):
-        self.manager.config[m_name]["sub_sheets"][s_name]["columns"][col]["type"] = val
-        if val == "enum":
-            res = ctk.CTkInputDialog(text=f"子表 {s_name} 欄位 {col} 選項:", title="Enum設定").get_input()
-            if res: self.manager.config[m_name]["sub_sheets"][s_name]["columns"][col]["options"] = [x.strip() for x in res.split(",")]
-            res = ctk.CTkInputDialog(
-                text=f"請輸入 {col} 的選項(逗號隔開):",
-                title="Enum設定"
-            ).get_input()
+    def set_sub_col_type(self, m, s, col, val):
+        self.manager.config[m]["sub_sheets"][s]["columns"][col]["type"] = val
 
     def save_and_close(self):
         self.manager.save_config()
