@@ -1,0 +1,127 @@
+{
+    "SkillData.json": {
+        "classification_key": "Job",
+        "primary_key": "SkillID",
+        "columns": {
+            "SkillID": {
+                "type": "string"
+            },
+            "Job": {
+                "type": "string"
+            },
+            "Name": {
+                "type": "string"
+            },
+            "NeedLv": {
+                "type": "int"
+            },
+            "Characteristic": {
+                "type": "bool"
+            },
+            "CastMage": {
+                "type": "int"
+            },
+            "CD": {
+                "type": "float"
+            },
+            "ChantTime": {
+                "type": "float"
+            },
+            "AnimaTrigger": {
+                "type": "string"
+            },
+            "Type": {
+                "type": "string"
+            },
+            "Distance": {
+                "type": "float"
+            },
+            "Width": {
+                "type": "float"
+            },
+            "Height": {
+                "type": "float"
+            },
+            "CircleDistance": {
+                "type": "float"
+            },
+            "Damage": {
+                "type": "float"
+            },
+            "AdditionMode": {
+                "type": "string"
+            },
+            "Intro": {
+                "type": "string"
+            }
+        },
+        "sub_sheets": {
+            "Operation": {
+                "foreign_key": "SkillID",
+                "columns": {
+                    "SkillID": {
+                        "type": "string"
+                    },
+                    "SkillOperationDataList": {
+                        "type": "string"
+                    },
+                    "SkillComponentID": {
+                        "type": "enum",
+                        "options": [
+                            "Damage",
+                            "CrowdControl",
+                            "Debuff",
+                            "ContinuanceBuff",
+                            "PassiveBuff",
+                            "ElementDamage",
+                            "DotDamage",
+                            "Channeled",
+                            "Utility",
+                            "Teleportation",
+                            "Lunge",
+                            "Charge",
+                            "UpgradeSkill",
+                            "EnhanceSkill",
+                            "InheritDamage",
+                            "AdditiveBuff",
+                            "MultipleDamage",
+                            "Health"
+                        ]
+                    },
+                    "DependCondition": {
+                        "type": "string"
+                    },
+                    "EffectValue": {
+                        "type": "float"
+                    },
+                    "InfluenceStatus": {
+                        "type": "string"
+                    },
+                    "AddType": {
+                        "type": "string"
+                    },
+                    "ConditionOR$": {
+                        "type": "string"
+                    },
+                    "ConditionAND$": {
+                        "type": "string"
+                    },
+                    "EffectDurationTime": {
+                        "type": "float"
+                    },
+                    "EffectRecive": {
+                        "type": "int"
+                    },
+                    "TargetCount": {
+                        "type": "int"
+                    },
+                    "Bonus$": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "use_icon": true,
+        "image_path": "skill_icon/Icon/"
+    }
+}
