@@ -3,14 +3,11 @@ from tkinter import messagebox, filedialog
 from data_manager import DataManager
 import os
 from PIL import Image
+import pandas as pd
+import tkinter.font as tkfont
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
-
-import customtkinter as ctk
-from tkinter import messagebox, filedialog
-import pandas as pd
-import tkinter.font as tkfont
 
 class SheetEditor(ctk.CTkFrame):
     """ 單一母表的編輯介面 (包含左中右佈局) """
@@ -540,7 +537,7 @@ class ConfigEditorWindow(ctk.CTkToplevel):
         self.manager = manager
         self.grab_set()
 
-        # 固定視窗大小（你要可調就拿掉 resizable）
+        # 固定視窗大小
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
         win_w = int(screen_w * 0.60)
@@ -564,10 +561,8 @@ class ConfigEditorWindow(ctk.CTkToplevel):
             text="偵測到資料表變動，請確認各表配置",
             font=("微軟正黑體", 16, "bold")
         ).grid(row=0, column=0, sticky="w", pady=(0, 8))
-
-        # BooleanVar
         self.var_use_icon = ctk.BooleanVar(
-            value=self.manager.config.get("use_icon", False)
+            value=False
         )
 
         icon_block = ctk.CTkFrame(header, fg_color="transparent")
@@ -592,7 +587,7 @@ class ConfigEditorWindow(ctk.CTkToplevel):
         self.entry_img_path = ctk.CTkEntry(self.frame_img_path, width=300)
         self.entry_img_path.grid(row=0, column=1, padx=5)
         self.entry_img_path.insert(
-            0, self.manager.config.get("image_path", "")
+            0, ""
         )
         self.entry_img_path.bind("<KeyRelease>", self.on_image_path_change)
 
@@ -626,6 +621,9 @@ class ConfigEditorWindow(ctk.CTkToplevel):
             tab = self.tab_view.add(sheet_name)
             self.build_tab_content(tab, sheet_name)
 
+        # 配置檔讀取完成 同步初始化一次圖片相關設定
+        self.sync_icon_setting_from_tab()
+
         # ========= Footer =========
         footer = ctk.CTkFrame(self)
         footer.grid(row=2, column=0, sticky="ew", padx=10, pady=(5, 10))
@@ -656,6 +654,22 @@ class ConfigEditorWindow(ctk.CTkToplevel):
             path = self.entry_img_path.get()
 
             self.manager.config[sheet_name]["image_path"] = path
+
+    def sync_icon_setting_from_tab(self):
+        """
+        在讀取配置檔後 同步初始化圖片相關設定
+        :return:
+        """
+
+        current_tab = self.tab_view.get()
+        cfg = self.manager.config.get(current_tab, {})
+
+        self.var_use_icon.set(cfg.get("use_icon", False))
+
+        self.entry_img_path.delete(0, "end")
+        self.entry_img_path.insert(0, cfg.get("image_path", ""))
+
+        self.toggle_icon_input()
 
     # ================== Tab 內容 ==================
 
