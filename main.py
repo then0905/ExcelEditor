@@ -17,11 +17,11 @@ class SheetEditor(ctk.CTkFrame):
         self.manager = manager
         self.df = manager.master_dfs[sheet_name]
         self.cfg = manager.config.get(sheet_name, {})
-        
+
         # 取得關鍵欄位
         self.cls_key = self.cfg.get("classification_key", self.df.columns[0])
         self.pk_key = self.cfg.get("primary_key", self.df.columns[0])
-        
+
         self.current_cls_val = None      # 目前點選的分類
         self.current_master_idx = None   # 目前點選的母表 index
         self.current_master_pk = None    # 目前母表的 Primary Key (用於子表新增)
@@ -37,11 +37,11 @@ class SheetEditor(ctk.CTkFrame):
         # --- 左區：分類 (如職業) ---
         self.frame_left = ctk.CTkFrame(self, width=150)
         self.frame_left.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
-        
+
         ctk.CTkLabel(self.frame_left, text=f"分類: {self.cls_key}", font=("微軟正黑體", 12, "bold")).pack(pady=5)
         self.scroll_cls = ctk.CTkScrollableFrame(self.frame_left)
         self.scroll_cls.pack(fill="both", expand=True)
-        
+
         # 左側操作按鈕
         btn_box_left = ctk.CTkFrame(self.frame_left, height=40, fg_color="transparent")
         btn_box_left.pack(fill="x", pady=5, padx=2)
@@ -51,7 +51,7 @@ class SheetEditor(ctk.CTkFrame):
         # --- 中區：項目清單 (如技能) ---
         self.frame_mid = ctk.CTkFrame(self, width=200)
         self.frame_mid.grid(row=0, column=1, sticky="nsew", padx=2, pady=2)
-        
+
         ctk.CTkLabel(self.frame_mid, text="清單", font=("微軟正黑體", 12, "bold")).pack(pady=5)
         self.scroll_items = ctk.CTkScrollableFrame(self.frame_mid)
         self.scroll_items.pack(fill="both", expand=True)
@@ -65,7 +65,7 @@ class SheetEditor(ctk.CTkFrame):
         # --- 右區：編輯區 (上:母表 / 下:子表) ---
         self.frame_right = ctk.CTkFrame(self)
         self.frame_right.grid(row=0, column=2, sticky="nsew", padx=2, pady=2)
-        
+
         # 右上：母表資料
         ctk.CTkLabel(self.frame_right, text="[母表資料]", font=("微軟正黑體", 12, "bold")).pack(pady=2)
         self.top_container = ctk.CTkFrame(self.frame_right, height=100, fg_color="transparent")
@@ -74,10 +74,10 @@ class SheetEditor(ctk.CTkFrame):
         # 右下：子表資料 (標題區含新增按鈕)
         sub_header_frame = ctk.CTkFrame(self.frame_right, fg_color="transparent")
         sub_header_frame.pack(fill="x", pady=2, padx=5)
-        
+
         ctk.CTkLabel(sub_header_frame, text="[子表資料]", font=("微軟正黑體", 12, "bold")).pack(pady=2)
         # 子表新增按鈕
-        ctk.CTkButton(sub_header_frame, text="+ 新增子表資料", width=100, height=24, fg_color="green", 
+        ctk.CTkButton(sub_header_frame, text="+ 新增子表資料", width=100, height=24, fg_color="green",
                       command=self.add_sub_item).pack(side="right")
 
         # 建立 TabView 用於子表切換
@@ -93,7 +93,7 @@ class SheetEditor(ctk.CTkFrame):
         dialog = ctk.CTkInputDialog(text="請輸入新分類名稱:", title="新增分類")
         new_cls = dialog.get_input()
         if not new_cls: return
-        
+
         dialog_id = ctk.CTkInputDialog(text="請輸入第一筆資料的 ID (Key):", title="初始資料")
         new_id = dialog_id.get_input()
         if not new_id: return
@@ -106,7 +106,7 @@ class SheetEditor(ctk.CTkFrame):
         new_row = {col: "" for col in self.df.columns}
         new_row[self.cls_key] = new_cls
         new_row[self.pk_key] = new_id
-        
+
         self.df = pd.concat([self.df, pd.DataFrame([new_row])], ignore_index=True)
         self.manager.master_dfs[self.sheet_name] = self.df
         self.load_classification_list()
@@ -116,11 +116,11 @@ class SheetEditor(ctk.CTkFrame):
         """ 刪除選取的分類 """
         if not self.current_cls_val: return
         if not messagebox.askyesno("刪除確認", f"確定要刪除分類 [{self.current_cls_val}] 及其下所有資料嗎？"): return
-        
+
         self.df = self.df[self.df[self.cls_key] != self.current_cls_val]
         self.df.reset_index(drop=True, inplace=True) # 重置索引
         self.manager.master_dfs[self.sheet_name] = self.df
-        
+
         self.current_cls_val = None
         self.current_master_idx = None
         self.load_classification_list()
@@ -176,16 +176,16 @@ class SheetEditor(ctk.CTkFrame):
 
     def delete_master_item(self):
         """ 刪除選取的項目 """
-        if self.current_master_idx is None: 
+        if self.current_master_idx is None:
             messagebox.showwarning("提示", "請先選擇要刪除的項目")
             return
-        
+
         if not messagebox.askyesno("刪除確認", "確定要刪除此筆資料嗎？"): return
 
         self.df.drop(self.current_master_idx, inplace=True)
         self.df.reset_index(drop=True, inplace=True)
         self.manager.master_dfs[self.sheet_name] = self.df
-        
+
         self.current_master_idx = None
         self.load_items_by_group(self.current_cls_val)
         self.load_sub_tables(None)
@@ -253,8 +253,8 @@ class SheetEditor(ctk.CTkFrame):
         except: current_tab = None
 
         self.load_sub_tables(self.current_master_pk)
-        
-        if current_tab: 
+
+        if current_tab:
             try: self.sub_tables_tabs.set(current_tab)
             except: pass
 
@@ -263,7 +263,7 @@ class SheetEditor(ctk.CTkFrame):
     def load_classification_list(self):
         """ 讀取分類欄位的唯一值 """
         for w in self.scroll_cls.winfo_children(): w.destroy()
-        
+
         groups = self.df[self.cls_key].unique()
         for g in groups:
             # [微調] 增加選取的高亮邏輯
@@ -281,14 +281,16 @@ class SheetEditor(ctk.CTkFrame):
         self.load_classification_list() # 刷新左側以更新高亮
 
         for widget in self.scroll_items.winfo_children(): widget.destroy()
-        
+
         # 篩選資料
         filter_df = self.df[self.df[self.cls_key] == group_val]
-        
+
         for idx, row in filter_df.iterrows():
+            text_dict_name = self.manager.text_dict.get(row['Name'])
             display_name = f"{row[self.pk_key]}"
-            if "Name" in row: display_name += f" | {row['Name']}"
-            
+            if text_dict_name:
+                display_name = text_dict_name["value"]
+
             # [微調] 增加選取的高亮邏輯
             fg_color = "gray"
             if idx == self.current_master_idx:
@@ -300,7 +302,7 @@ class SheetEditor(ctk.CTkFrame):
 
     def load_editor(self, row_idx):
             self.current_master_idx = row_idx
-        
+
             # 1. 刷新清單高亮
             if self.current_cls_val:
                 for child in self.scroll_items.winfo_children(): child.destroy() # 簡單暴力刷新
@@ -308,8 +310,8 @@ class SheetEditor(ctk.CTkFrame):
 
             # 2. 清空頂部容器
             for w in self.top_container.winfo_children(): w.destroy()
-        
-            if row_idx not in self.df.index: return 
+
+            if row_idx not in self.df.index: return
             row_data = self.df.loc[row_idx]
             self.current_master_pk = row_data[self.pk_key]
 
@@ -317,7 +319,7 @@ class SheetEditor(ctk.CTkFrame):
             # 注意：這裡假設 ConfigWindow 已經把 'use_icon' 和 'image_path' 寫入 manager.config[sheet_name]
             # 或者如果是全域設定，可能是 manager.config['global']，這裡暫設為與 sheet 同級或上一層
             # 為了保險，先從 sheet config 找，沒有再找全域 (如果有設計全域的話)
-        
+
             use_icon = self.cfg.get("use_icon", False)
             img_base_path = self.cfg.get("image_path", "")
 
@@ -328,31 +330,31 @@ class SheetEditor(ctk.CTkFrame):
 
             if use_icon:
                 # --- 啟用圖片模式：左圖右文 ---
-            
+
                 # 左側圖片區塊
                 img_frame = ctk.CTkFrame(self.top_container, width=150, height=100)
                 img_frame.pack(side="left", fill="y", padx=(0, 5))
                 img_frame.pack_propagate(False) # 固定大小
-            
+
                 # 組出圖片路徑規則
                 # 分類是最後一層資料夾名稱
                 # 詳細清單名稱是檔名
                 img_folder = f"{img_base_path}/{self.current_cls_val}"
                 img_file = f"{self.current_master_pk}.png"
-            
+
                 img_label = ctk.CTkLabel(img_frame, text="No Image")
                 img_label.pack(expand=True)
 
                 if img_file and img_folder:
                     full_path = os.path.join(img_folder, img_file)
-                
+
                     if os.path.exists(full_path):
                         try:
                             pil_img = Image.open(full_path)
                             # 保持比例縮放
-                            pil_img.thumbnail((128, 128)) 
+                            pil_img.thumbnail((128, 128))
                             ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=pil_img.size)
-                        
+
                             img_label.configure(image=ctk_img, text="")
                             self.current_image_ref = ctk_img # 必須保留引用
                         except Exception as e:
@@ -381,7 +383,7 @@ class SheetEditor(ctk.CTkFrame):
                 # 右側編輯區
                 edit_target_frame = ctk.CTkScrollableFrame(self.top_container, height=100)
                 edit_target_frame.pack(side="right", fill="both", expand=True)
-            
+
             else:
                 # --- 原始模式：全寬編輯 ---
                 edit_target_frame = ctk.CTkScrollableFrame(self.top_container, height=100)
@@ -393,7 +395,7 @@ class SheetEditor(ctk.CTkFrame):
                 f = ctk.CTkFrame(edit_target_frame, fg_color="transparent")
                 f.pack(fill="x", pady=2)
                 ctk.CTkLabel(f, text=col, width=100, anchor="w").pack(side="left")
-            
+
                 val = row_data[col]
                 col_conf = cols_cfg.get(col, {})
                 col_type = cols_cfg.get(col, {}).get("type", "string")
@@ -418,11 +420,11 @@ class SheetEditor(ctk.CTkFrame):
 
                 elif col_type == "bool":
                     var = ctk.BooleanVar(value=bool(val))
-                    ctk.CTkCheckBox(f, text="", variable=var, 
+                    ctk.CTkCheckBox(f, text="", variable=var,
                                     command=lambda c=col, v=var: self.manager.update_cell(False, self.sheet_name, row_idx, c, v.get())).pack(side="left")
                 elif col_type == "enum":
                     opts = cols_cfg.get(col, {}).get("options", [])
-                    w = ctk.CTkOptionMenu(f, values=opts, 
+                    w = ctk.CTkOptionMenu(f, values=opts,
                                           command=lambda v, c=col: self.manager.update_cell(False, self.sheet_name, row_idx, c, v))
                     w.set(str(val))
                     w.pack(side="left", fill="x", expand=True)
@@ -438,29 +440,29 @@ class SheetEditor(ctk.CTkFrame):
         # 1. 刪除所有舊的 Tab
         for tab_name in list(self.sub_tables_tabs._tab_dict.keys()):
             self.sub_tables_tabs.delete(tab_name)
-    
+
         related_sheets = [s for s in self.manager.sub_dfs if s.startswith(self.sheet_name + "#")]
-    
+
         # 如果沒有子表，顯示提示
         if not related_sheets:
             self.sub_tables_tabs.add("無子表")
             return
-    
+
         # 2. 為每個子表建立一個 Tab
         for sheet in related_sheets:
             short_name = sheet.split("#")[1]
             self.sub_tables_tabs.add(short_name)
             tab_frame = self.sub_tables_tabs.tab(short_name)
-            
+
             sub_df = self.manager.sub_dfs[sheet]
             sub_cfg = self.cfg.get("sub_sheets", {}).get(short_name, {})
             sub_cols_cfg = sub_cfg.get("columns", {})
             fk = sub_cfg.get("foreign_key", self.pk_key)
-            
+
             if fk not in sub_df.columns:
                 ctk.CTkLabel(tab_frame, text=f"錯誤: 子表找不到關聯欄位 {fk}").pack()
                 continue
-            
+
             try:
                 # 確保 master_id 與欄位型態一致比較
                 mask = sub_df[fk].astype(str) == str(master_id)
@@ -474,11 +476,11 @@ class SheetEditor(ctk.CTkFrame):
             header_font = tkfont.Font(family="微軟正黑體", size=12, weight="bold")
             # 這裡假設一個 scaling，若無可設為 1.0 或使用你的 _get_widget_scaling()
             try: scaling = self._get_widget_scaling()
-            except: scaling = 1.0 
-            
+            except: scaling = 1.0
+
             column_widths = {}
             # 總寬度初始值要加上刪除按鈕的寬度 (例如 50px)
-            total_width = 50 
+            total_width = 50
 
             for col in headers:
                 text_width_pixels = header_font.measure(col)
@@ -492,24 +494,24 @@ class SheetEditor(ctk.CTkFrame):
             # ========== 3. 標題列容器 ==========
             header_scroll_container = ctk.CTkFrame(tab_frame)
             header_scroll_container.pack(fill="x", pady=(0, 5))
-            
+
             header_canvas = ctk.CTkCanvas(header_scroll_container, bg="#2b2b2b", highlightthickness=0, height=25)
             header_canvas.pack(side="top", fill="x")
-            
+
             header_content = ctk.CTkFrame(header_canvas, fg_color="transparent")
             header_canvas.create_window((0, 0), window=header_content, anchor="nw")
-            
+
             h_frame = ctk.CTkFrame(header_content, fg_color="gray25", width=total_width, height=25)
             h_frame.pack(anchor="w")
             h_frame.pack_propagate(False)
-            
+
             # 標題列最左側增加 "Del" 欄位
             ctk.CTkLabel(h_frame, text="Del", width=40, font=("Arial", 10, "bold"), text_color="red").pack(side="left", padx=5, pady=5)
 
             for col in headers:
                 label = ctk.CTkLabel(h_frame, text=col, width=column_widths[col], font=("微軟正黑體", 12, "bold"))
                 label.pack(side="left", padx=5, pady=5)
-            
+
             header_content.update_idletasks()
             header_canvas.configure(scrollregion=header_canvas.bbox("all"))
 
@@ -520,16 +522,16 @@ class SheetEditor(ctk.CTkFrame):
             data_canvas = ctk.CTkCanvas(data_scroll_container, bg="#2b2b2b", highlightthickness=0)
             data_scroll_v = ctk.CTkScrollbar(data_scroll_container, orientation="vertical", command=data_canvas.yview)
             data_scroll_h = ctk.CTkScrollbar(data_scroll_container, orientation="horizontal")
-            
+
             data_canvas.configure(yscrollcommand=data_scroll_v.set, xscrollcommand=data_scroll_h.set)
-            
+
             data_scroll_v.pack(side="right", fill="y")
             data_scroll_h.pack(side="bottom", fill="x")
             data_canvas.pack(side="left", fill="both", expand=True)
-            
+
             data_content = ctk.CTkFrame(data_canvas, fg_color="transparent")
             data_canvas.create_window((0, 0), window=data_content, anchor="nw")
-            
+
             # 更新捲動範圍
             def make_update_scroll(canvas):
                 def update_scroll(event=None):
@@ -538,7 +540,7 @@ class SheetEditor(ctk.CTkFrame):
                     if bbox: canvas.configure(scrollregion=bbox)
                 return update_scroll
             data_content.bind("<Configure>", make_update_scroll(data_canvas))
-            
+
             # 同步捲動
             def make_sync_scroll_command(header_c, data_c):
                 def sync_command(*args):
@@ -546,13 +548,13 @@ class SheetEditor(ctk.CTkFrame):
                     header_c.xview(*args)
                 return sync_command
             data_scroll_h.configure(command=make_sync_scroll_command(header_canvas, data_canvas))
-            
+
             # 滑鼠滾輪綁定
             def make_mousewheel_handler(canvas):
                 def handler(event): canvas.yview_scroll(int(-1*(event.delta/120)), "units")
                 return handler
             def make_shift_mousewheel_handler(header_c, data_c):
-                def handler(event): 
+                def handler(event):
                     data_c.xview_scroll(int(-1*(event.delta/120)), "units")
                     header_c.xview_scroll(int(-1*(event.delta/120)), "units")
                 return handler
@@ -571,7 +573,7 @@ class SheetEditor(ctk.CTkFrame):
                 r_frame = ctk.CTkFrame(data_content, width=total_width, height=25)
                 r_frame.pack(anchor="w", pady=5)
                 r_frame.pack_propagate(False)
-                
+
                 # 刪除按鈕 (放在每一列最前面)
                 del_btn = ctk.CTkButton(r_frame, text="X", width=40, height=25, fg_color="darkred", hover_color="#800000",
                                         command=lambda full_n=sheet, r=s_idx: self.delete_sub_item(full_n, r))
@@ -620,7 +622,7 @@ class SheetEditor(ctk.CTkFrame):
                         entry = ctk.CTkEntry(r_frame, textvariable=var, width=target_width, height=25)
                         entry.pack(side="left", padx=5, pady=0)
                         var.trace_add("write", lambda *args, s=sheet, r=s_idx, c=col, v=var: self.manager.update_cell(True, s, r, c, v.get()))
-            
+
             # 更新範圍
             data_content.update_idletasks()
             data_canvas.update_idletasks()
@@ -959,13 +961,13 @@ class App(ctk.CTk):
 
         self.geometry(f"{win_w}x{win_h}")
         # self.geometry("1280x720")
-        
+
         self.manager = DataManager()
-        
+
         # 頂部操作列
         self.top_bar = ctk.CTkFrame(self, height=40)
         self.top_bar.pack(fill="x", padx=5, pady=5)
-        
+
         ctk.CTkButton(self.top_bar, text="讀取 Excel", command=self.load_file).pack(side="left", padx=5)
         ctk.CTkButton(self.top_bar, text="儲存 Excel", command=self.save_file, fg_color="green").pack(side="left", padx=5)
         ctk.CTkButton(self.top_bar, text="配置設定", command=self.open_configwnd, fg_color="gray").pack(side="right", padx=5)
@@ -977,17 +979,17 @@ class App(ctk.CTk):
     def load_file(self):
         path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx")])
         if not path: return
-    
+
         try:
             self.manager.load_excel(path)
-        
+
             # 關鍵：判斷是否需要提示使用者
             if self.manager.need_config_alert:
                 messagebox.showinfo("提示", "偵測到新資料表，請先設定【分類參數】與【欄位格式】")
                 self.open_configwnd()
             else:
                 self.refresh_ui()
-            
+
         except Exception as e:
             messagebox.showerror("錯誤", f"讀取失敗: {str(e)}")
 
@@ -1002,7 +1004,7 @@ class App(ctk.CTk):
         # 根據母表數量建立 Tabs
         for tab_name in list(self.main_tabs._tab_dict.keys()):
             self.main_tabs.delete(tab_name)
-            
+
         for sheet_name in self.manager.master_dfs:
             self.main_tabs.add(sheet_name)
             parent = self.main_tabs.tab(sheet_name)
