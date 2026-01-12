@@ -323,7 +323,7 @@ class SheetEditor(ctk.CTkFrame):
 
             # 4. 建立編輯區容器 (scroll_master_edit)
             # 如果要顯示圖片，把 top_container 分成左右兩邊
-        
+
             edit_target_frame = None
 
             if use_icon:
@@ -395,9 +395,28 @@ class SheetEditor(ctk.CTkFrame):
                 ctk.CTkLabel(f, text=col, width=100, anchor="w").pack(side="left")
             
                 val = row_data[col]
+                col_conf = cols_cfg.get(col, {})
                 col_type = cols_cfg.get(col, {}).get("type", "string")
-            
-                if col_type == "bool":
+                is_linked = col_conf.get("link_to_text", False)
+
+                if is_linked:
+                    # 1. 顯示 Key (唯讀，灰色)
+                    key_label = ctk.CTkEntry(f, width=80, text_color="gray")
+                    key_label.insert(0, str(val))
+                    key_label.configure(state="disabled")  # 禁止修改 Key
+                    key_label.pack(side="left", padx=(0, 5))
+
+                    # 2. 顯示 Text (可編輯)
+                    real_text = self.manager.get_text_value(val)  # 從 DataManager 拿文字
+                    var = ctk.StringVar(value=str(real_text))
+
+                    entry = ctk.CTkEntry(f, textvariable=var)
+                    entry.pack(side="left", fill="x", expand=True)
+
+                    # 3. 綁定更新事件：更新文字表，而非 DataFrame
+                    var.trace_add("write", lambda *args, k=val, v=var: self.manager.update_linked_text(k, v.get()))
+
+                elif col_type == "bool":
                     var = ctk.BooleanVar(value=bool(val))
                     ctk.CTkCheckBox(f, text="", variable=var, 
                                     command=lambda c=col, v=var: self.manager.update_cell(False, self.sheet_name, row_idx, c, v.get())).pack(side="left")
@@ -466,6 +485,8 @@ class SheetEditor(ctk.CTkFrame):
                 text_width_scaled = text_width_pixels / scaling
                 target_width = text_width_scaled
                 column_widths[col] = max(120, int(target_width))
+                if sub_cols_cfg.get(col, {}).get("link_to_text", False):
+                    column_widths[col] = max(200, int(target_width) + 100)
                 total_width += column_widths[col] + 10
 
             # ========== 3. 標題列容器 ==========
@@ -560,9 +581,31 @@ class SheetEditor(ctk.CTkFrame):
                     val = s_row[col]
                     c_info = sub_cols_cfg.get(col, {"type": "string"})
                     col_type = c_info.get("type", "string")
+                    is_linked = c_info.get("link_to_text", False)  # 檢查是否連結
                     target_width = column_widths[col]
 
-                    if col_type == "enum":
+                    if is_linked:
+                        # 分割寬度：Key 佔 30%, Text 佔 70%
+                        key_w = int(target_width * 0.3)
+                        text_w = target_width - key_w
+
+                        # Key (唯讀)
+                        lbl_key = ctk.CTkEntry(r_frame, width=key_w, height=25, text_color="gray")
+                        lbl_key.insert(0, str(val))
+                        lbl_key.configure(state="disabled")
+                        lbl_key.pack(side="left", padx=2)
+
+                        # Text (可編輯)
+                        real_text = self.manager.get_text_value(val)
+                        var = ctk.StringVar(value=str(real_text))
+                        entry = ctk.CTkEntry(r_frame, textvariable=var, width=text_w, height=25)
+                        entry.pack(side="left", padx=2)
+
+                        # 綁定：修改時更新外部文字表
+                        # 注意：這裡 val 就是 Key
+                        var.trace_add("write", lambda *args, k=val, v=var: self.manager.update_linked_text(k, v.get()))
+
+                    elif col_type == "enum":
                         menu = ctk.CTkOptionMenu(r_frame, values=c_info.get("options", ["None"]), width=target_width, height=25,
                                                  command=lambda v, r=s_idx, c=col, s=sheet: self.manager.update_cell(True, s, r, c, v))
                         menu.set(str(val))
@@ -616,27 +659,39 @@ class ConfigEditorWindow(ctk.CTkToplevel):
         # ========= 圖片設定（固定在上方，不進 Scroll） =========
         self.var_use_icon = ctk.BooleanVar(value=False)
 
-        icon_block = ctk.CTkFrame(header, fg_color="transparent")
-        icon_block.grid(row=1, column=0, sticky="w", pady=(0, 5))
+        # ========= 圖片與文字表設定 =========
+        # 將原本只有 Icon 的區塊擴充
+        setting_block = ctk.CTkFrame(header, fg_color="transparent")
+        setting_block.grid(row=1, column=0, sticky="w", pady=(0, 5))
 
+        # 1. 文字表路徑設定 (新增)
+        self.frame_text_path = ctk.CTkFrame(setting_block, fg_color="transparent")
+        self.frame_text_path.pack(anchor="w", padx=10, pady=2)
+        ctk.CTkLabel(self.frame_text_path, text="外部文字表路徑 (.xlsx):").pack(side="left")
+
+        self.entry_text_path = ctk.CTkEntry(self.frame_text_path, width=300)
+        self.entry_text_path.pack(side="left", padx=5)
+        self.entry_text_path.insert(0, self.manager.config.get("global_text_path", ""))
+
+        ctk.CTkButton(self.frame_text_path, text="瀏覽", width=50,
+                      command=self.browse_text_file).pack(side="left")
+
+        # 2. 圖片設定 (原本的)
+        self.var_use_icon = ctk.BooleanVar(value=False)
         self.chk_use_icon = ctk.CTkCheckBox(
-            icon_block,
+            setting_block,
             text="啟用圖示顯示 (需有 'Icon' 或 'Image' 欄位)",
             variable=self.var_use_icon,
             command=self.toggle_icon_input
         )
-        self.chk_use_icon.grid(row=0, column=0, sticky="w")
+        self.chk_use_icon.pack(anchor="w", padx=10, pady=(10, 0))
 
-        self.frame_img_path = ctk.CTkFrame(icon_block, fg_color="transparent")
-        self.frame_img_path.grid(row=1, column=0, sticky="w", padx=20, pady=5)
+        self.frame_img_path = ctk.CTkFrame(setting_block, fg_color="transparent")
+        self.frame_img_path.pack(anchor="w", padx=30, pady=2)
 
-        ctk.CTkLabel(
-            self.frame_img_path,
-            text="圖片讀取路徑 (資料夾):"
-        ).grid(row=0, column=0, sticky="w")
-
-        self.entry_img_path = ctk.CTkEntry(self.frame_img_path, width=320)
-        self.entry_img_path.grid(row=0, column=1, padx=5)
+        ctk.CTkLabel(self.frame_img_path, text="圖片資料夾:").pack(side="left")
+        self.entry_img_path = ctk.CTkEntry(self.frame_img_path, width=300)
+        self.entry_img_path.pack(side="left", padx=5)
         self.entry_img_path.bind("<KeyRelease>", self.on_image_path_change)
 
         # ========= Tabs =========
@@ -660,7 +715,10 @@ class ConfigEditorWindow(ctk.CTkToplevel):
                     "classification_key": self.manager.master_dfs[sheet_name].classification_key,
                     "primary_key": self.manager.master_dfs[sheet_name].primary_key,
                     "columns": {
-                        col: {"type": "string"}
+                        col: {
+                            "type": "string",
+                            "link_to_text": False
+                        }
                         for col in self.manager.master_dfs[sheet_name].columns
                     },
                     "sub_sheets": {}
@@ -704,13 +762,27 @@ class ConfigEditorWindow(ctk.CTkToplevel):
         self.manager.config[sheet]["use_icon"] = self.var_use_icon.get()
 
         if self.var_use_icon.get():
-            self.frame_img_path.grid()
+            self.frame_img_path.pack(anchor="w", padx=30, pady=2)
         else:
-            self.frame_img_path.grid_remove()
+            self.frame_img_path.pack_forget()
 
     def on_image_path_change(self, event=None):
         sheet = self.tab_view.get()
         self.manager.config[sheet]["image_path"] = self.entry_img_path.get()
+
+    def browse_text_file(self):
+        path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx")])
+        if path:
+            self.entry_text_path.delete(0, "end")
+            self.entry_text_path.insert(0, path)
+            # 暫存到 manager config (尚未存檔)
+            self.manager.config["global_text_path"] = path
+            # 立即嘗試載入，以便後續編輯使用
+            success = self.manager.load_external_text(path)
+            if success:
+                messagebox.showinfo("成功", "已載入外部文字表")
+            else:
+                messagebox.showerror("失敗", "載入失敗，請檢查格式")
 
     # ================== Tab 內容 ==================
 
@@ -751,11 +823,38 @@ class ConfigEditorWindow(ctk.CTkToplevel):
             line = ctk.CTkFrame(main_scroll, fg_color="transparent")
             line.pack(fill="x", padx=20, pady=1)
 
-            ctk.CTkLabel(line, text=col, width=150, anchor="w").pack(side="left")
+            ctk.CTkLabel(
+                line,
+                text=col,
+                width=150,
+                anchor="w"
+            ).pack(side="left")
 
+            # 確保 config 結構完整
             if col not in cfg["columns"]:
-                cfg["columns"][col] = {"type": "string"}
+                cfg["columns"][col] = {
+                    "type": "string",
+                    "link_to_text": False
+                }
+            else:
+                cfg["columns"][col].setdefault("link_to_text", False)
 
+            # ---------- link_to_text 勾選 ----------
+            link_var = ctk.BooleanVar(
+                value=cfg["columns"][col]["link_to_text"]
+            )
+
+            def on_toggle_link(c=col, v=link_var):
+                cfg["columns"][c]["link_to_text"] = v.get()
+
+            ctk.CTkCheckBox(
+                line,
+                text="連結文字",
+                variable=link_var,
+                command=on_toggle_link
+            ).pack(side="right", padx=6)
+
+            # ---------- type 選單 ----------
             t_menu = ctk.CTkOptionMenu(
                 line,
                 values=["string", "float", "int", "bool", "enum"],
@@ -801,17 +900,37 @@ class ConfigEditorWindow(ctk.CTkToplevel):
                     ).pack(side="left")
 
                     if s_col not in cfg["sub_sheets"][short]["columns"]:
-                        cfg["sub_sheets"][short]["columns"][s_col] = {"type": "string"}
+                        cfg["sub_sheets"][short]["columns"][s_col] =  {
+                            "type": "string",
+                            "link_to_text": False
+                        }
+                    else:
+                        cfg["sub_sheets"][short]["columns"][s_col].setdefault("link_to_text", False)
 
-                    st_menu = ctk.CTkOptionMenu(
-                        s_line,
-                        values=["string", "float", "int", "bool", "enum"],
-                        width=100,
-                        command=lambda v, sn=short, sc=s_col:
-                        self.set_sub_col_type(sheet_name, sn, sc, v)
-                    )
-                    st_menu.set(cfg["sub_sheets"][short]["columns"][s_col]["type"])
-                    st_menu.pack(side="right")
+                        # ---------- link_to_text 勾選 ----------
+                        link_var = ctk.BooleanVar(
+                            value=cfg["sub_sheets"][short]["columns"][s_col]["link_to_text"]
+                        )
+
+                        def on_toggle_link(c=col, v=link_var):
+                            cfg["sub_sheets"][short]["columns"][c]["link_to_text"] = v.get()
+
+                        ctk.CTkCheckBox(
+                            s_line,
+                            text="連結文字",
+                            variable=link_var,
+                            command=on_toggle_link
+                        ).pack(side="right", padx=6)
+
+                        # ---------- type 選單 ----------
+                        st_menu = ctk.CTkOptionMenu(
+                            s_line,
+                            values=["string", "float", "int", "bool", "enum"],
+                            width=100,
+                            command=lambda v, sn=short, sc=s_col: self.set_sub_col_type(sheet_name,sn,sc, v)
+                        )
+                        st_menu.set(cfg["sub_sheets"][short]["columns"][s_col]["type"])
+                        st_menu.pack(side="right")
 
     # ================== Config 操作 ==================
 
