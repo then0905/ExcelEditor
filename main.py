@@ -1366,7 +1366,7 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Game Data Editor (Config Driven)")
-
+        self.iconbitmap("icon.ico")
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
 
