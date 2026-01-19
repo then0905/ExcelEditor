@@ -98,9 +98,8 @@ class SheetEditor(ctk.CTkFrame):
         self.sub_tables_tabs = ctk.CTkTabview(self.frame_right)
         self.sub_tables_tabs.pack(fill="both", expand=True, padx=5, pady=5)
 
-
     def load_classification_list(self):
-        """載入分類列表 - 優化版：只更新必要的按鈕"""
+        """載入分類列表 """
         groups = self.df[self.cls_key].unique()
         current_groups = set(groups)
         cached_groups = set(self.cls_buttons.keys())
@@ -135,7 +134,7 @@ class SheetEditor(ctk.CTkFrame):
                 self.cls_buttons[g] = btn
 
     def load_items_by_group(self, group_val):
-        """載入項目清單 - 優化版：只更新必要的按鈕"""
+        """載入項目清單 """
         self.current_cls_val = group_val
 
         # 更新左側分類按鈕的高亮狀態（不重建）
@@ -186,7 +185,7 @@ class SheetEditor(ctk.CTkFrame):
                 self.item_buttons[idx] = btn
 
     def load_editor(self, row_idx):
-        """載入編輯器 - 優化版：只更新欄位值，不重建 UI"""
+        """載入編輯器 """
         self.current_master_idx = row_idx
 
         # 1. 更新中間清單的高亮（不重建）
@@ -630,14 +629,10 @@ class SheetEditor(ctk.CTkFrame):
         data_container = ctk.CTkFrame(canvas, fg_color="transparent")
         canvas_window = canvas.create_window((0, 0), window=data_container, anchor="nw")
 
-        # === 關鍵修改 A: 將標題區移入 data_container 內部 ===
-        # 這樣橫向捲動時，標題才會跟著動
         header_container = ctk.CTkFrame(data_container, fg_color="gray25", height=30)
         header_container.pack(fill="x", side="top", pady=(0, 5))
 
-        # header_container.pack_propagate(False) # 移除這行，讓標題依內容自動撐開
-
-        # === 關鍵修改 B: 修正視窗縮放邏輯 ===
+        # === 視窗縮放邏輯 ===
         def on_frame_configure(event=None):
             # 更新捲動區域
             canvas.configure(scrollregion=canvas.bbox("all"))
@@ -712,7 +707,7 @@ class SheetEditor(ctk.CTkFrame):
         if not header_frame.winfo_children():
             self._build_sub_table_header(header_frame, headers, sub_cols_cfg)
 
-        # === 關鍵：行池機制 ===
+        # === 行池機制 ===
         # 1. 回收正在使用的行到池中
         active_rows = self.sub_table_active_rows.get(tab_name, [])
         row_pool = self.sub_table_row_pools.get(tab_name, [])
@@ -1044,6 +1039,7 @@ class SheetEditor(ctk.CTkFrame):
         super().destroy()
 
 class ConfigEditorWindow(ctk.CTkToplevel):
+    """配置設定視窗"""
     def __init__(self, parent, manager):
         super().__init__(parent)
         self.title("配置詳細設定")
@@ -1363,6 +1359,7 @@ class ConfigEditorWindow(ctk.CTkToplevel):
             self.master.refresh_ui()
 
 class App(ctk.CTk):
+    """ 主畫面 """
     def __init__(self):
         super().__init__()
         self.title("Game Data Editor (Config Driven)")
@@ -1397,7 +1394,7 @@ class App(ctk.CTk):
         try:
             self.manager.load_excel(path)
 
-            # 關鍵：判斷是否需要提示使用者
+            # 判斷是否需要強制彈出配置視窗
             if self.manager.need_config_alert:
                 messagebox.showinfo("提示", "偵測到新資料表，請先設定【分類參數】與【欄位格式】")
                 self.open_configwnd()
