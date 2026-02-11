@@ -1,4 +1,5 @@
 import customtkinter as ctk
+import tkinter as tk
 from tkinter import messagebox, filedialog
 from data_manager import DataManager
 import os
@@ -8,6 +9,47 @@ import tkinter.font as tkfont
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
+
+# Dark theme 色彩常數
+_BG = "#2b2b2b"
+_BG_HEADER = "#404040"
+
+
+class LightScrollableFrame(tk.Frame):
+    """
+    輕量化可捲動框架 — 替代 ctk.CTkScrollableFrame。
+    內部全部使用原生 tk 元件，避免 CTk 雙層 canvas 在快速捲動時產生殘影。
+    子元件請放到 .interior 屬性中。
+    """
+
+    def __init__(self, parent, height=None, **kwargs):
+        super().__init__(parent, bg=_BG)
+
+        self._canvas = tk.Canvas(self, bg=_BG, highlightthickness=0, bd=0)
+        self._scrollbar = ctk.CTkScrollbar(self, orientation="vertical",
+                                           command=self._canvas.yview)
+        self._scrollbar.pack(side="right", fill="y")
+        self._canvas.pack(side="left", fill="both", expand=True)
+        self._canvas.configure(yscrollcommand=self._scrollbar.set)
+
+        self.interior = tk.Frame(self._canvas, bg=_BG)
+        self._win_id = self._canvas.create_window((0, 0), window=self.interior, anchor="nw")
+
+        self.interior.bind("<Configure>", self._on_interior_cfg)
+        self._canvas.bind("<Configure>", self._on_canvas_cfg)
+
+        if height:
+            self._canvas.configure(height=height)
+
+        # 供 App 層級滾輪路由識別
+        self._canvas._is_light_scrollable = True
+
+    def _on_interior_cfg(self, _event=None):
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    def _on_canvas_cfg(self, event):
+        self._canvas.itemconfig(self._win_id, width=event.width)
+
 
 class SheetEditor(ctk.CTkFrame):
     """ 單一母表的編輯介面 (包含左中右佈局) """
@@ -53,7 +95,7 @@ class SheetEditor(ctk.CTkFrame):
         self.frame_left.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
 
         ctk.CTkLabel(self.frame_left, text=f"分類: {self.cls_key}", font=("微軟正黑體", 12, "bold")).pack(pady=5)
-        self.scroll_cls = ctk.CTkScrollableFrame(self.frame_left)
+        self.scroll_cls = LightScrollableFrame(self.frame_left)
         self.scroll_cls.pack(fill="both", expand=True)
 
         # 左側操作按鈕
@@ -67,7 +109,7 @@ class SheetEditor(ctk.CTkFrame):
         self.frame_mid.grid(row=0, column=1, sticky="nsew", padx=2, pady=2)
 
         ctk.CTkLabel(self.frame_mid, text="清單", font=("微軟正黑體", 12, "bold")).pack(pady=5)
-        self.scroll_items = ctk.CTkScrollableFrame(self.frame_mid)
+        self.scroll_items = LightScrollableFrame(self.frame_mid)
         self.scroll_items.pack(fill="both", expand=True)
 
         # 中間操作按鈕
@@ -123,7 +165,7 @@ class SheetEditor(ctk.CTkFrame):
                 # 不存在：創建新按鈕
                 fg_color = ("#3B8ED0", "#1F6AA5") if str(g) == str(self.current_cls_val) else "transparent"
                 btn = ctk.CTkButton(
-                    self.scroll_cls,
+                    self.scroll_cls.interior,
                     text=str(g),
                     fg_color=fg_color,
                     border_width=1,
@@ -175,7 +217,7 @@ class SheetEditor(ctk.CTkFrame):
                 # 不存在：創建新按鈕
                 fg_color = ("#3B8ED0", "#1F6AA5") if idx == self.current_master_idx else "gray"
                 btn = ctk.CTkButton(
-                    self.scroll_items,
+                    self.scroll_items.interior,
                     text=display_name,
                     anchor="w",
                     fg_color=fg_color,
@@ -232,12 +274,12 @@ class SheetEditor(ctk.CTkFrame):
             self.img_label = ctk.CTkLabel(self.img_frame, text="No Image")
             self.img_label.pack(expand=True)
 
-            edit_target_frame = ctk.CTkScrollableFrame(self.top_container, height=100)
+            edit_target_frame = LightScrollableFrame(self.top_container, height=100)
             edit_target_frame.pack(side="right", fill="both", expand=True)
         else:
             self.img_frame = None
             self.img_label = None
-            edit_target_frame = ctk.CTkScrollableFrame(self.top_container, height=100)
+            edit_target_frame = LightScrollableFrame(self.top_container, height=100)
             edit_target_frame.pack(fill="both", expand=True)
 
         # 建立欄位 UI
@@ -247,7 +289,7 @@ class SheetEditor(ctk.CTkFrame):
         self.trace_ids = {}
 
         for col in self.df.columns:
-            f = ctk.CTkFrame(edit_target_frame, fg_color="transparent")
+            f = tk.Frame(edit_target_frame.interior, bg=_BG)
             f.pack(fill="x", pady=2)
 
             ctk.CTkLabel(f, text=col, width=100, anchor="w").pack(side="left")
@@ -614,22 +656,30 @@ class SheetEditor(ctk.CTkFrame):
         # 2. 建立 Canvas
         canvas = ctk.CTkCanvas(scroll_container, bg="#2b2b2b", highlightthickness=0)
 
-        # 3. 建立捲軸
-        v_scrollbar = ctk.CTkScrollbar(scroll_container, orientation="vertical", command=canvas.yview)
+        # 3. 建立捲軸 (包裝 command 以強制重繪，避免快速拖曳殘影)
+        def yview_and_redraw(*args):
+            canvas.yview(*args)
+            canvas.update_idletasks()
+
+        def xview_and_redraw(*args):
+            canvas.xview(*args)
+            canvas.update_idletasks()
+
+        v_scrollbar = ctk.CTkScrollbar(scroll_container, orientation="vertical", command=yview_and_redraw)
         v_scrollbar.pack(side="right", fill="y")
 
-        h_scrollbar = ctk.CTkScrollbar(scroll_container, orientation="horizontal", command=canvas.xview)
+        h_scrollbar = ctk.CTkScrollbar(scroll_container, orientation="horizontal", command=xview_and_redraw)
         h_scrollbar.pack(side="bottom", fill="x")
 
         # 4. 配置 Canvas
         canvas.pack(side="left", fill="both", expand=True)
         canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
 
-        # 5. 建立內部資料框架 (所有內容都放在這裡)
-        data_container = ctk.CTkFrame(canvas, fg_color="transparent")
+        # 5. 建立內部資料框架 (使用原生 tk.Frame 避免 CTk 雙層 canvas 殘影)
+        data_container = tk.Frame(canvas, bg=_BG)
         canvas_window = canvas.create_window((0, 0), window=data_container, anchor="nw")
 
-        header_container = ctk.CTkFrame(data_container, fg_color="gray25", height=30)
+        header_container = tk.Frame(data_container, bg=_BG_HEADER, height=30)
         header_container.pack(fill="x", side="top", pady=(0, 5))
 
         # === 視窗縮放邏輯 ===
@@ -654,22 +704,15 @@ class SheetEditor(ctk.CTkFrame):
         data_container.bind("<Configure>", on_frame_configure)
         canvas.bind("<Configure>", on_canvas_configure)
 
-        # 滑鼠滾輪支援
-        def on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        # 標記此 Canvas 為子表用途 (供 App 層級滾輪路由識別)
+        canvas._is_sub_table_canvas = True
 
-        # 支援 Shift + 滾輪 進行橫向捲動
-        def on_shift_mousewheel(event):
-            canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        canvas.bind_all("<MouseWheel>", on_mousewheel)
-        canvas.bind_all("<Shift-MouseWheel>", on_shift_mousewheel)
-
-        # 緩存容器
+        # 緩存容器 (滑鼠滾輪由 App 層級統一路由)
         self.sub_table_frames[tab_name] = {
             'header': header_container,
             'data': data_container,
-            'canvas': canvas
+            'canvas': canvas,
+            'scroll_container': scroll_container
         }
         self.sub_table_row_pools[tab_name] = []
         self.sub_table_active_rows[tab_name] = []
@@ -773,7 +816,7 @@ class SheetEditor(ctk.CTkFrame):
 
     def _create_sub_table_row(self, parent, headers, row_data, row_idx, sheet_name, cols_cfg):
         """創建新的資料行（當池中沒有可用行時）"""
-        row_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        row_frame = tk.Frame(parent, bg=_BG)
 
         # 儲存元數據（用於後續更新）
         row_frame._widgets = {}
@@ -931,13 +974,13 @@ class SheetEditor(ctk.CTkFrame):
             return
 
         # 使用簡單的滾動框架
-        scroll_frame = ctk.CTkScrollableFrame(parent)
+        scroll_frame = LightScrollableFrame(parent)
         scroll_frame.pack(fill="both", expand=True)
 
         headers = list(filtered_df.columns)
 
         # 標題列
-        header_frame = ctk.CTkFrame(scroll_frame, fg_color="gray25")
+        header_frame = tk.Frame(scroll_frame.interior, bg=_BG_HEADER)
         header_frame.pack(fill="x", pady=(0, 5))
 
         ctk.CTkLabel(header_frame, text="操作", width=60, font=("微軟正黑體", 10, "bold")).pack(side="left", padx=2)
@@ -946,7 +989,7 @@ class SheetEditor(ctk.CTkFrame):
 
         # 資料列
         for idx, row in filtered_df.iterrows():
-            row_frame = ctk.CTkFrame(scroll_frame, fg_color="transparent")
+            row_frame = tk.Frame(scroll_frame.interior, bg=_BG)
             row_frame.pack(fill="x", pady=2)
 
             # 刪除按鈕
@@ -1199,14 +1242,14 @@ class ConfigEditorWindow(ctk.CTkToplevel):
     # ================== Tab 內容 ==================
 
     def build_tab_content(self, tab, sheet_name):
-        main_scroll = ctk.CTkScrollableFrame(tab)
+        main_scroll = LightScrollableFrame(tab)
         main_scroll.pack(fill="both", expand=True)
 
         cfg = self.manager.config[sheet_name]
         all_cols = list(self.manager.master_dfs[sheet_name].columns)
 
         # --- 母表設定 ---
-        base_frame = ctk.CTkFrame(main_scroll)
+        base_frame = ctk.CTkFrame(main_scroll.interior)
         base_frame.pack(fill="x", padx=5, pady=5)
 
         ctk.CTkLabel(
@@ -1225,14 +1268,14 @@ class ConfigEditorWindow(ctk.CTkToplevel):
 
         # --- 母表欄位 ---
         ctk.CTkLabel(
-            main_scroll,
+            main_scroll.interior,
             text="母表欄位類型設定",
             font=("微軟正黑體", 13, "bold"),
             text_color="#3B8ED0"
         ).pack(pady=5)
 
         for col in all_cols:
-            line = ctk.CTkFrame(main_scroll, fg_color="transparent")
+            line = tk.Frame(main_scroll.interior, bg=_BG)
             line.pack(fill="x", padx=20, pady=1)
 
             ctk.CTkLabel(
@@ -1280,7 +1323,7 @@ class ConfigEditorWindow(ctk.CTkToplevel):
         related_subs = [s for s in self.manager.sub_dfs if s.startswith(sheet_name + "#")]
         if related_subs:
             ctk.CTkLabel(
-                main_scroll,
+                main_scroll.interior,
                 text="子表欄位類型設定",
                 font=("微軟正黑體", 13, "bold"),
                 text_color="#E38D2D"
@@ -1288,7 +1331,7 @@ class ConfigEditorWindow(ctk.CTkToplevel):
 
             for sub_full in related_subs:
                 short = sub_full.split("#")[1]
-                sub_group = ctk.CTkFrame(main_scroll, border_width=1, border_color="gray")
+                sub_group = ctk.CTkFrame(main_scroll.interior, border_width=1, border_color="gray")
                 sub_group.pack(fill="x", padx=10, pady=5)
 
                 ctk.CTkLabel(
@@ -1304,7 +1347,7 @@ class ConfigEditorWindow(ctk.CTkToplevel):
 
                 sub_cols = list(self.manager.sub_dfs[sub_full].columns)
                 for s_col in sub_cols:
-                    s_line = ctk.CTkFrame(sub_group, fg_color="transparent")
+                    s_line = tk.Frame(sub_group, bg=_BG)
                     s_line.pack(fill="x", padx=15, pady=1)
 
                     ctk.CTkLabel(
@@ -1312,37 +1355,37 @@ class ConfigEditorWindow(ctk.CTkToplevel):
                     ).pack(side="left")
 
                     if s_col not in cfg["sub_sheets"][short]["columns"]:
-                        cfg["sub_sheets"][short]["columns"][s_col] =  {
+                        cfg["sub_sheets"][short]["columns"][s_col] = {
                             "type": "string",
                             "link_to_text": False
                         }
                     else:
                         cfg["sub_sheets"][short]["columns"][s_col].setdefault("link_to_text", False)
 
-                        # ---------- link_to_text 勾選 ----------
-                        link_var = ctk.BooleanVar(
-                            value=cfg["sub_sheets"][short]["columns"][s_col]["link_to_text"]
-                        )
+                    # ---------- link_to_text 勾選 ----------
+                    link_var = ctk.BooleanVar(
+                        value=cfg["sub_sheets"][short]["columns"][s_col]["link_to_text"]
+                    )
 
-                        def on_toggle_link(c=col, v=link_var):
-                            cfg["sub_sheets"][short]["columns"][c]["link_to_text"] = v.get()
+                    def on_toggle_link(c=s_col, v=link_var, s=short):
+                        cfg["sub_sheets"][s]["columns"][c]["link_to_text"] = v.get()
 
-                        ctk.CTkCheckBox(
-                            s_line,
-                            text="連結文字",
-                            variable=link_var,
-                            command=on_toggle_link
-                        ).pack(side="right", padx=6)
+                    ctk.CTkCheckBox(
+                        s_line,
+                        text="連結文字",
+                        variable=link_var,
+                        command=on_toggle_link
+                    ).pack(side="right", padx=6)
 
-                        # ---------- type 選單 ----------
-                        st_menu = ctk.CTkOptionMenu(
-                            s_line,
-                            values=["string", "float", "int", "bool", "enum"],
-                            width=100,
-                            command=lambda v, sn=short, sc=s_col: self.set_sub_col_type(sheet_name,sn,sc, v)
-                        )
-                        st_menu.set(cfg["sub_sheets"][short]["columns"][s_col]["type"])
-                        st_menu.pack(side="right")
+                    # ---------- type 選單 ----------
+                    st_menu = ctk.CTkOptionMenu(
+                        s_line,
+                        values=["string", "float", "int", "bool", "enum"],
+                        width=100,
+                        command=lambda v, sn=short, sc=s_col: self.set_sub_col_type(sheet_name, sn, sc, v)
+                    )
+                    st_menu.set(cfg["sub_sheets"][short]["columns"][s_col]["type"])
+                    st_menu.pack(side="right")
 
     # ================== Config 操作 ==================
 
@@ -1387,6 +1430,11 @@ class App(ctk.CTk):
         self.main_tabs = ctk.CTkTabview(self)
         self.main_tabs.pack(fill="both", expand=True, padx=5, pady=5)
 
+        self.sheet_editors = []
+        # 全域滑鼠滾輪路由 (根據游標位置決定捲動目標)
+        self.bind_all("<MouseWheel>", self._route_mousewheel)
+        self.bind_all("<Shift-MouseWheel>", self._route_shift_mousewheel)
+
     def load_file(self):
         path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx")])
         if not path: return
@@ -1413,6 +1461,7 @@ class App(ctk.CTk):
 
     def refresh_ui(self):
         # 根據母表數量建立 Tabs
+        self.sheet_editors = []
         for tab_name in list(self.main_tabs._tab_dict.keys()):
             self.main_tabs.delete(tab_name)
 
@@ -1422,12 +1471,54 @@ class App(ctk.CTk):
             # 實例化單一 Sheet 編輯器
             editor = SheetEditor(parent, sheet_name, self.manager)
             editor.pack(fill="both", expand=True)
+            self.sheet_editors.append(editor)
 
     def open_configwnd(self):
         if not self.manager.master_dfs:
             messagebox.showinfo("提示", "請先匯入Excel後再進行參數的配置")
             return
         _ = ConfigEditorWindow(self, self.manager)
+
+    def _route_mousewheel(self, event):
+        """將滑鼠滾輪事件路由到游標所在的可捲動區域"""
+        widget = self.winfo_containing(event.x_root, event.y_root)
+        if not widget:
+            return
+        scroll_units = int(-1 * (event.delta / 120))
+        w = widget
+        while w:
+            # 子表 Canvas
+            if getattr(w, '_is_sub_table_canvas', False):
+                w.yview_scroll(scroll_units, "units")
+                return "break"
+            # LightScrollableFrame 的內部 Canvas
+            if getattr(w, '_is_light_scrollable', False):
+                w.yview_scroll(scroll_units, "units")
+                return "break"
+            # CTkScrollableFrame (備用相容)
+            if isinstance(w, ctk.CTkScrollableFrame):
+                w._parent_canvas.yview_scroll(scroll_units, "units")
+                return "break"
+            try:
+                w = w.master
+            except:
+                break
+
+    def _route_shift_mousewheel(self, event):
+        """將 Shift+滑鼠滾輪事件路由到游標所在的子表 Canvas (橫向捲動)"""
+        widget = self.winfo_containing(event.x_root, event.y_root)
+        if not widget:
+            return
+        scroll_units = int(-1 * (event.delta / 120))
+        w = widget
+        while w:
+            if getattr(w, '_is_sub_table_canvas', False):
+                w.xview_scroll(scroll_units, "units")
+                return "break"
+            try:
+                w = w.master
+            except:
+                break
 
 if __name__ == "__main__":
     app = App()
