@@ -16,6 +16,7 @@ class DataManager:
         self.master_dfs = {}  # 存放母表 DataFrame
         self.sub_dfs = {}  # 存放子表 DataFrame
         self.need_config_alert = False  # 標記是否需要彈出配置視窗
+        self.dirty = False  # 標記資料是否有未儲存的變更
 
         # --- 外部文字表相關變數 ---
         self.text_df = None  # 存放文字表的完整 DataFrame
@@ -197,6 +198,7 @@ class DataManager:
 
             # 強制垃圾回收
             gc.collect()
+            self.dirty = False
 
         except Exception as e:
             print(f"儲存失敗: {e}")
@@ -335,6 +337,7 @@ class DataManager:
                 df.at[row_idx, col_name] = value
 
             df.at[row_idx, col_name] = value
+            self.dirty = True
 
     def _update_external_text(self, key, new_value):
         """
@@ -366,6 +369,7 @@ class DataManager:
             return
 
         self._update_external_text(key, new_text)
+        self.dirty = True
 
     def cleanup(self):
         """清理所有資源"""

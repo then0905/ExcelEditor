@@ -13,6 +13,8 @@ ctk.set_default_color_theme("blue")
 # Dark theme 色彩常數
 _BG = "#2b2b2b"
 _BG_HEADER = "#404040"
+_ROW_EVEN = "#2b2b2b"
+_ROW_ODD = "#3a3a3a"
 
 
 class LightScrollableFrame(tk.Frame):
@@ -44,11 +46,19 @@ class LightScrollableFrame(tk.Frame):
         # 供 App 層級滾輪路由識別
         self._canvas._is_light_scrollable = True
 
+    def _update_scroll_region(self):
+        bbox = self._canvas.bbox("all")
+        if bbox:
+            canvas_h = self._canvas.winfo_height()
+            region_h = max(bbox[3], canvas_h)
+            self._canvas.configure(scrollregion=(bbox[0], bbox[1], bbox[2], region_h))
+
     def _on_interior_cfg(self, _event=None):
-        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+        self._update_scroll_region()
 
     def _on_canvas_cfg(self, event):
         self._canvas.itemconfig(self._win_id, width=event.width)
+        self._update_scroll_region()
 
 
 class SheetEditor(ctk.CTkFrame):
@@ -87,12 +97,14 @@ class SheetEditor(ctk.CTkFrame):
 
     def setup_layout(self):
         """佈局設置"""
+        self.columnconfigure(0, weight=0)
+        self.columnconfigure(1, weight=0)
         self.columnconfigure(2, weight=1)
         self.rowconfigure(0, weight=1)
 
         # --- 左側：分類 ---
         self.frame_left = ctk.CTkFrame(self, width=150)
-        self.frame_left.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
+        self.frame_left.grid(row=0, column=0, sticky="nsew")
 
         ctk.CTkLabel(self.frame_left, text=f"分類: {self.cls_key}", font=("微軟正黑體", 12, "bold")).pack(pady=5)
         self.scroll_cls = LightScrollableFrame(self.frame_left)
@@ -106,7 +118,7 @@ class SheetEditor(ctk.CTkFrame):
 
         # --- 中間：項目清單 ---
         self.frame_mid = ctk.CTkFrame(self, width=200)
-        self.frame_mid.grid(row=0, column=1, sticky="nsew", padx=2, pady=2)
+        self.frame_mid.grid(row=0, column=1, sticky="nsew")
 
         ctk.CTkLabel(self.frame_mid, text="清單", font=("微軟正黑體", 12, "bold")).pack(pady=5)
         self.scroll_items = LightScrollableFrame(self.frame_mid)
@@ -120,7 +132,7 @@ class SheetEditor(ctk.CTkFrame):
 
         # --- 右區：編輯區 (上:母表 / 下:子表) ---
         self.frame_right = ctk.CTkFrame(self)
-        self.frame_right.grid(row=0, column=2, sticky="nsew", padx=2, pady=2)
+        self.frame_right.grid(row=0, column=2, sticky="nsew")
 
         # 右上：母表資料
         ctk.CTkLabel(self.frame_right, text="[母表資料]", font=("微軟正黑體", 12, "bold")).pack(pady=2)
@@ -471,6 +483,7 @@ class SheetEditor(ctk.CTkFrame):
 
         self.df = pd.concat([self.df, pd.DataFrame([new_row])], ignore_index=True)
         self.manager.master_dfs[self.sheet_name] = self.df
+        self.manager.dirty = True
         self.load_classification_list()
         self.load_items_by_group(new_cls)
 
@@ -482,6 +495,7 @@ class SheetEditor(ctk.CTkFrame):
         self.df = self.df[self.df[self.cls_key] != self.current_cls_val]
         self.df.reset_index(drop=True, inplace=True)
         self.manager.master_dfs[self.sheet_name] = self.df
+        self.manager.dirty = True
 
         self.current_cls_val = None
         self.current_master_idx = None
@@ -519,6 +533,7 @@ class SheetEditor(ctk.CTkFrame):
         bottom = self.df.iloc[insert_idx:]
         self.df = pd.concat([top, pd.DataFrame([new_row]), bottom], ignore_index=True)
         self.manager.master_dfs[self.sheet_name] = self.df
+        self.manager.dirty = True
 
         self.load_items_by_group(self.current_cls_val)
 
@@ -536,6 +551,7 @@ class SheetEditor(ctk.CTkFrame):
         self.df.drop(self.current_master_idx, inplace=True)
         self.df.reset_index(drop=True, inplace=True)
         self.manager.master_dfs[self.sheet_name] = self.df
+        self.manager.dirty = True
 
         # 從緩存中移除
         if self.current_master_idx in self.item_buttons:
@@ -578,6 +594,7 @@ class SheetEditor(ctk.CTkFrame):
         bottom = sub_df.iloc[insert_idx:]
         sub_df = pd.concat([top, pd.DataFrame([new_row]), bottom], ignore_index=True)
         self.manager.sub_dfs[full_sub_name] = sub_df
+        self.manager.dirty = True
 
         # 重新載入該 Tab（會自動重用行）
         self._update_sub_table_data(current_tab, full_sub_name, self.current_master_pk)
@@ -590,6 +607,7 @@ class SheetEditor(ctk.CTkFrame):
         sub_df.drop(row_idx, inplace=True)
         sub_df.reset_index(drop=True, inplace=True)
         self.manager.sub_dfs[sheet_full_name] = sub_df
+        self.manager.dirty = True
 
         try:
             current_tab = self.sub_tables_tabs.get()
@@ -646,70 +664,103 @@ class SheetEditor(ctk.CTkFrame):
             self._update_sub_table_data(short_name, sheet, master_id)
 
     def _create_sub_table_structure(self, tab_name):
-        """創建子表的固定結構 """
+        """創建子表的固定結構 (標題固定在頂部，資料區域獨立捲動)"""
         tab_frame = self.sub_tables_tabs.tab(tab_name)
 
-        # 1. 建立外層容器 (存放 Canvas + Scrollbars)
+        # 1. 外層容器
         scroll_container = ctk.CTkFrame(tab_frame)
         scroll_container.pack(fill="both", expand=True)
 
-        # 2. 建立 Canvas
-        canvas = ctk.CTkCanvas(scroll_container, bg="#2b2b2b", highlightthickness=0)
+        # 2. 固定標題區 (header_canvas — 只做水平捲動，不做垂直捲動)
+        header_canvas = tk.Canvas(scroll_container, bg=_BG_HEADER,
+                                  highlightthickness=0, bd=0, height=30)
+        header_canvas.pack(fill="x", side="top")
 
-        # 3. 建立捲軸 (包裝 command 以強制重繪，避免快速拖曳殘影)
-        def yview_and_redraw(*args):
-            canvas.yview(*args)
-            canvas.update_idletasks()
+        header_container = tk.Frame(header_canvas, bg=_BG_HEADER, height=30)
+        header_canvas_window = header_canvas.create_window((0, 0), window=header_container, anchor="nw")
 
-        def xview_and_redraw(*args):
-            canvas.xview(*args)
-            canvas.update_idletasks()
+        def on_header_configure(_event=None):
+            header_canvas.configure(scrollregion=header_canvas.bbox("all"))
+            # 更新 header_canvas 的高度以符合內容
+            h = header_container.winfo_reqheight()
+            header_canvas.configure(height=h)
 
-        v_scrollbar = ctk.CTkScrollbar(scroll_container, orientation="vertical", command=yview_and_redraw)
+        header_container.bind("<Configure>", on_header_configure)
+
+        # 3. 資料區容器 (canvas + scrollbars)
+        body_frame = tk.Frame(scroll_container, bg=_BG)
+        body_frame.pack(fill="both", expand=True)
+
+        canvas = ctk.CTkCanvas(body_frame, bg=_BG, highlightthickness=0)
+
+        v_scrollbar = ctk.CTkScrollbar(body_frame, orientation="vertical",
+                                       command=canvas.yview)
         v_scrollbar.pack(side="right", fill="y")
 
-        h_scrollbar = ctk.CTkScrollbar(scroll_container, orientation="horizontal", command=xview_and_redraw)
+        # 水平捲軸同步驅動 data canvas 和 header canvas
+        def xview_sync(*args):
+            canvas.xview(*args)
+            header_canvas.xview(*args)
+
+        h_scrollbar = ctk.CTkScrollbar(body_frame, orientation="horizontal",
+                                       command=xview_sync)
         h_scrollbar.pack(side="bottom", fill="x")
 
-        # 4. 配置 Canvas
         canvas.pack(side="left", fill="both", expand=True)
-        canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
 
-        # 5. 建立內部資料框架 (使用原生 tk.Frame 避免 CTk 雙層 canvas 殘影)
+        # data canvas 的 xscrollcommand 同步更新 scrollbar 和 header 位置
+        def on_data_xscroll(*args):
+            h_scrollbar.set(*args)
+            header_canvas.xview_moveto(args[0])
+
+        canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=on_data_xscroll)
+
+        # 4. 資料框架 (使用原生 tk.Frame 避免殘影)
         data_container = tk.Frame(canvas, bg=_BG)
         canvas_window = canvas.create_window((0, 0), window=data_container, anchor="nw")
 
-        header_container = tk.Frame(data_container, bg=_BG_HEADER, height=30)
-        header_container.pack(fill="x", side="top", pady=(0, 5))
-
         # === 視窗縮放邏輯 ===
-        def on_frame_configure(event=None):
-            # 更新捲動區域
-            canvas.configure(scrollregion=canvas.bbox("all"))
+        def sync_header_width():
+            """同步 header canvas 的寬度與 scrollregion 以配合資料 canvas"""
+            req_w = max(data_container.winfo_reqwidth(),
+                        header_container.winfo_reqwidth(),
+                        canvas.winfo_width())
+            header_canvas.itemconfig(header_canvas_window, width=req_w)
+            header_canvas.configure(scrollregion=(0, 0, req_w,
+                                                  header_container.winfo_reqheight()))
 
-        def on_canvas_configure(event):
-            # 獲取內容目前的請求寬度
-            req_width = data_container.winfo_reqwidth()
+        def _update_widths():
+            """統一更新 data canvas window 寬度 + header 同步"""
+            req_width = max(data_container.winfo_reqwidth(),
+                            header_container.winfo_reqwidth())
+            canvas_w = canvas.winfo_width()
+            target_w = max(canvas_w, req_width)
+            canvas.itemconfig(canvas_window, width=target_w)
+            bbox = canvas.bbox("all")
+            if bbox:
+                canvas_h = canvas.winfo_height()
+                region_h = max(bbox[3], canvas_h)
+                canvas.configure(scrollregion=(bbox[0], bbox[1], bbox[2], region_h))
+            sync_header_width()
 
-            # 邏輯：
-            # 1. 如果視窗比內容寬 -> 強制內容拉伸到視窗寬度 (為了美觀，背景填滿)
-            # 2. 如果內容比視窗寬 -> 使用內容的寬度 (這樣才會產生捲軸)
+        def on_frame_configure(_event=None):
+            _update_widths()
 
-            if event.width > req_width:
-                canvas.itemconfig(canvas_window, width=event.width)
-            else:
-                # 關鍵：當內容過寬時，不要限制 width，讓它維持 req_width
-                canvas.itemconfig(canvas_window, width=req_width)
+        def on_canvas_configure(_event=None):
+            _update_widths()
 
         data_container.bind("<Configure>", on_frame_configure)
         canvas.bind("<Configure>", on_canvas_configure)
 
-        # 標記此 Canvas 為子表用途 (供 App 層級滾輪路由識別)
+        # 標記 Canvas 用途 (供 App 層級滾輪路由識別)
         canvas._is_sub_table_canvas = True
+        header_canvas._is_sub_table_header_canvas = True
+        header_canvas._linked_data_canvas = canvas
 
-        # 緩存容器 (滑鼠滾輪由 App 層級統一路由)
+        # 緩存容器
         self.sub_table_frames[tab_name] = {
             'header': header_container,
+            'header_canvas': header_canvas,
             'data': data_container,
             'canvas': canvas,
             'scroll_container': scroll_container
@@ -780,15 +831,18 @@ class SheetEditor(ctk.CTkFrame):
         new_active_rows = []
 
         for i, (idx, row) in enumerate(filtered_rows.iterrows()):
+            row_bg = _ROW_EVEN if i % 2 == 0 else _ROW_ODD
             if i < available_rows:
                 # 重用現有的行
                 row_frame = row_pool[i]
                 self._update_sub_table_row(row_frame, headers, row, idx, sheet_full_name, sub_cols_cfg)
-                row_frame.pack(fill="x", pady=2, padx=2)
+                row_frame.configure(bg=row_bg)
+                row_frame.pack(fill="x", pady=1, padx=2, ipady=3)
             else:
                 # 創建新行
                 row_frame = self._create_sub_table_row(data_frame, headers, row, idx, sheet_full_name, sub_cols_cfg)
-                row_frame.pack(fill="x", pady=2, padx=2)
+                row_frame.configure(bg=row_bg)
+                row_frame.pack(fill="x", pady=1, padx=2, ipady=3)
 
             new_active_rows.append(row_frame)
 
@@ -988,9 +1042,10 @@ class SheetEditor(ctk.CTkFrame):
             ctk.CTkLabel(header_frame, text=col, width=120, font=("微軟正黑體", 10, "bold")).pack(side="left", padx=2)
 
         # 資料列
-        for idx, row in filtered_df.iterrows():
-            row_frame = tk.Frame(scroll_frame.interior, bg=_BG)
-            row_frame.pack(fill="x", pady=2)
+        for i, (idx, row) in enumerate(filtered_df.iterrows()):
+            row_bg = _ROW_EVEN if i % 2 == 0 else _ROW_ODD
+            row_frame = tk.Frame(scroll_frame.interior, bg=row_bg)
+            row_frame.pack(fill="x", pady=1, ipady=3)
 
             # 刪除按鈕
             ctk.CTkButton(row_frame, text="X", width=60, height=25, fg_color="darkred",
@@ -1435,6 +1490,19 @@ class App(ctk.CTk):
         self.bind_all("<MouseWheel>", self._route_mousewheel)
         self.bind_all("<Shift-MouseWheel>", self._route_shift_mousewheel)
 
+        # 關閉視窗攔截
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self):
+        """關閉視窗前檢查未儲存的變更"""
+        if self.manager.dirty:
+            result = messagebox.askyesnocancel("資料未儲存", "有尚未儲存的變更，是否先儲存再關閉？")
+            if result is None:  # Cancel
+                return
+            if result:  # Yes
+                self.save_file()
+        self.destroy()
+
     def load_file(self):
         path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx")])
         if not path: return
@@ -1489,11 +1557,15 @@ class App(ctk.CTk):
         while w:
             # 子表 Canvas
             if getattr(w, '_is_sub_table_canvas', False):
-                w.yview_scroll(scroll_units, "units")
+                top, bottom = w.yview()
+                if bottom - top < 1.0:
+                    w.yview_scroll(scroll_units, "units")
                 return "break"
             # LightScrollableFrame 的內部 Canvas
             if getattr(w, '_is_light_scrollable', False):
-                w.yview_scroll(scroll_units, "units")
+                top, bottom = w.yview()
+                if bottom - top < 1.0:
+                    w.yview_scroll(scroll_units, "units")
                 return "break"
             # CTkScrollableFrame (備用相容)
             if isinstance(w, ctk.CTkScrollableFrame):
@@ -1514,6 +1586,10 @@ class App(ctk.CTk):
         while w:
             if getattr(w, '_is_sub_table_canvas', False):
                 w.xview_scroll(scroll_units, "units")
+                return "break"
+            # 支援在 header 區域也能觸發水平捲動 (找到相鄰的 data canvas)
+            if getattr(w, '_is_sub_table_header_canvas', False):
+                w._linked_data_canvas.xview_scroll(scroll_units, "units")
                 return "break"
             try:
                 w = w.master
