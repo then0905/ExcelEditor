@@ -3,6 +3,7 @@ import tkinter as tk
 from tkinter import messagebox, filedialog
 from data_manager import DataManager
 import os
+import sys
 from PIL import Image
 import pandas as pd
 import tkinter.font as tkfont
@@ -1461,7 +1462,9 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Game Data Editor (Config Driven)")
-        self.iconbitmap("icon.ico")
+        icon_path = os.path.join(getattr(sys, '_MEIPASS', os.path.abspath(".")), "icon.ico")
+        if os.path.exists(icon_path):
+            self.iconbitmap(icon_path)
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
 
