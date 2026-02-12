@@ -1447,9 +1447,39 @@ class ConfigEditorWindow(ctk.CTkToplevel):
 
     def set_col_type(self, sheet_name, col, val):
         self.manager.config[sheet_name]["columns"][col]["type"] = val
+        if val == "enum":
+            self._ask_enum_options(self.manager.config[sheet_name]["columns"][col])
 
     def set_sub_col_type(self, m, s, col, val):
         self.manager.config[m]["sub_sheets"][s]["columns"][col]["type"] = val
+        if val == "enum":
+            self._ask_enum_options(self.manager.config[m]["sub_sheets"][s]["columns"][col])
+
+    def _ask_enum_options(self, col_conf):
+        """彈出視窗讓使用者輸入 enum 選項（逗號分隔）"""
+        current = col_conf.get("options", [])
+        current_str = ", ".join(current) if current else ""
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("設定 Enum 選項")
+        dialog.geometry("400x150")
+        dialog.transient(self)
+        dialog.grab_set()
+
+        ctk.CTkLabel(dialog, text="請輸入選項（以逗號分隔）：").pack(padx=10, pady=(10, 5), anchor="w")
+        var = ctk.StringVar(value=current_str)
+        entry = ctk.CTkEntry(dialog, textvariable=var, width=360)
+        entry.pack(padx=10, pady=5)
+        entry.focus_set()
+
+        def on_confirm():
+            raw = var.get().strip()
+            opts = [o.strip() for o in raw.split(",") if o.strip()] if raw else []
+            col_conf["options"] = opts
+            dialog.destroy()
+
+        entry.bind("<Return>", lambda e: on_confirm())
+        ctk.CTkButton(dialog, text="確認", command=on_confirm).pack(pady=10)
 
     def save_and_close(self):
         self.manager.save_config()
