@@ -54,6 +54,53 @@ class DataManager:
         mask = ~df.apply(lambda row: all(str(v).strip() == "" for v in row), axis=1)
         return df[mask].reset_index(drop=True)
 
+    def _get_col_type_map(self, sheet_name):
+        """取得工作表各欄位的資料型別對應"""
+        col_types = {}
+        if "#" in sheet_name:
+            parts = sheet_name.split("#", 1)
+            master_name, sub_name = parts[0], parts[1]
+            if master_name in self.config:
+                cols = self.config[master_name].get("sub_sheets", {}).get(sub_name, {}).get("columns", {})
+                for col_name, col_conf in cols.items():
+                    col_types[col_name] = col_conf.get("type", "string")
+        else:
+            if sheet_name in self.config:
+                cols = self.config[sheet_name].get("columns", {})
+                for col_name, col_conf in cols.items():
+                    col_types[col_name] = col_conf.get("type", "string")
+        return col_types
+
+    @staticmethod
+    def _convert_value_for_excel(value, col_type):
+        """根據欄位型別轉換值供 Excel 寫入"""
+        if value == "" or value is None:
+            return value
+        try:
+            if col_type == "int":
+                return int(float(str(value)))
+            elif col_type == "float":
+                return float(str(value))
+            elif col_type == "bool":
+                return str(value).lower() in ('true', '1', 'yes')
+        except (ValueError, TypeError):
+            pass
+        return value
+
+    def _prepare_df_for_save(self, sheet_name, df):
+        """儲存前根據 config 轉換 DataFrame 的數值欄位為正確型別"""
+        col_types = self._get_col_type_map(sheet_name)
+        if not col_types:
+            return df
+        df = df.copy()
+        for col_name in df.columns:
+            col_type = col_types.get(col_name, "string")
+            if col_type in ("int", "float", "bool"):
+                df[col_name] = df[col_name].apply(
+                    lambda v, ct=col_type: self._convert_value_for_excel(v, ct)
+                )
+        return df
+
     @staticmethod
     def _copy_cell_style(cell):
         """複製儲存格的格式資訊"""
@@ -298,9 +345,9 @@ class DataManager:
             if not os.path.exists(self.excel_path):
                 with pd.ExcelWriter(self.excel_path, engine='openpyxl', mode='w') as writer:
                     for sheet, df in self.master_dfs.items():
-                        df.to_excel(writer, sheet_name=sheet, index=False)
+                        self._prepare_df_for_save(sheet, df).to_excel(writer, sheet_name=sheet, index=False)
                     for sheet, df in self.sub_dfs.items():
-                        df.to_excel(writer, sheet_name=sheet, index=False)
+                        self._prepare_df_for_save(sheet, df).to_excel(writer, sheet_name=sheet, index=False)
                     # 套用儲存的格式
                     for sheet_name in list(self.master_dfs) + list(self.sub_dfs):
                         if sheet_name in writer.sheets:
@@ -414,11 +461,14 @@ class DataManager:
             cell = ws.cell(row=1, column=col_idx)
             cell.value = col_name
 
+        col_types = self._get_col_type_map(sheet_name)
+
         current_row_idx = 2
         for row in df.itertuples(index=False):
             for col_idx, value in enumerate(row, 1):
                 cell = ws.cell(row=current_row_idx, column=col_idx)
-                cell.value = value
+                col_name = df.columns[col_idx - 1]
+                cell.value = self._convert_value_for_excel(value, col_types.get(col_name, "string"))
             current_row_idx += 1
 
         # 清除多餘的舊資料（值與格式）
