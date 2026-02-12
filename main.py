@@ -317,18 +317,17 @@ class SheetEditor(ctk.CTkFrame):
                 key_entry.configure(state="disabled")
                 key_entry.pack(side="left", padx=(0, 5))
 
-                # Text (可編輯)
-                var = ctk.StringVar()
-                text_entry = ctk.CTkEntry(f, textvariable=var)
-                text_entry.pack(side="left", fill="x", expand=True)
+                # Text (可編輯) — 使用 CTkTextbox 支援多行
+                textbox = ctk.CTkTextbox(f, height=25, wrap="word")
+                self._setup_auto_textbox(textbox)
+                textbox.pack(side="left", fill="x", expand=True)
 
-                self.master_fields[col] = (key_entry, text_entry)  # 保存兩個
-                self.master_field_vars[col] = var
+                self.master_fields[col] = (key_entry, textbox)
+                self.master_field_vars[col] = None  # CTkTextbox 不使用 StringVar
 
-                # 綁定更新事件
-                trace_id = var.trace_add("write",
-                                         lambda *args, c=col, v=var: self._on_linked_field_change(c, v))
-                self.trace_ids[col] = trace_id
+                textbox.bind("<KeyRelease>",
+                             lambda e, c=col, tb=textbox: (self._on_linked_field_change_tb(c, tb), self._resize_textbox(tb)))
+                self.trace_ids[col] = "bind"
 
             elif col_type == "bool":
                 var = ctk.BooleanVar()
@@ -347,7 +346,7 @@ class SheetEditor(ctk.CTkFrame):
 
                 self.master_fields[col] = menu
 
-            else:  # string, int, float
+            elif col_type in ("int", "float"):
                 var = ctk.StringVar()
                 entry = ctk.CTkEntry(f, textvariable=var)
                 entry.pack(side="left", fill="x", expand=True)
@@ -359,8 +358,30 @@ class SheetEditor(ctk.CTkFrame):
                                          lambda *args, c=col, v=var: self._on_field_change(c, v.get()))
                 self.trace_ids[col] = trace_id
 
+            else:  # string — 使用 CTkTextbox 支援多行
+                textbox = ctk.CTkTextbox(f, height=25, wrap="word")
+                self._setup_auto_textbox(textbox)
+                textbox.pack(side="left", fill="x", expand=True)
+
+                self.master_fields[col] = textbox
+                self.master_field_vars[col] = None  # CTkTextbox 不使用 StringVar
+
+                textbox.bind("<KeyRelease>",
+                             lambda e, c=col, tb=textbox: (self._on_field_change(c, tb.get("1.0", "end-1c")), self._resize_textbox(tb)))
+                self.trace_ids[col] = "bind"
+
         # 首次載入數據
         self._update_editor_data(row_data)
+
+    def _on_linked_field_change_tb(self, col, textbox):
+        """連結欄位 (CTkTextbox 版) 文字變更回呼"""
+        key_entry, _ = self.master_fields[col]
+        # 從 key_entry 取得 key
+        key_entry.configure(state="normal")
+        key = key_entry.get()
+        key_entry.configure(state="disabled")
+        new_text = textbox.get("1.0", "end-1c")
+        self.manager.update_linked_text(key, new_text)
 
     def _update_editor_data(self, row_data):
         """只更新欄位的數據值（不重建 UI）"""
@@ -375,13 +396,27 @@ class SheetEditor(ctk.CTkFrame):
             col_type = col_conf.get("type", "string")
             is_linked = col_conf.get("link_to_text", False)
 
-            # 暫時移除 trace 避免觸發更新
+            # 暫時移除 trace / unbind 避免觸發更新
             if col in self.trace_ids:
-                var = self.master_field_vars[col]
-                var.trace_remove("write", self.trace_ids[col])
+                var = self.master_field_vars.get(col)
+                if var is not None:
+                    try:
+                        var.trace_remove("write", self.trace_ids[col])
+                    except:
+                        pass
+                else:
+                    # CTkTextbox — 暫時解綁
+                    widget = self.master_fields.get(col)
+                    if isinstance(widget, tuple):
+                        widget = widget[1]
+                    if isinstance(widget, ctk.CTkTextbox):
+                        try:
+                            widget.unbind("<KeyRelease>")
+                        except:
+                            pass
 
             if is_linked:
-                key_entry, text_entry = self.master_fields[col]
+                key_entry, textbox = self.master_fields[col]
 
                 # 更新 Key
                 key_entry.configure(state="normal")
@@ -389,10 +424,11 @@ class SheetEditor(ctk.CTkFrame):
                 key_entry.insert(0, str(val))
                 key_entry.configure(state="disabled")
 
-                # 更新 Text
-                real_text = self.manager.get_text_value(val)
-                var = self.master_field_vars[col]
-                var.set(str(real_text))
+                # 更新 Text (CTkTextbox)
+                real_text = str(self.manager.get_text_value(val))
+                textbox.delete("1.0", "end")
+                textbox.insert("1.0", real_text)
+                self._resize_textbox(textbox)
 
             elif col_type == "bool":
                 var = self.master_field_vars[col]
@@ -402,20 +438,38 @@ class SheetEditor(ctk.CTkFrame):
                 menu = self.master_fields[col]
                 menu.set(str(val))
 
-            else:
+            elif col_type in ("int", "float"):
                 var = self.master_field_vars[col]
                 var.set(str(val))
 
-            # 重新綁定 trace
-            if col in self.trace_ids and col in self.master_field_vars:
-                var = self.master_field_vars[col]
-                if is_linked:
-                    trace_id = var.trace_add("write",
-                                             lambda *args, c=col, v=var: self._on_linked_field_change(c, v))
+            else:  # string (CTkTextbox)
+                textbox = self.master_fields[col]
+                textbox.delete("1.0", "end")
+                textbox.insert("1.0", str(val))
+                self._resize_textbox(textbox)
+
+            # 重新綁定 trace / bind
+            if col in self.trace_ids:
+                var = self.master_field_vars.get(col)
+                if var is not None:
+                    if is_linked:
+                        trace_id = var.trace_add("write",
+                                                 lambda *args, c=col, v=var: self._on_linked_field_change(c, v))
+                    else:
+                        trace_id = var.trace_add("write",
+                                                 lambda *args, c=col, v=var: self._on_field_change(c, v.get()))
+                    self.trace_ids[col] = trace_id
                 else:
-                    trace_id = var.trace_add("write",
-                                             lambda *args, c=col, v=var: self._on_field_change(c, v.get()))
-                self.trace_ids[col] = trace_id
+                    # 重新綁定 CTkTextbox
+                    widget = self.master_fields.get(col)
+                    if is_linked:
+                        _, textbox = widget
+                        textbox.bind("<KeyRelease>",
+                                     lambda e, c=col, tb=textbox: (self._on_linked_field_change_tb(c, tb), self._resize_textbox(tb)))
+                    elif isinstance(widget, ctk.CTkTextbox):
+                        widget.bind("<KeyRelease>",
+                                    lambda e, c=col, tb=widget: (self._on_field_change(c, tb.get("1.0", "end-1c")), self._resize_textbox(tb)))
+                    self.trace_ids[col] = "bind"
 
     def _update_image(self):
         """只更新圖片（不重建 UI）"""
@@ -869,6 +923,63 @@ class SheetEditor(ctk.CTkFrame):
             ctk.CTkLabel(header_frame, text=label_text, width=width,
                          font=("微軟正黑體", 10, "bold")).pack(side="left", padx=2)
 
+    @staticmethod
+    def _setup_auto_textbox(textbox):
+        """設定 CTkTextbox：永久隱藏捲軸，封鎖所有重新顯示的途徑"""
+        textbox._y_scrollbar.grid_remove()
+        textbox._x_scrollbar.grid_remove()
+        textbox._check_if_scrollbars_needed = lambda *a, **kw: None
+        # 封鎖 grid/pack/place，防止 configure() 內部重新顯示捲軸
+        textbox._y_scrollbar.grid = lambda *a, **kw: None
+        textbox._y_scrollbar.grid_configure = lambda *a, **kw: None
+        textbox._x_scrollbar.grid = lambda *a, **kw: None
+        textbox._x_scrollbar.grid_configure = lambda *a, **kw: None
+
+    @staticmethod
+    def _resize_textbox(textbox, min_height=25):
+        """
+        使用實際行高與真實顯示行數
+        """
+        content = textbox.get("1.0", "end-1c")
+        inner = textbox._textbox
+
+        if not content.strip():
+            textbox.configure(height=min_height)
+            return min_height
+
+        line_info = inner.dlineinfo("1.0")
+        if line_info:
+            actual_line_height = line_info[3]  # 這就是該行在螢幕上的真實像素高
+        else:
+            font = tkfont.Font(font=inner.cget("font"))
+            actual_line_height = font.metrics("linespace")
+
+        try:
+            total_display_lines = int(inner.count("1.0", "end", "displaylines")[0])
+        except (TypeError, IndexError):
+            total_display_lines = content.count('\n') + 1.15
+
+        padding = 15
+        new_h = max(min_height, (total_display_lines * actual_line_height) + padding)
+
+        textbox.configure(height=new_h)
+        return new_h
+
+    def _auto_resize_row(self, row_frame, headers):
+        """計算行內最大 textbox 高度並統一該行所有 textbox"""
+        max_height = 25
+        textboxes = []
+        for col in headers:
+            widget = row_frame._widgets.get(col)
+            tb = widget[1] if isinstance(widget, tuple) else widget
+            if isinstance(tb, ctk.CTkTextbox):
+                h = self._resize_textbox(tb)
+                max_height = max(max_height, h)
+                textboxes.append(tb)
+        if max_height > 25:
+            for tb in textboxes:
+                tb.configure(height=max_height)
+
     def _create_sub_table_row(self, parent, headers, row_data, row_idx, sheet_name, cols_cfg):
         """創建新的資料行（當池中沒有可用行時）"""
         row_frame = tk.Frame(parent, bg=_BG)
@@ -891,17 +1002,17 @@ class SheetEditor(ctk.CTkFrame):
             is_linked = col_info.get("link_to_text", False)
 
             if is_linked:
-                # Key + Text 兩個欄位
+                # Key (唯讀) + Text (CTkTextbox 自動換行拉高)
                 key_entry = ctk.CTkEntry(row_frame, width=60, height=25, text_color="gray")
                 key_entry.configure(state="disabled")
                 key_entry.pack(side="left", padx=1)
 
-                text_var = ctk.StringVar()
-                text_entry = ctk.CTkEntry(row_frame, textvariable=text_var, width=120, height=25)
-                text_entry.pack(side="left", padx=1)
+                textbox = ctk.CTkTextbox(row_frame, width=120, height=25, wrap="word")
+                self._setup_auto_textbox(textbox)
+                textbox.pack(side="left", padx=1)
 
-                row_frame._widgets[col] = (key_entry, text_entry)
-                row_frame._vars[col] = text_var
+                row_frame._widgets[col] = (key_entry, textbox)
+                row_frame._vars[col] = None
 
             elif col_type == "enum":
                 var = ctk.StringVar()
@@ -920,13 +1031,21 @@ class SheetEditor(ctk.CTkFrame):
                 row_frame._widgets[col] = chk
                 row_frame._vars[col] = var
 
-            else:  # string, int, float
+            elif col_type in ("int", "float"):
                 var = ctk.StringVar()
                 entry = ctk.CTkEntry(row_frame, textvariable=var, width=120, height=25)
                 entry.pack(side="left", padx=2)
 
                 row_frame._widgets[col] = entry
                 row_frame._vars[col] = var
+
+            else:  # string — CTkTextbox 自動換行拉高
+                textbox = ctk.CTkTextbox(row_frame, width=120, height=25, wrap="word")
+                self._setup_auto_textbox(textbox)
+                textbox.pack(side="left", padx=2)
+
+                row_frame._widgets[col] = textbox
+                row_frame._vars[col] = None
 
         # 填充初始數據
         self._update_sub_table_row(row_frame, headers, row_data, row_idx, sheet_name, cols_cfg)
@@ -936,13 +1055,23 @@ class SheetEditor(ctk.CTkFrame):
     def _update_sub_table_row(self, row_frame, headers, row_data, row_idx, sheet_name, cols_cfg):
         """更新資料行的內容（重用時調用）"""
 
-        # 1. 清理舊的 trace
-        for col, trace_id in row_frame._trace_ids.items():
-            if col in row_frame._vars:
+        # 1. 清理舊的 trace / binding
+        for col in list(row_frame._trace_ids.keys()):
+            tid = row_frame._trace_ids[col]
+            var = row_frame._vars.get(col)
+            if var is not None:
                 try:
-                    row_frame._vars[col].trace_remove("write", trace_id)
+                    var.trace_remove("write", tid)
                 except:
                     pass
+            else:
+                widget = row_frame._widgets.get(col)
+                tb = widget[1] if isinstance(widget, tuple) else widget
+                if isinstance(tb, ctk.CTkTextbox):
+                    try:
+                        tb.unbind("<KeyRelease>")
+                    except:
+                        pass
         row_frame._trace_ids.clear()
 
         # 2. 更新刪除按鈕的命令
@@ -961,7 +1090,7 @@ class SheetEditor(ctk.CTkFrame):
                 continue
 
             if is_linked:
-                key_entry, text_entry = row_frame._widgets[col]
+                key_entry, textbox = row_frame._widgets[col]
 
                 # 更新 Key
                 key_entry.configure(state="normal")
@@ -970,14 +1099,16 @@ class SheetEditor(ctk.CTkFrame):
                 key_entry.configure(state="disabled")
 
                 # 更新 Text
-                real_text = self.manager.get_text_value(val)
-                var = row_frame._vars[col]
-                var.set(str(real_text))
+                real_text = str(self.manager.get_text_value(val))
+                textbox.delete("1.0", "end")
+                textbox.insert("1.0", real_text)
 
-                # 重新綁定 trace
-                trace_id = var.trace_add("write",
-                                         lambda *args, k=val, v=var: self.manager.update_linked_text(k, v.get()))
-                row_frame._trace_ids[col] = trace_id
+                # 綁定變更事件 + 自動拉高
+                textbox.bind("<KeyRelease>",
+                             lambda e, k=val, tb=textbox, rf=row_frame, h=headers:
+                             (self.manager.update_linked_text(k, tb.get("1.0", "end-1c")),
+                              self._auto_resize_row(rf, h)))
+                row_frame._trace_ids[col] = "bind"
 
             elif col_type == "enum":
                 var = row_frame._vars[col]
@@ -997,7 +1128,7 @@ class SheetEditor(ctk.CTkFrame):
                 chk.configure(command=lambda r=row_idx, c=col, s=sheet_name, v=var:
                 self.manager.update_cell(True, s, r, c, v.get()))
 
-            else:  # string, int, float
+            elif col_type in ("int", "float"):
                 var = row_frame._vars[col]
                 var.set(str(val))
 
@@ -1006,6 +1137,21 @@ class SheetEditor(ctk.CTkFrame):
                                          lambda *args, s=sheet_name, r=row_idx, c=col, v=var:
                                          self.manager.update_cell(True, s, r, c, v.get()))
                 row_frame._trace_ids[col] = trace_id
+
+            else:  # string (CTkTextbox)
+                textbox = row_frame._widgets[col]
+                textbox.delete("1.0", "end")
+                textbox.insert("1.0", str(val))
+
+                # 綁定變更事件 + 自動拉高
+                textbox.bind("<KeyRelease>",
+                             lambda e, s=sheet_name, r=row_idx, c=col, tb=textbox, rf=row_frame, h=headers:
+                             (self.manager.update_cell(True, s, r, c, tb.get("1.0", "end-1c")),
+                              self._auto_resize_row(rf, h)))
+                row_frame._trace_ids[col] = "bind"
+
+        # 4. 初始自動調整行高
+        self._auto_resize_row(row_frame, headers)
 
     def _show_error_in_tab(self, tab_name, message):
         """在 Tab 中顯示錯誤訊息"""
@@ -1053,6 +1199,8 @@ class SheetEditor(ctk.CTkFrame):
                           command=lambda s=sheet_name, r=idx: self.delete_sub_item(s, r)).pack(side="left", padx=2)
 
             # 資料欄位
+            row_frame._widgets = {}
+            textboxes = []
             for col in headers:
                 val = row[col]
                 c_info = cols_cfg.get(col, {"type": "string"})
@@ -1060,17 +1208,21 @@ class SheetEditor(ctk.CTkFrame):
                 is_linked = c_info.get("link_to_text", False)
 
                 if is_linked:
-                    # Key + Text
                     key_entry = ctk.CTkEntry(row_frame, width=60, height=25)
                     key_entry.insert(0, str(val))
                     key_entry.configure(state="disabled")
                     key_entry.pack(side="left", padx=1)
 
-                    real_text = self.manager.get_text_value(val)
-                    var = ctk.StringVar(value=str(real_text))
-                    text_entry = ctk.CTkEntry(row_frame, textvariable=var, width=100, height=25)
-                    text_entry.pack(side="left", padx=1)
-                    var.trace_add("write", lambda *args, k=val, v=var: self.manager.update_linked_text(k, v.get()))
+                    real_text = str(self.manager.get_text_value(val))
+                    textbox = ctk.CTkTextbox(row_frame, width=120, height=25, wrap="word")
+                    self._setup_auto_textbox(textbox)
+                    textbox.insert("1.0", real_text)
+                    textbox.pack(side="left", padx=1)
+                    textbox.bind("<KeyRelease>",
+                                 lambda e, k=val, tb=textbox:
+                                 self.manager.update_linked_text(k, tb.get("1.0", "end-1c")))
+                    row_frame._widgets[col] = (key_entry, textbox)
+                    textboxes.append(textbox)
 
                 elif col_type == "enum":
                     var = ctk.StringVar(value=str(val))
@@ -1085,31 +1237,51 @@ class SheetEditor(ctk.CTkFrame):
                                           command=lambda r=idx, c=col, s=sheet_name, v=var: self.manager.update_cell(
                                               True, s, r, c, v.get()))
                     chk.pack(side="left", padx=2)
-                else:
+                elif col_type in ("int", "float"):
                     var = ctk.StringVar(value=str(val))
                     entry = ctk.CTkEntry(row_frame, textvariable=var, width=120, height=25)
                     entry.pack(side="left", padx=2)
                     var.trace_add("write",
                                   lambda *args, s=sheet_name, r=idx, c=col, v=var: self.manager.update_cell(True, s, r,
                                                                                                             c, v.get()))
+                else:  # string
+                    textbox = ctk.CTkTextbox(row_frame, width=120, height=25, wrap="word")
+                    self._setup_auto_textbox(textbox)
+                    textbox.insert("1.0", str(val))
+                    textbox.pack(side="left", padx=2)
+                    textbox.bind("<KeyRelease>",
+                                 lambda e, s=sheet_name, r=idx, c=col, tb=textbox:
+                                 self.manager.update_cell(True, s, r, c, tb.get("1.0", "end-1c")))
+                    row_frame._widgets[col] = textbox
+                    textboxes.append(textbox)
+
+            # 統一行高
+            max_h = 25
+            for tb in textboxes:
+                max_h = max(max_h, self._resize_textbox(tb))
+            if max_h > 25:
+                for tb in textboxes:
+                    tb.configure(height=max_h)
 
     def cleanup(self):
         """清理資源"""
-        # 清理母表 trace
+        # 清理母表 trace / binding
         for col, trace_id in self.trace_ids.items():
-            if col in self.master_field_vars:
+            var = self.master_field_vars.get(col)
+            if var is not None:
                 try:
-                    self.master_field_vars[col].trace_remove("write", trace_id)
+                    var.trace_remove("write", trace_id)
                 except:
                     pass
 
-        # 清理子表 trace
+        # 清理子表 trace / binding
         for tab_name, active_rows in self.sub_table_active_rows.items():
             for row_frame in active_rows:
-                for col, trace_id in row_frame._trace_ids.items():
-                    if col in row_frame._vars:
+                for col in list(row_frame._trace_ids.keys()):
+                    var = row_frame._vars.get(col)
+                    if var is not None:
                         try:
-                            row_frame._vars[col].trace_remove("write", trace_id)
+                            var.trace_remove("write", row_frame._trace_ids[col])
                         except:
                             pass
 
