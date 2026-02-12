@@ -13,10 +13,29 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        'scipy', 'matplotlib', 'IPython', 'jupyter',
+        'notebook', 'pytest', 'unittest',
+        'numpy.f2py', 'numpy.distutils', 'numpy.testing',
+        'pandas.tests', 'pandas.io.formats.style',
+        'tkinter.test', 'lib2to3',
+        'multiprocessing', 'concurrent',
+        'email', 'html', 'http', 'xmlrpc',
+        'pydoc', 'doctest', 'argparse',
+        'logging.handlers', 'logging.config',
+    ],
     noarchive=False,
     optimize=0,
 )
+
+# 移除不必要的大型 DLL（numpy MKL/OpenBLAS 測試等）
+import re
+_exclude_patterns = re.compile(
+    r'(mkl_|libopenblas|libiomp|libblas|liblapack|libgfortran|libquadmath|vcruntime)'
+    r'.*\.(dll|so)', re.IGNORECASE
+)
+a.binaries = [b for b in a.binaries if not _exclude_patterns.search(b[0])]
+
 pyz = PYZ(a.pure)
 
 exe = EXE(
