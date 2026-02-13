@@ -213,10 +213,11 @@ class SheetEditor(ctk.CTkFrame):
         # 2. 新增或更新項目按鈕
         for idx, row in filter_df.iterrows():
             # 取得顯示名稱
-            text_dict_name = self.manager.text_dict.get(row['Name'])
             display_name = f"{row[self.pk_key]}"
-            if text_dict_name:
-                display_name = text_dict_name["value"]
+            if 'Name' in row.index and self.manager.text_dict:
+                text_dict_name = self.manager.text_dict.get(row['Name'])
+                if text_dict_name:
+                    display_name = text_dict_name["value"]
 
             if idx in self.item_buttons:
                 # 已存在：只更新文字和顏色

@@ -35,9 +35,7 @@ class DataManager:
         self._excel_file_handle = None  # 保存 Excel 文件句柄
         self._text_file_handle = None  # 保存文字表文件句柄
         
-        # 初始化時嘗試載入文字表 (如果 config 有寫)
-        if "global_text_path" in self.config:
-            self.load_external_text(self.config["global_text_path"])
+        # 文字表在 load_excel 時根據各 Excel 獨立的配置檔載入
 
     def _load_config(self, path):
         if not os.path.exists(path):
@@ -205,6 +203,24 @@ class DataManager:
         self.master_dfs = {}
         self.sub_dfs = {}
         self.sheet_styles = {}
+
+        # 每個 Excel 使用獨立的配置檔
+        base = os.path.splitext(file_path)[0]
+        self.config_path = base + "_config.json"
+        self.config = self._load_config(self.config_path)
+
+        # 清空文字表狀態
+        self.text_dict = {}
+        self.text_df = None
+        self.text_file_path = ""
+        self.text_modified = False
+        self.text_sheetnames = []
+        self.text_modifications = {}
+        self._text_file_handle = None
+
+        # 若配置有文字表路徑，嘗試載入
+        if "global_text_path" in self.config:
+            self.load_external_text(self.config["global_text_path"])
 
         # 使用 context manager 確保文件關閉
         try:
