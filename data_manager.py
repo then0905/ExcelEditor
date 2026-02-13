@@ -14,7 +14,8 @@ warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 class DataManager:
     def __init__(self, config_path="config.json"):
         self.config_path = config_path
-        self.config = self._load_config(config_path)
+        self._full_config = self._load_config(config_path)  # 完整配置（以 Excel 路徑為 key）
+        self.config = {}  # 當前 Excel 的配置（指向 _full_config 的子 dict）
         self.excel_path = None
         self.master_dfs = {}  # 存放母表 DataFrame
         self.sub_dfs = {}  # 存放子表 DataFrame
@@ -34,8 +35,6 @@ class DataManager:
 
         self._excel_file_handle = None  # 保存 Excel 文件句柄
         self._text_file_handle = None  # 保存文字表文件句柄
-        
-        # 文字表在 load_excel 時根據各 Excel 獨立的配置檔載入
 
     def _load_config(self, path):
         if not os.path.exists(path):
@@ -204,10 +203,11 @@ class DataManager:
         self.sub_dfs = {}
         self.sheet_styles = {}
 
-        # 每個 Excel 使用獨立的配置檔
-        base = os.path.splitext(file_path)[0]
-        self.config_path = base + "_config.json"
-        self.config = self._load_config(self.config_path)
+        # 從 _full_config 取出該 Excel 的獨立配置區段
+        excel_key = os.path.normpath(file_path)
+        if excel_key not in self._full_config:
+            self._full_config[excel_key] = {}
+        self.config = self._full_config[excel_key]
 
         # 清空文字表狀態
         self.text_dict = {}
@@ -218,7 +218,7 @@ class DataManager:
         self.text_modifications = {}
         self._text_file_handle = None
 
-        # 若配置有文字表路徑，嘗試載入
+        # 若該 Excel 的配置有文字表路徑，嘗試載入
         if "global_text_path" in self.config:
             self.load_external_text(self.config["global_text_path"])
 
@@ -342,7 +342,7 @@ class DataManager:
 
     def save_config(self):
         with open(self.config_path, 'w', encoding='utf-8') as f:
-            json.dump(self.config, f, indent=4, ensure_ascii=False)
+            json.dump(self._full_config, f, indent=4, ensure_ascii=False)
 
     def save_excel(self):
         """
