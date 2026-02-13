@@ -1734,15 +1734,24 @@ class App(ctk.CTk):
             messagebox.showerror("存檔失敗", str(e))
 
     def refresh_ui(self):
-        # 根據母表數量建立 Tabs
+        # 1. 先清理舊的 SheetEditor
+        for editor in self.sheet_editors:
+            editor.destroy()
         self.sheet_editors = []
+
+        # 2. 刪除舊 Tabs
         for tab_name in list(self.main_tabs._tab_dict.keys()):
             self.main_tabs.delete(tab_name)
 
+        # 3. 重建整個 TabView（避免殘留狀態）
+        self.main_tabs.destroy()
+        self.main_tabs = ctk.CTkTabview(self)
+        self.main_tabs.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # 4. 建立新的 Tabs 和 Editor
         for sheet_name in self.manager.master_dfs:
             self.main_tabs.add(sheet_name)
             parent = self.main_tabs.tab(sheet_name)
-            # 實例化單一 Sheet 編輯器
             editor = SheetEditor(parent, sheet_name, self.manager)
             editor.pack(fill="both", expand=True)
             self.sheet_editors.append(editor)
