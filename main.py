@@ -4,18 +4,54 @@ from tkinter import messagebox, filedialog
 from data_manager import DataManager
 import os
 import sys
+import threading
 from PIL import Image
 import pandas as pd
-import tkinter.font as tkfont
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
+
+# ══════════════════════════════════════════════════════════════
+# Performance Guidelines（效能開發守則）
+# ══════════════════════════════════════════════════════════════
+# 1. 禁止在迴圈/熱路徑使用 CTk 元件（CTkEntry, CTkOptionMenu, CTkCheckBox,
+#    CTkLabel, CTkButton, CTkTextbox）。一律用原生 tk/ttk 並手動套暗色主題。
+#    CTk 元件僅可用於「一次性建立且不在迴圈中」的框架層級（如 CTkTabview）。
+#
+# 2. 回呼綁定使用 suppress-flag 模式：callback 內部讀取 mutable context dict
+#    （_ctx["suppress"]），注入資料時 suppress=True 即可跳過，不需 unbind/rebind。
+#
+# 3. Tab 內容一律 lazy-load：只在 tab 被選中時才建立/更新 UI。
+#    使用 _ensure_editor / _on_tab_changed 模式。
+#
+# 4. 批次 UI 更新使用 freeze/thaw 模式：凍結期間阻擋 _update_widths 等
+#    佈局回呼，全部完成後一次 flush。
+#
+# 5. DataFrame 運算限定在 data_manager.py，UI 層不做 pandas 操作。
+#    大量資料讀取/寫入必須在背景線程 + loading dialog。
+#
+# 6. 查找操作使用 dict/set O(1)，禁止在迴圈內線性掃描。
+#    （例：text_dict, row_index）
+#
+# 7. 跳過 no-op：configure/resize 前先比對舊值（_last_lines, _prev_width），
+#    相同則不呼叫。
+#
+# 8. 新功能上線前用生產級資料量（14+ sheets, 1000+ rows）測試，
+#    確認無 UI 凍結（>200ms 主線程阻塞）。
+# ══════════════════════════════════════════════════════════════
 
 # Dark theme 色彩常數
 _BG = "#2b2b2b"
 _BG_HEADER = "#404040"
 _ROW_EVEN = "#2b2b2b"
 _ROW_ODD = "#3a3a3a"
+
+# 子表 tk.Text cell 的暗色主題樣式 (取代沉重的 CTkTextbox)
+_CELL_FONT = ("Segoe UI", 11)
+_CELL_BG = "#343638"
+_CELL_FG = "#DCE4EE"
+_CELL_BORDER = "#565B5E"
+_CELL_FOCUS_BORDER = "#3B8ED0"
 
 
 class LightScrollableFrame(tk.Frame):
@@ -29,8 +65,8 @@ class LightScrollableFrame(tk.Frame):
         super().__init__(parent, bg=_BG)
 
         self._canvas = tk.Canvas(self, bg=_BG, highlightthickness=0, bd=0)
-        self._scrollbar = ctk.CTkScrollbar(self, orientation="vertical",
-                                           command=self._canvas.yview)
+        self._scrollbar = tk.Scrollbar(self, orient="vertical",
+                                       command=self._canvas.yview)
         self._scrollbar.pack(side="right", fill="y")
         self._canvas.pack(side="left", fill="both", expand=True)
         self._canvas.configure(yscrollcommand=self._scrollbar.set)
@@ -79,6 +115,7 @@ class SheetEditor(ctk.CTkFrame):
         self.current_master_idx = None
         self.current_master_pk = None
         self.current_image_ref = None
+        self._master_suppress = False  # suppress-flag for master field callbacks
 
         # 母表UI緩存
         self.cls_buttons = {}  # {分類值: 按鈕widget}
@@ -318,16 +355,15 @@ class SheetEditor(ctk.CTkFrame):
                 key_entry.configure(state="disabled")
                 key_entry.pack(side="left", padx=(0, 5))
 
-                # Text (可編輯) — 使用 CTkTextbox 支援多行
-                textbox = ctk.CTkTextbox(f, height=25, wrap="word")
-                self._setup_auto_textbox(textbox)
+                # Text (可編輯) — 原生 tk.Text（輕量，取代 CTkTextbox）
+                textbox = self._make_master_text_cell(f)
                 textbox.pack(side="left", fill="x", expand=True)
 
                 self.master_fields[col] = (key_entry, textbox)
-                self.master_field_vars[col] = None  # CTkTextbox 不使用 StringVar
+                self.master_field_vars[col] = None
 
                 textbox.bind("<KeyRelease>",
-                             lambda e, c=col, tb=textbox: (self._on_linked_field_change_tb(c, tb), self._resize_textbox(tb)))
+                             lambda e, c=col, tb=textbox: (self._on_linked_field_change_tb(c, tb), self._resize_text_cell(tb)))
                 self.trace_ids[col] = "bind"
 
             elif col_type == "bool":
@@ -359,118 +395,110 @@ class SheetEditor(ctk.CTkFrame):
                                          lambda *args, c=col, v=var: self._on_field_change(c, v.get()))
                 self.trace_ids[col] = trace_id
 
-            else:  # string — 使用 CTkTextbox 支援多行
-                textbox = ctk.CTkTextbox(f, height=25, wrap="word")
-                self._setup_auto_textbox(textbox)
+            else:  # string — 原生 tk.Text（輕量，取代 CTkTextbox）
+                textbox = self._make_master_text_cell(f)
                 textbox.pack(side="left", fill="x", expand=True)
 
                 self.master_fields[col] = textbox
-                self.master_field_vars[col] = None  # CTkTextbox 不使用 StringVar
+                self.master_field_vars[col] = None
 
                 textbox.bind("<KeyRelease>",
-                             lambda e, c=col, tb=textbox: (self._on_field_change(c, tb.get("1.0", "end-1c")), self._resize_textbox(tb)))
+                             lambda e, c=col, tb=textbox: (self._on_field_change(c, tb.get("1.0", "end-1c")), self._resize_text_cell(tb)))
                 self.trace_ids[col] = "bind"
 
         # 首次載入數據
         self._update_editor_data(row_data)
 
     def _on_linked_field_change_tb(self, col, textbox):
-        """連結欄位 (CTkTextbox 版) 文字變更回呼"""
-        key_entry, _ = self.master_fields[col]
-        # 從 key_entry 取得 key
-        key_entry.configure(state="normal")
-        key = key_entry.get()
-        key_entry.configure(state="disabled")
+        """連結欄位 (tk.Text 版) 文字變更回呼
+        讀取快取的 _linked_key，避免每次按鍵觸發 2 次 CTkEntry.configure"""
+        if getattr(self, '_master_suppress', False):
+            return
+        key = getattr(textbox, '_linked_key', None)
+        if key is None:
+            return
         new_text = textbox.get("1.0", "end-1c")
         self.manager.update_linked_text(key, new_text)
 
     def _update_editor_data(self, row_data):
-        """只更新欄位的數據值（不重建 UI）"""
+        """只更新欄位的數據值（不重建 UI）
+        使用 suppress-flag 模式：suppress=True 時 callback 直接跳過，
+        無需 unbind/rebind 開銷。"""
         cols_cfg = self.cfg.get("columns", {})
+        _deferred_resize = []  # 收集需要調整高度的 textbox，延遲一起執行
 
-        for col in self.df.columns:
-            if col not in self.master_fields:
-                continue
+        # suppress all master field callbacks
+        self._master_suppress = True
 
-            val = row_data[col]
-            col_conf = cols_cfg.get(col, {})
-            col_type = col_conf.get("type", "string")
-            is_linked = col_conf.get("link_to_text", False)
+        try:
+            for col in self.df.columns:
+                if col not in self.master_fields:
+                    continue
 
-            # 暫時移除 trace / unbind 避免觸發更新
-            if col in self.trace_ids:
-                var = self.master_field_vars.get(col)
-                if var is not None:
-                    try:
-                        var.trace_remove("write", self.trace_ids[col])
-                    except:
-                        pass
-                else:
-                    # CTkTextbox — 暫時解綁
-                    widget = self.master_fields.get(col)
-                    if isinstance(widget, tuple):
-                        widget = widget[1]
-                    if isinstance(widget, ctk.CTkTextbox):
-                        try:
-                            widget.unbind("<KeyRelease>")
-                        except:
-                            pass
+                val = row_data[col]
+                col_conf = cols_cfg.get(col, {})
+                col_type = col_conf.get("type", "string")
+                is_linked = col_conf.get("link_to_text", False)
 
-            if is_linked:
-                key_entry, textbox = self.master_fields[col]
+                if is_linked:
+                    key_entry, textbox = self.master_fields[col]
 
-                # 更新 Key
-                key_entry.configure(state="normal")
-                key_entry.delete(0, "end")
-                key_entry.insert(0, str(val))
-                key_entry.configure(state="disabled")
+                    # 更新 Key
+                    key_entry.configure(state="normal")
+                    key_entry.delete(0, "end")
+                    key_entry.insert(0, str(val))
+                    key_entry.configure(state="disabled")
 
-                # 更新 Text (CTkTextbox)
-                real_text = str(self.manager.get_text_value(val))
-                textbox.delete("1.0", "end")
-                textbox.insert("1.0", real_text)
-                self._resize_textbox(textbox)
+                    # 快取 linked key 到 textbox 上（供 _on_linked_field_change_tb 讀取）
+                    textbox._linked_key = str(val)
 
-            elif col_type == "bool":
-                var = self.master_field_vars[col]
-                var.set(bool(val))
+                    # 更新 Text (tk.Text)
+                    real_text = str(self.manager.get_text_value(val))
+                    textbox.delete("1.0", "end")
+                    textbox.insert("1.0", real_text)
+                    _deferred_resize.append(textbox)
 
-            elif col_type == "enum":
-                menu = self.master_fields[col]
-                menu.set(str(val))
+                elif col_type == "bool":
+                    var = self.master_field_vars[col]
+                    var.set(bool(val))
 
-            elif col_type in ("int", "float"):
-                var = self.master_field_vars[col]
-                var.set(str(val))
+                elif col_type == "enum":
+                    menu = self.master_fields[col]
+                    menu.set(str(val))
 
-            else:  # string (CTkTextbox)
-                textbox = self.master_fields[col]
-                textbox.delete("1.0", "end")
-                textbox.insert("1.0", str(val))
-                self._resize_textbox(textbox)
+                elif col_type in ("int", "float"):
+                    var = self.master_field_vars[col]
+                    var.set(str(val))
 
-            # 重新綁定 trace / bind
-            if col in self.trace_ids:
-                var = self.master_field_vars.get(col)
-                if var is not None:
-                    if is_linked:
-                        trace_id = var.trace_add("write",
-                                                 lambda *args, c=col, v=var: self._on_linked_field_change(c, v))
-                    else:
-                        trace_id = var.trace_add("write",
-                                                 lambda *args, c=col, v=var: self._on_field_change(c, v.get()))
-                    self.trace_ids[col] = trace_id
-                else:
-                    # 重新綁定 CTkTextbox
-                    widget = self.master_fields.get(col)
-                    if is_linked:
-                        _, textbox = widget
-                        textbox.bind("<KeyRelease>",
-                                     lambda e, c=col, tb=textbox: (self._on_linked_field_change_tb(c, tb), self._resize_textbox(tb)))
-                    elif isinstance(widget, ctk.CTkTextbox):
-                        widget.bind("<KeyRelease>",
-                                    lambda e, c=col, tb=widget: (self._on_field_change(c, tb.get("1.0", "end-1c")), self._resize_textbox(tb)))
-                    self.trace_ids[col] = "bind"
+                else:  # string (tk.Text)
+                    textbox = self.master_fields[col]
+                    textbox.delete("1.0", "end")
+                    textbox.insert("1.0", str(val))
+                    _deferred_resize.append(textbox)
+
+        finally:
+            self._master_suppress = False
+
+        # 待 UI 渲染後再批次調整所有 text cell 高度
+        if _deferred_resize:
+            def _batch_resize(tbs=_deferred_resize):
+                # 強制幾何計算，讓 tk.Text 取得實際渲染寬度，
+                # 否則 count("displaylines") 會按初始 width=30 字元計算，導致行數偏高
+                self.top_container.update_idletasks()
+                for tb in tbs:
+                    self._resize_text_cell(tb)
+            self.after_idle(_batch_resize)
+
+            # 綁定寬度變化事件：視窗縮放時重新計算高度（避免殘留舊的行數）
+            for tb in _deferred_resize:
+                if not getattr(tb, '_has_configure_resize', False):
+                    tb._has_configure_resize = True
+                    tb._prev_width = 0
+                    def _on_width_change(event, w=tb):
+                        if event.width != w._prev_width:
+                            w._prev_width = event.width
+                            self._resize_text_cell(w)
+                    tb.bind("<Configure>", _on_width_change)
 
     def _update_image(self):
         """只更新圖片（不重建 UI）"""
@@ -503,19 +531,22 @@ class SheetEditor(ctk.CTkFrame):
             self.current_image_ref = None
 
     def _on_field_change(self, col_name, value):
-        """欄位變更回調"""
+        """欄位變更回調（suppress-flag 模式）"""
+        if getattr(self, '_master_suppress', False):
+            return
         if self.current_master_idx is not None:
             self.manager.update_cell(False, self.sheet_name, self.current_master_idx, col_name, value)
 
     def _on_linked_field_change(self, col_name, var):
-        """連結文字欄位變更回調"""
+        """連結文字欄位變更回調（suppress-flag 模式）"""
+        if getattr(self, '_master_suppress', False):
+            return
         if self.current_master_idx is not None:
-            # 取得 Key
-            key_entry, _ = self.master_fields[col_name]
-            key_entry.configure(state="normal")
-            key = key_entry.get()
-            key_entry.configure(state="disabled")
-
+            # 取得 Key（從快取讀取，不碰 CTkEntry.configure）
+            _, textbox = self.master_fields[col_name]
+            key = getattr(textbox, '_linked_key', None)
+            if key is None:
+                return
             # 更新文字表
             self.manager.update_linked_text(key, var.get())
 
@@ -665,18 +696,13 @@ class SheetEditor(ctk.CTkFrame):
         self.manager.sub_dfs[sheet_full_name] = sub_df
         self.manager.dirty = True
 
-        try:
-            current_tab = self.sub_tables_tabs.get()
-        except:
-            current_tab = None
-
-        self.load_sub_tables(self.current_master_pk)
-
-        if current_tab:
-            try:
-                self.sub_tables_tabs.set(current_tab)
-            except:
-                pass
+        # 只更新受影響的單一 Tab，不重建全部子表結構（避免卡頓）
+        short_name = sheet_full_name.split("#")[1]
+        if short_name in self.sub_table_frames:
+            self._update_sub_table_data(short_name, sheet_full_name, self.current_master_pk)
+        else:
+            # 若結構不存在（罕見情況）則回退到完整重建
+            self.load_sub_tables(self.current_master_pk)
 
     def load_sub_tables(self, master_id):
         """載入子表（保持原版實現或使用優化版）"""
@@ -723,8 +749,8 @@ class SheetEditor(ctk.CTkFrame):
         """創建子表的固定結構 (標題固定在頂部，資料區域獨立捲動)"""
         tab_frame = self.sub_tables_tabs.tab(tab_name)
 
-        # 1. 外層容器
-        scroll_container = ctk.CTkFrame(tab_frame)
+        # 1. 外層容器 — 原生 tk.Frame
+        scroll_container = tk.Frame(tab_frame, bg=_BG)
         scroll_container.pack(fill="both", expand=True)
 
         # 2. 固定標題區 (header_canvas — 只做水平捲動，不做垂直捲動)
@@ -747,10 +773,10 @@ class SheetEditor(ctk.CTkFrame):
         body_frame = tk.Frame(scroll_container, bg=_BG)
         body_frame.pack(fill="both", expand=True)
 
-        canvas = ctk.CTkCanvas(body_frame, bg=_BG, highlightthickness=0)
+        canvas = tk.Canvas(body_frame, bg=_BG, highlightthickness=0, bd=0)
 
-        v_scrollbar = ctk.CTkScrollbar(body_frame, orientation="vertical",
-                                       command=canvas.yview)
+        v_scrollbar = tk.Scrollbar(body_frame, orient="vertical",
+                                   command=canvas.yview)
         v_scrollbar.pack(side="right", fill="y")
 
         # 水平捲軸同步驅動 data canvas 和 header canvas
@@ -758,8 +784,8 @@ class SheetEditor(ctk.CTkFrame):
             canvas.xview(*args)
             header_canvas.xview(*args)
 
-        h_scrollbar = ctk.CTkScrollbar(body_frame, orientation="horizontal",
-                                       command=xview_sync)
+        h_scrollbar = tk.Scrollbar(body_frame, orient="horizontal",
+                                   command=xview_sync)
         h_scrollbar.pack(side="bottom", fill="x")
 
         canvas.pack(side="left", fill="both", expand=True)
@@ -787,6 +813,9 @@ class SheetEditor(ctk.CTkFrame):
 
         def _update_widths():
             """統一更新 data canvas window 寬度 + header 同步"""
+            # 批次更新時凍結，避免每行 pack/resize 都觸發重繪
+            if self.sub_table_frames.get(tab_name, {}).get('_freeze', False):
+                return
             req_width = max(data_container.winfo_reqwidth(),
                             header_container.winfo_reqwidth())
             canvas_w = canvas.winfo_width()
@@ -819,7 +848,9 @@ class SheetEditor(ctk.CTkFrame):
             'header_canvas': header_canvas,
             'data': data_container,
             'canvas': canvas,
-            'scroll_container': scroll_container
+            'scroll_container': scroll_container,
+            '_freeze': False,
+            '_update_widths': _update_widths,
         }
         self.sub_table_row_pools[tab_name] = []
         self.sub_table_active_rows[tab_name] = []
@@ -857,144 +888,167 @@ class SheetEditor(ctk.CTkFrame):
         if not header_frame.winfo_children():
             self._build_sub_table_header(header_frame, headers, sub_cols_cfg)
 
-        # === 行池機制 ===
-        # 1. 回收正在使用的行到池中
-        active_rows = self.sub_table_active_rows.get(tab_name, [])
-        row_pool = self.sub_table_row_pools.get(tab_name, [])
+        # === 三階段更新：凍結 → 批次資料+pack → flush → 批次 resize → 解凍 ===
+        frames['_freeze'] = True
 
-        for row_frame in active_rows:
-            row_frame.pack_forget()  # 隱藏但不銷毀
-            row_pool.append(row_frame)
+        try:
+            # ── 階段 1：回收舊行 + 填入新資料 + pack（不做 resize）──
+            active_rows = self.sub_table_active_rows.get(tab_name, [])
+            row_pool = self.sub_table_row_pools.get(tab_name, [])
 
-        self.sub_table_active_rows[tab_name] = []
+            for row_frame in active_rows:
+                row_frame.pack_forget()
+                row_pool.append(row_frame)
 
-        # 2. 處理資料
-        if filtered_rows.empty:
-            # 顯示空資料提示
-            if not hasattr(data_frame, '_empty_label'):
-                data_frame._empty_label = ctk.CTkLabel(data_frame, text="(此項目無資料)", text_color="gray")
-            data_frame._empty_label.pack(pady=10)
-            return
-        else:
-            # 隱藏空資料提示
-            if hasattr(data_frame, '_empty_label'):
-                data_frame._empty_label.pack_forget()
+            self.sub_table_active_rows[tab_name] = []
 
-        # 3. 為每一行資料分配或創建 row_frame
-        needed_rows = len(filtered_rows)
-        available_rows = len(row_pool)
-
-        new_active_rows = []
-
-        for i, (idx, row) in enumerate(filtered_rows.iterrows()):
-            row_bg = _ROW_EVEN if i % 2 == 0 else _ROW_ODD
-            if i < available_rows:
-                # 重用現有的行
-                row_frame = row_pool[i]
-                self._update_sub_table_row(row_frame, headers, row, idx, sheet_full_name, sub_cols_cfg)
-                row_frame.configure(bg=row_bg)
-                row_frame.pack(fill="x", pady=1, padx=2, ipady=3)
+            if filtered_rows.empty:
+                if not hasattr(data_frame, '_empty_label'):
+                    data_frame._empty_label = tk.Label(data_frame, text="(此項目無資料)",
+                                                        bg=_BG, fg="gray", font=_CELL_FONT)
+                data_frame._empty_label.pack(pady=10)
+                return
             else:
-                # 創建新行
-                row_frame = self._create_sub_table_row(data_frame, headers, row, idx, sheet_full_name, sub_cols_cfg)
-                row_frame.configure(bg=row_bg)
-                row_frame.pack(fill="x", pady=1, padx=2, ipady=3)
+                if hasattr(data_frame, '_empty_label'):
+                    data_frame._empty_label.pack_forget()
 
-            new_active_rows.append(row_frame)
+            needed_rows = len(filtered_rows)
+            available_rows = len(row_pool)
+            new_active_rows = []
 
-        # 4. 更新活躍行列表和池
-        self.sub_table_active_rows[tab_name] = new_active_rows
-        self.sub_table_row_pools[tab_name] = row_pool[needed_rows:]  # 剩餘未使用的保留在池中
+            for i, (idx, row) in enumerate(filtered_rows.iterrows()):
+                row_bg = _ROW_EVEN if i % 2 == 0 else _ROW_ODD
+                if i < available_rows:
+                    row_frame = row_pool[i]
+                    self._update_sub_table_row(row_frame, headers, row, idx, sheet_full_name, sub_cols_cfg)
+                    row_frame.configure(bg=row_bg)
+                    row_frame.pack(fill="x", pady=1, padx=2, ipady=3)
+                else:
+                    row_frame = self._create_sub_table_row(data_frame, headers, row, idx, sheet_full_name, sub_cols_cfg)
+                    row_frame.configure(bg=row_bg)
+                    row_frame.pack(fill="x", pady=1, padx=2, ipady=3)
+                new_active_rows.append(row_frame)
+
+            self.sub_table_active_rows[tab_name] = new_active_rows
+            self.sub_table_row_pools[tab_name] = row_pool[needed_rows:]
+
+            # ── 強制幾何計算，讓 tk.Text 取得實際寬度後 count("displaylines") 才準確 ──
+            # _freeze=True 會阻擋 _update_widths，不會產生連鎖重繪
+            data_frame.update_idletasks()
+
+            # ── 批次 resize ──
+            for rf in new_active_rows:
+                self._auto_resize_row(rf, headers)
+
+        finally:
+            frames['_freeze'] = False
+            frames['_update_widths']()
 
     def _build_sub_table_header(self, header_frame, headers, cols_cfg):
-        """建立子表標題（只執行一次）"""
+        """建立子表標題（只執行一次）— 原生 tk.Label"""
         # 操作欄
-        ctk.CTkLabel(header_frame, text="操作", width=60,
-                     font=("微軟正黑體", 10, "bold")).pack(side="left", padx=2)
+        tk.Label(header_frame, text="操作", width=8,
+                 bg=_BG_HEADER, fg=_CELL_FG,
+                 font=("微軟正黑體", 10, "bold"), anchor="w").pack(side="left", padx=2)
 
         # 資料欄
         for col in headers:
             col_info = cols_cfg.get(col, {})
             is_linked = col_info.get("link_to_text", False)
 
-            # 如果是連結欄位，標題加上標記
             label_text = f"{col} 🔗" if is_linked else col
-            width = 180 if is_linked else 120
+            width = 22 if is_linked else 15  # tk.Label width in chars
 
-            ctk.CTkLabel(header_frame, text=label_text, width=width,
-                         font=("微軟正黑體", 10, "bold")).pack(side="left", padx=2)
-
-    @staticmethod
-    def _setup_auto_textbox(textbox):
-        """設定 CTkTextbox：永久隱藏捲軸，封鎖所有重新顯示的途徑"""
-        textbox._y_scrollbar.grid_remove()
-        textbox._x_scrollbar.grid_remove()
-        textbox._check_if_scrollbars_needed = lambda *a, **kw: None
-        # 封鎖 grid/pack/place，防止 configure() 內部重新顯示捲軸
-        textbox._y_scrollbar.grid = lambda *a, **kw: None
-        textbox._y_scrollbar.grid_configure = lambda *a, **kw: None
-        textbox._x_scrollbar.grid = lambda *a, **kw: None
-        textbox._x_scrollbar.grid_configure = lambda *a, **kw: None
+            tk.Label(header_frame, text=label_text, width=width,
+                     bg=_BG_HEADER, fg=_CELL_FG,
+                     font=("微軟正黑體", 10, "bold"), anchor="w").pack(side="left", padx=2)
 
     @staticmethod
-    def _resize_textbox(textbox, min_height=25):
+    def _resize_text_cell(tw, min_lines=1):
         """
-        使用實際行高與真實顯示行數
+        原生 tk.Text 用（子表 cell）。height 以行數計，configure 極快（~0.05ms）。
         """
-        content = textbox.get("1.0", "end-1c")
-        inner = textbox._textbox
-
-        if not content.strip():
-            textbox.configure(height=min_height)
-            return min_height
-
-        line_info = inner.dlineinfo("1.0")
-        if line_info:
-            actual_line_height = line_info[3]  # 這就是該行在螢幕上的真實像素高
-        else:
-            font = tkfont.Font(font=inner.cget("font"))
-            actual_line_height = font.metrics("linespace")
+        content = tw.get("1.0", "end-1c")
+        if not content.strip() or ('\n' not in content and len(content) <= 20):
+            last = getattr(tw, '_last_lines', min_lines)
+            if last != min_lines:
+                tw.configure(height=min_lines)
+                tw._last_lines = min_lines
+            return min_lines
 
         try:
-            total_display_lines = int(inner.count("1.0", "end", "displaylines")[0])
+            display_lines = int(tw.count("1.0", "end", "displaylines")[0])
         except (TypeError, IndexError):
-            total_display_lines = content.count('\n') + 1.15
+            display_lines = max(1, content.count('\n') + 1)
 
-        padding = 15
-        new_h = max(min_height, (total_display_lines * actual_line_height) + padding)
-
-        textbox.configure(height=new_h)
-        return new_h
+        target = max(min_lines, display_lines)
+        if target != getattr(tw, '_last_lines', -1):
+            tw.configure(height=target)
+            tw._last_lines = target
+        return target
 
     def _auto_resize_row(self, row_frame, headers):
-        """計算行內最大 textbox 高度並統一該行所有 textbox"""
-        max_height = 25
-        textboxes = []
+        """計算行內最大高度並統一該行所有 text widget"""
+        max_lines = 1
+        text_cells = []
         for col in headers:
             widget = row_frame._widgets.get(col)
-            tb = widget[1] if isinstance(widget, tuple) else widget
-            if isinstance(tb, ctk.CTkTextbox):
-                h = self._resize_textbox(tb)
-                max_height = max(max_height, h)
-                textboxes.append(tb)
-        if max_height > 25:
-            for tb in textboxes:
-                tb.configure(height=max_height)
+            tw = widget[1] if isinstance(widget, tuple) else widget
+            if getattr(tw, '_is_text_cell', False):
+                lines = self._resize_text_cell(tw)
+                max_lines = max(max_lines, lines)
+                text_cells.append(tw)
+        if max_lines > 1:
+            for tw in text_cells:
+                if getattr(tw, '_last_lines', 1) != max_lines:
+                    tw.configure(height=max_lines)
+                    tw._last_lines = max_lines
+
+    @staticmethod
+    def _make_master_text_cell(parent, width=30):
+        """建立母表用的 tk.Text cell（取代 CTkTextbox，fill=x expand=True 佈局）"""
+        tw = tk.Text(parent, width=width, height=1, wrap="word",
+                     bg=_CELL_BG, fg=_CELL_FG, insertbackground=_CELL_FG,
+                     selectbackground=_CELL_FOCUS_BORDER, selectforeground="white",
+                     relief="flat", highlightthickness=1,
+                     highlightbackground=_CELL_BORDER, highlightcolor=_CELL_FOCUS_BORDER,
+                     font=_CELL_FONT, padx=4, pady=2, undo=False, maxundo=0)
+        tw._is_text_cell = True
+        tw._last_lines = 1
+        return tw
+
+    @staticmethod
+    def _make_text_cell(parent, width=15):
+        """建立輕量 tk.Text cell（取代 CTkTextbox，建立快 ~20x，configure 快 ~100x）"""
+        tw = tk.Text(parent, width=width, height=1, wrap="word",
+                     bg=_CELL_BG, fg=_CELL_FG, insertbackground=_CELL_FG,
+                     selectbackground=_CELL_FOCUS_BORDER, selectforeground="white",
+                     relief="flat", highlightthickness=1,
+                     highlightbackground=_CELL_BORDER, highlightcolor=_CELL_FOCUS_BORDER,
+                     font=_CELL_FONT, padx=4, pady=2, undo=False, maxundo=0)
+        tw._is_text_cell = True
+        tw._last_lines = 1
+        return tw
 
     def _create_sub_table_row(self, parent, headers, row_data, row_idx, sheet_name, cols_cfg):
-        """創建新的資料行（當池中沒有可用行時）"""
+        """創建新的資料行（當池中沒有可用行時）
+        使用 suppress-flag + mutable context 模式，避免 unbind/rebind 開銷。"""
         row_frame = tk.Frame(parent, bg=_BG)
 
-        # 儲存元數據（用於後續更新）
         row_frame._widgets = {}
         row_frame._vars = {}
-        row_frame._trace_ids = {}
+        row_frame._ctxs = {}  # mutable context dicts per column
 
-        # 刪除按鈕
-        del_btn = ctk.CTkButton(row_frame, text="X", width=60, height=25,
-                                fg_color="darkred", hover_color="#800000")
+        # 刪除按鈕（原生 tk.Button）
+        del_ctx = {"suppress": False, "sheet": sheet_name, "row_idx": row_idx}
+        del_btn = tk.Button(row_frame, text="X", width=4,
+                            bg="darkred", fg="white", activebackground="#800000",
+                            activeforeground="white", relief="flat", cursor="hand2",
+                            font=("Segoe UI", 9),
+                            command=lambda c=del_ctx: self.delete_sub_item(c["sheet"], c["row_idx"]))
         del_btn.pack(side="left", padx=2)
         row_frame._widgets['delete_btn'] = del_btn
+        row_frame._del_ctx = del_ctx
 
         # 資料欄位
         for col in headers:
@@ -1002,50 +1056,85 @@ class SheetEditor(ctk.CTkFrame):
             col_type = col_info.get("type", "string")
             is_linked = col_info.get("link_to_text", False)
 
+            ctx = {"suppress": False, "sheet": sheet_name, "row_idx": row_idx, "col": col}
+            row_frame._ctxs[col] = ctx
+
             if is_linked:
-                # Key (唯讀) + Text (CTkTextbox 自動換行拉高)
-                key_entry = ctk.CTkEntry(row_frame, width=60, height=25, text_color="gray")
-                key_entry.configure(state="disabled")
+                # Key (唯讀) — 原生 tk.Entry
+                key_entry = tk.Entry(row_frame, width=8,
+                                     bg=_CELL_BG, fg="gray",
+                                     disabledbackground=_CELL_BG, disabledforeground="gray",
+                                     relief="flat", font=_CELL_FONT, state="disabled")
                 key_entry.pack(side="left", padx=1)
 
-                textbox = ctk.CTkTextbox(row_frame, width=120, height=25, wrap="word")
-                self._setup_auto_textbox(textbox)
-                textbox.pack(side="left", padx=1)
+                # Text — 原生 tk.Text（輕量）
+                tw = self._make_text_cell(row_frame, width=15)
+                tw.pack(side="left", padx=1)
 
-                row_frame._widgets[col] = (key_entry, textbox)
+                tw.bind("<KeyRelease>",
+                        lambda e, c=ctx, w=tw, rf=row_frame, h=headers:
+                        None if c["suppress"] else
+                        (self.manager.update_linked_text(c.get("key", ""), w.get("1.0", "end-1c")),
+                         self._auto_resize_row(rf, h)))
+
+                row_frame._widgets[col] = (key_entry, tw)
                 row_frame._vars[col] = None
 
             elif col_type == "enum":
-                var = ctk.StringVar()
-                menu = ctk.CTkOptionMenu(row_frame, values=col_info.get("options", ["None"]),
-                                         variable=var, width=120, height=25)
+                var = tk.StringVar()
+                options = col_info.get("options", ["None"])
+                menu = tk.OptionMenu(row_frame, var, *options,
+                                     command=lambda v, c=ctx:
+                                     None if c["suppress"] else
+                                     self.manager.update_cell(True, c["sheet"], c["row_idx"], c["col"], v))
+                menu.config(bg=_CELL_BG, fg=_CELL_FG,
+                            activebackground=_CELL_FOCUS_BORDER, activeforeground="white",
+                            relief="flat", highlightthickness=0, font=_CELL_FONT, width=12)
+                menu["menu"].config(bg=_CELL_BG, fg=_CELL_FG,
+                                    activebackground=_CELL_FOCUS_BORDER, font=_CELL_FONT)
                 menu.pack(side="left", padx=2)
-
                 row_frame._widgets[col] = menu
                 row_frame._vars[col] = var
 
             elif col_type == "bool":
-                var = ctk.BooleanVar()
-                chk = ctk.CTkCheckBox(row_frame, text="", variable=var, width=120, height=25)
+                var = tk.BooleanVar()
+                chk = tk.Checkbutton(row_frame, variable=var,
+                                     bg=_BG, activebackground=_BG, selectcolor=_CELL_BG, relief="flat",
+                                     command=lambda c=ctx, v=var:
+                                     None if c["suppress"] else
+                                     self.manager.update_cell(True, c["sheet"], c["row_idx"], c["col"], v.get()))
                 chk.pack(side="left", padx=2)
-
                 row_frame._widgets[col] = chk
                 row_frame._vars[col] = var
 
             elif col_type in ("int", "float"):
-                var = ctk.StringVar()
-                entry = ctk.CTkEntry(row_frame, textvariable=var, width=120, height=25)
+                var = tk.StringVar()
+                entry = tk.Entry(row_frame, textvariable=var, width=15,
+                                 bg=_CELL_BG, fg=_CELL_FG, insertbackground=_CELL_FG,
+                                 relief="flat", highlightthickness=1,
+                                 highlightbackground=_CELL_BORDER, highlightcolor=_CELL_FOCUS_BORDER,
+                                 font=_CELL_FONT)
                 entry.pack(side="left", padx=2)
+
+                var.trace_add("write",
+                              lambda *args, c=ctx, v=var:
+                              None if c["suppress"] else
+                              self.manager.update_cell(True, c["sheet"], c["row_idx"], c["col"], v.get()))
 
                 row_frame._widgets[col] = entry
                 row_frame._vars[col] = var
 
-            else:  # string — CTkTextbox 自動換行拉高
-                textbox = ctk.CTkTextbox(row_frame, width=120, height=25, wrap="word")
-                self._setup_auto_textbox(textbox)
-                textbox.pack(side="left", padx=2)
+            else:  # string — 原生 tk.Text（輕量）
+                tw = self._make_text_cell(row_frame, width=15)
+                tw.pack(side="left", padx=2)
 
-                row_frame._widgets[col] = textbox
+                tw.bind("<KeyRelease>",
+                        lambda e, c=ctx, w=tw, rf=row_frame, h=headers:
+                        None if c["suppress"] else
+                        (self.manager.update_cell(True, c["sheet"], c["row_idx"], c["col"], w.get("1.0", "end-1c")),
+                         self._auto_resize_row(rf, h)))
+
+                row_frame._widgets[col] = tw
                 row_frame._vars[col] = None
 
         # 填充初始數據
@@ -1054,33 +1143,16 @@ class SheetEditor(ctk.CTkFrame):
         return row_frame
 
     def _update_sub_table_row(self, row_frame, headers, row_data, row_idx, sheet_name, cols_cfg):
-        """更新資料行的內容（重用時調用）"""
+        """更新資料行的內容（重用時調用）
+        使用 suppress-flag 模式：suppress=True → 注入值 → 更新 ctx → suppress=False
+        無需 unbind/rebind，Python 層開銷極小。"""
 
-        # 1. 清理舊的 trace / binding
-        for col in list(row_frame._trace_ids.keys()):
-            tid = row_frame._trace_ids[col]
-            var = row_frame._vars.get(col)
-            if var is not None:
-                try:
-                    var.trace_remove("write", tid)
-                except:
-                    pass
-            else:
-                widget = row_frame._widgets.get(col)
-                tb = widget[1] if isinstance(widget, tuple) else widget
-                if isinstance(tb, ctk.CTkTextbox):
-                    try:
-                        tb.unbind("<KeyRelease>")
-                    except:
-                        pass
-        row_frame._trace_ids.clear()
+        # 1. 更新刪除按鈕的 context
+        del_ctx = row_frame._del_ctx
+        del_ctx["sheet"] = sheet_name
+        del_ctx["row_idx"] = row_idx
 
-        # 2. 更新刪除按鈕的命令
-        del_btn = row_frame._widgets.get('delete_btn')
-        if del_btn:
-            del_btn.configure(command=lambda: self.delete_sub_item(sheet_name, row_idx))
-
-        # 3. 更新每個欄位的值
+        # 2. 更新每個欄位的值（suppress 模式）
         for col in headers:
             val = row_data[col]
             col_info = cols_cfg.get(col, {"type": "string"})
@@ -1090,69 +1162,49 @@ class SheetEditor(ctk.CTkFrame):
             if col not in row_frame._widgets:
                 continue
 
-            if is_linked:
-                key_entry, textbox = row_frame._widgets[col]
+            ctx = row_frame._ctxs[col]
+            ctx["suppress"] = True
 
-                # 更新 Key
-                key_entry.configure(state="normal")
-                key_entry.delete(0, "end")
-                key_entry.insert(0, str(val))
-                key_entry.configure(state="disabled")
+            try:
+                if is_linked:
+                    key_entry, tw = row_frame._widgets[col]
 
-                # 更新 Text
-                real_text = str(self.manager.get_text_value(val))
-                textbox.delete("1.0", "end")
-                textbox.insert("1.0", real_text)
+                    key_entry.configure(state="normal")
+                    key_entry.delete(0, "end")
+                    key_entry.insert(0, str(val))
+                    key_entry.configure(state="disabled")
 
-                # 綁定變更事件 + 自動拉高
-                textbox.bind("<KeyRelease>",
-                             lambda e, k=val, tb=textbox, rf=row_frame, h=headers:
-                             (self.manager.update_linked_text(k, tb.get("1.0", "end-1c")),
-                              self._auto_resize_row(rf, h)))
-                row_frame._trace_ids[col] = "bind"
+                    real_text = str(self.manager.get_text_value(val))
+                    tw.delete("1.0", "end")
+                    tw.insert("1.0", real_text)
 
-            elif col_type == "enum":
-                var = row_frame._vars[col]
-                var.set(str(val))
+                    # 更新 ctx 中的 key（供 callback 讀取）
+                    ctx["key"] = str(val)
 
-                # 更新命令
-                menu = row_frame._widgets[col]
-                menu.configure(command=lambda v, r=row_idx, c=col, s=sheet_name:
-                self.manager.update_cell(True, s, r, c, v))
+                elif col_type == "enum":
+                    var = row_frame._vars[col]
+                    var.set(str(val))
 
-            elif col_type == "bool":
-                var = row_frame._vars[col]
-                var.set(bool(val) if val != "" else False)
+                elif col_type == "bool":
+                    var = row_frame._vars[col]
+                    var.set(bool(val) if val != "" else False)
 
-                # 更新命令
-                chk = row_frame._widgets[col]
-                chk.configure(command=lambda r=row_idx, c=col, s=sheet_name, v=var:
-                self.manager.update_cell(True, s, r, c, v.get()))
+                elif col_type in ("int", "float"):
+                    var = row_frame._vars[col]
+                    var.set(str(val))
 
-            elif col_type in ("int", "float"):
-                var = row_frame._vars[col]
-                var.set(str(val))
+                else:  # string (tk.Text cell)
+                    tw = row_frame._widgets[col]
+                    tw.delete("1.0", "end")
+                    tw.insert("1.0", str(val))
 
-                # 重新綁定 trace
-                trace_id = var.trace_add("write",
-                                         lambda *args, s=sheet_name, r=row_idx, c=col, v=var:
-                                         self.manager.update_cell(True, s, r, c, v.get()))
-                row_frame._trace_ids[col] = trace_id
+            finally:
+                # 更新 context 指向新的 sheet/row_idx，然後解除 suppress
+                ctx["sheet"] = sheet_name
+                ctx["row_idx"] = row_idx
+                ctx["suppress"] = False
 
-            else:  # string (CTkTextbox)
-                textbox = row_frame._widgets[col]
-                textbox.delete("1.0", "end")
-                textbox.insert("1.0", str(val))
-
-                # 綁定變更事件 + 自動拉高
-                textbox.bind("<KeyRelease>",
-                             lambda e, s=sheet_name, r=row_idx, c=col, tb=textbox, rf=row_frame, h=headers:
-                             (self.manager.update_cell(True, s, r, c, tb.get("1.0", "end-1c")),
-                              self._auto_resize_row(rf, h)))
-                row_frame._trace_ids[col] = "bind"
-
-        # 4. 初始自動調整行高
-        self._auto_resize_row(row_frame, headers)
+        # 行高調整交由 _update_sub_table_data 批次處理
 
     def _show_error_in_tab(self, tab_name, message):
         """在 Tab 中顯示錯誤訊息"""
@@ -1166,125 +1218,19 @@ class SheetEditor(ctk.CTkFrame):
         for widget in data_frame.winfo_children():
             widget.pack_forget()
 
-        # 顯示錯誤
-        ctk.CTkLabel(data_frame, text=message, text_color="red").pack(pady=20)
-
-    def _render_simple_sub_table(self, parent, sheet_name, filtered_df, cols_cfg):
-        """簡化版子表渲染（減少卡頓）"""
-        if filtered_df.empty:
-            ctk.CTkLabel(parent, text="(此項目無資料)", text_color="gray").pack(pady=10)
-            return
-
-        # 使用簡單的滾動框架
-        scroll_frame = LightScrollableFrame(parent)
-        scroll_frame.pack(fill="both", expand=True)
-
-        headers = list(filtered_df.columns)
-
-        # 標題列
-        header_frame = tk.Frame(scroll_frame.interior, bg=_BG_HEADER)
-        header_frame.pack(fill="x", pady=(0, 5))
-
-        ctk.CTkLabel(header_frame, text="操作", width=60, font=("微軟正黑體", 10, "bold")).pack(side="left", padx=2)
-        for col in headers:
-            ctk.CTkLabel(header_frame, text=col, width=120, font=("微軟正黑體", 10, "bold")).pack(side="left", padx=2)
-
-        # 資料列
-        for i, (idx, row) in enumerate(filtered_df.iterrows()):
-            row_bg = _ROW_EVEN if i % 2 == 0 else _ROW_ODD
-            row_frame = tk.Frame(scroll_frame.interior, bg=row_bg)
-            row_frame.pack(fill="x", pady=1, ipady=3)
-
-            # 刪除按鈕
-            ctk.CTkButton(row_frame, text="X", width=60, height=25, fg_color="darkred",
-                          command=lambda s=sheet_name, r=idx: self.delete_sub_item(s, r)).pack(side="left", padx=2)
-
-            # 資料欄位
-            row_frame._widgets = {}
-            textboxes = []
-            for col in headers:
-                val = row[col]
-                c_info = cols_cfg.get(col, {"type": "string"})
-                col_type = c_info.get("type", "string")
-                is_linked = c_info.get("link_to_text", False)
-
-                if is_linked:
-                    key_entry = ctk.CTkEntry(row_frame, width=60, height=25)
-                    key_entry.insert(0, str(val))
-                    key_entry.configure(state="disabled")
-                    key_entry.pack(side="left", padx=1)
-
-                    real_text = str(self.manager.get_text_value(val))
-                    textbox = ctk.CTkTextbox(row_frame, width=120, height=25, wrap="word")
-                    self._setup_auto_textbox(textbox)
-                    textbox.insert("1.0", real_text)
-                    textbox.pack(side="left", padx=1)
-                    textbox.bind("<KeyRelease>",
-                                 lambda e, k=val, tb=textbox:
-                                 self.manager.update_linked_text(k, tb.get("1.0", "end-1c")))
-                    row_frame._widgets[col] = (key_entry, textbox)
-                    textboxes.append(textbox)
-
-                elif col_type == "enum":
-                    var = ctk.StringVar(value=str(val))
-                    menu = ctk.CTkOptionMenu(row_frame, values=c_info.get("options", ["None"]),
-                                             variable=var, width=120, height=25,
-                                             command=lambda v, r=idx, c=col, s=sheet_name: self.manager.update_cell(
-                                                 True, s, r, c, v))
-                    menu.pack(side="left", padx=2)
-                elif col_type == "bool":
-                    var = ctk.BooleanVar(value=bool(val) if val != "" else False)
-                    chk = ctk.CTkCheckBox(row_frame, text="", variable=var, width=120, height=25,
-                                          command=lambda r=idx, c=col, s=sheet_name, v=var: self.manager.update_cell(
-                                              True, s, r, c, v.get()))
-                    chk.pack(side="left", padx=2)
-                elif col_type in ("int", "float"):
-                    var = ctk.StringVar(value=str(val))
-                    entry = ctk.CTkEntry(row_frame, textvariable=var, width=120, height=25)
-                    entry.pack(side="left", padx=2)
-                    var.trace_add("write",
-                                  lambda *args, s=sheet_name, r=idx, c=col, v=var: self.manager.update_cell(True, s, r,
-                                                                                                            c, v.get()))
-                else:  # string
-                    textbox = ctk.CTkTextbox(row_frame, width=120, height=25, wrap="word")
-                    self._setup_auto_textbox(textbox)
-                    textbox.insert("1.0", str(val))
-                    textbox.pack(side="left", padx=2)
-                    textbox.bind("<KeyRelease>",
-                                 lambda e, s=sheet_name, r=idx, c=col, tb=textbox:
-                                 self.manager.update_cell(True, s, r, c, tb.get("1.0", "end-1c")))
-                    row_frame._widgets[col] = textbox
-                    textboxes.append(textbox)
-
-            # 統一行高
-            max_h = 25
-            for tb in textboxes:
-                max_h = max(max_h, self._resize_textbox(tb))
-            if max_h > 25:
-                for tb in textboxes:
-                    tb.configure(height=max_h)
+        # 顯示錯誤 — 原生 tk.Label
+        tk.Label(data_frame, text=message, bg=_BG, fg="red", font=_CELL_FONT).pack(pady=20)
 
     def cleanup(self):
         """清理資源"""
-        # 清理母表 trace / binding
-        for col, trace_id in self.trace_ids.items():
-            var = self.master_field_vars.get(col)
-            if var is not None:
-                try:
-                    var.trace_remove("write", trace_id)
-                except:
-                    pass
+        # suppress 所有 callback 防止 stale 呼叫
+        self._master_suppress = True
 
-        # 清理子表 trace / binding
+        # 清理子表：suppress all contexts to prevent stale callbacks
         for tab_name, active_rows in self.sub_table_active_rows.items():
             for row_frame in active_rows:
-                for col in list(row_frame._trace_ids.keys()):
-                    var = row_frame._vars.get(col)
-                    if var is not None:
-                        try:
-                            var.trace_remove("write", row_frame._trace_ids[col])
-                        except:
-                            pass
+                for ctx in getattr(row_frame, '_ctxs', {}).values():
+                    ctx["suppress"] = True
 
         # 清空所有緩存
         self.cls_buttons.clear()
@@ -1456,17 +1402,45 @@ class ConfigEditorWindow(ctk.CTkToplevel):
 
     def browse_text_file(self):
         path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx")])
-        if path:
-            self.entry_text_path.delete(0, "end")
-            self.entry_text_path.insert(0, path)
-            # 暫存到 manager config (尚未存檔)
-            self.manager.config["global_text_path"] = path
-            # 立即嘗試載入，以便後續編輯使用
-            success = self.manager.load_external_text(path)
-            if success:
+        if not path:
+            return
+
+        self.entry_text_path.delete(0, "end")
+        self.entry_text_path.insert(0, path)
+        self.manager.config["global_text_path"] = path
+
+        # 背景執行緒載入，避免大型文字表（多 sheet / 大量資料）凍結 UI
+        loading_win = ctk.CTkToplevel(self)
+        loading_win.title("")
+        loading_win.geometry("240x80")
+        loading_win.resizable(False, False)
+        loading_win.transient(self)
+        loading_win.grab_set()
+        ctk.CTkLabel(loading_win, text="載入文字表中，請稍候...",
+                     font=("微軟正黑體", 13)).pack(expand=True)
+        loading_win.update()
+
+        result_holder = []
+
+        def _do_load():
+            try:
+                result_holder.append(self.manager.load_external_text(path))
+            except Exception:
+                result_holder.append(False)
+            finally:
+                self.after(0, _on_done)
+
+        def _on_done():
+            try:
+                loading_win.destroy()
+            except Exception:
+                pass
+            if result_holder and result_holder[0]:
                 messagebox.showinfo("成功", "已載入外部文字表")
             else:
                 messagebox.showerror("失敗", "載入失敗，請檢查格式")
+
+        threading.Thread(target=_do_load, daemon=True).start()
 
     # ================== Tab 內容 ==================
 
@@ -1688,10 +1662,11 @@ class App(ctk.CTk):
         ctk.CTkButton(self.top_bar, text="配置設定", command=self.open_configwnd, fg_color="gray").pack(side="right", padx=5)
 
         # 內容區 (Tabview 存放不同的母表)
-        self.main_tabs = ctk.CTkTabview(self)
+        self.main_tabs = ctk.CTkTabview(self, command=self._on_main_tab_changed)
         self.main_tabs.pack(fill="both", expand=True, padx=5, pady=5)
 
         self.sheet_editors = []
+        self._editor_map = {}  # {sheet_name: SheetEditor or None} 延遲載入追蹤
         # 全域滑鼠滾輪路由 (根據游標位置決定捲動目標)
         self.bind_all("<MouseWheel>", self._route_mousewheel)
         self.bind_all("<Shift-MouseWheel>", self._route_shift_mousewheel)
@@ -1711,50 +1686,122 @@ class App(ctk.CTk):
 
     def load_file(self):
         path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx")])
-        if not path: return
+        if not path:
+            return
 
-        try:
-            self.manager.load_excel(path)
+        # 建立載入中提示視窗（不阻塞事件迴圈）
+        loading_win = ctk.CTkToplevel(self)
+        loading_win.title("")
+        loading_win.geometry("240x80")
+        loading_win.resizable(False, False)
+        loading_win.transient(self)
+        loading_win.grab_set()
+        ctk.CTkLabel(loading_win, text="載入中，請稍候...",
+                     font=("微軟正黑體", 13)).pack(expand=True)
+        loading_win.update()
 
-            # 判斷是否需要強制彈出配置視窗
+        error_holder = []
+
+        def _do_load():
+            try:
+                self.manager.load_excel(path)
+            except Exception as e:
+                error_holder.append(str(e))
+            finally:
+                self.after(0, _on_done)
+
+        def _on_done():
+            try:
+                loading_win.destroy()
+            except Exception:
+                pass
+            if error_holder:
+                messagebox.showerror("錯誤", f"讀取失敗: {error_holder[0]}")
+                return
             if self.manager.need_config_alert:
                 messagebox.showinfo("提示", "偵測到新資料表，請先設定【分類參數】與【欄位格式】")
                 self.open_configwnd()
             else:
                 self.refresh_ui()
 
-        except Exception as e:
-            messagebox.showerror("錯誤", f"讀取失敗: {str(e)}")
+        threading.Thread(target=_do_load, daemon=True).start()
 
     def save_file(self):
-        try:
-            self.manager.save_excel()
-            messagebox.showinfo("成功", "存檔完成")
-        except Exception as e:
-            messagebox.showerror("存檔失敗", str(e))
+        # 建立儲存中提示視窗
+        loading_win = ctk.CTkToplevel(self)
+        loading_win.title("")
+        loading_win.geometry("240x80")
+        loading_win.resizable(False, False)
+        loading_win.transient(self)
+        loading_win.grab_set()
+        ctk.CTkLabel(loading_win, text="儲存中，請稍候...",
+                     font=("微軟正黑體", 13)).pack(expand=True)
+        loading_win.update()
+
+        error_holder = []
+
+        def _do_save():
+            try:
+                self.manager.save_excel()
+            except Exception as e:
+                error_holder.append(str(e))
+            finally:
+                self.after(0, _on_done)
+
+        def _on_done():
+            try:
+                loading_win.destroy()
+            except Exception:
+                pass
+            if error_holder:
+                messagebox.showerror("存檔失敗", error_holder[0])
+            else:
+                messagebox.showinfo("成功", "存檔完成")
+
+        threading.Thread(target=_do_save, daemon=True).start()
 
     def refresh_ui(self):
         # 1. 先清理舊的 SheetEditor
         for editor in self.sheet_editors:
             editor.destroy()
         self.sheet_editors = []
+        self._editor_map = {}
 
-        # 2. 刪除舊 Tabs
-        for tab_name in list(self.main_tabs._tab_dict.keys()):
+        # 2. 差異更新 Tabs（保留 CTkTabview 實例，避免重建開銷）
+        existing_tabs = set(self.main_tabs._tab_dict.keys())
+        needed_tabs = set(self.manager.master_dfs.keys())
+
+        # 移除不需要的 tab
+        for tab_name in (existing_tabs - needed_tabs):
             self.main_tabs.delete(tab_name)
 
-        # 3. 重建整個 TabView（避免殘留狀態）
-        self.main_tabs.destroy()
-        self.main_tabs = ctk.CTkTabview(self)
-        self.main_tabs.pack(fill="both", expand=True, padx=5, pady=5)
+        # 新增需要的 tab（只建立 tab 按鈕，不建立 Editor 內容）
+        sheet_names = list(self.manager.master_dfs.keys())
+        for sheet_name in sheet_names:
+            if sheet_name not in existing_tabs:
+                self.main_tabs.add(sheet_name)
+            self._editor_map[sheet_name] = None  # 標記為尚未建立
 
-        # 4. 建立新的 Tabs 和 Editor
-        for sheet_name in self.manager.master_dfs:
-            self.main_tabs.add(sheet_name)
-            parent = self.main_tabs.tab(sheet_name)
-            editor = SheetEditor(parent, sheet_name, self.manager)
-            editor.pack(fill="both", expand=True)
-            self.sheet_editors.append(editor)
+        # 3. 只建立第一個（當前可見的）tab 的 Editor，其餘延遲到切換時
+        if sheet_names:
+            self._ensure_editor(sheet_names[0])
+
+    def _on_main_tab_changed(self):
+        """頂部 Tab 切換時，延遲建立尚未初始化的 SheetEditor"""
+        current = self.main_tabs.get()
+        if current:
+            self._ensure_editor(current)
+
+    def _ensure_editor(self, sheet_name):
+        """確保指定 tab 的 SheetEditor 已建立（只建立一次）"""
+        if self._editor_map.get(sheet_name) is not None:
+            return  # 已建立，跳過
+
+        parent = self.main_tabs.tab(sheet_name)
+        editor = SheetEditor(parent, sheet_name, self.manager)
+        editor.pack(fill="both", expand=True)
+        self._editor_map[sheet_name] = editor
+        self.sheet_editors.append(editor)
 
     def open_configwnd(self):
         if not self.manager.master_dfs:

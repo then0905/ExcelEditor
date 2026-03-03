@@ -46,10 +46,62 @@ class DataManager:
             return {}
 
     @staticmethod
+    def _ws_to_dataframe(ws):
+        """
+        將 openpyxl Worksheet 轉為全字串 pandas DataFrame，
+        模擬 pd.read_excel(..., dtype=str).fillna("") 的行為，
+        但只需開一次檔案（避免雙重 I/O）。
+        """
+        import math
+        from datetime import datetime, date, time as dtime
+
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            return pd.DataFrame()
+
+        # 建立 header（仿 pandas Unnamed: N 規則）
+        header_row = rows[0]
+        headers = []
+        for i, h in enumerate(header_row):
+            h_str = str(h).strip() if h is not None else ""
+            headers.append(h_str if h_str else f"Unnamed: {i}")
+
+        def _to_str(v):
+            if v is None:
+                return ""
+            if isinstance(v, bool):
+                return str(v)
+            if isinstance(v, float):
+                if math.isnan(v):
+                    return ""
+                # 整數值的 float（如 1.0）轉為 "1"，與 pd.read_excel dtype=str 一致
+                if v == int(v):
+                    return str(int(v))
+                return str(v)
+            if isinstance(v, int):
+                return str(v)
+            if isinstance(v, (datetime, date)):
+                return v.strftime("%Y-%m-%d")
+            if isinstance(v, dtime):
+                return v.strftime("%H:%M:%S")
+            return str(v)
+
+        num_cols = len(headers)
+        data = []
+        for row in rows[1:]:
+            # 補齊或截斷，確保與 header 長度一致
+            padded = list(row) + [None] * (num_cols - len(row)) if len(row) < num_cols else list(row[:num_cols])
+            data.append([_to_str(v) for v in padded])
+
+        return pd.DataFrame(data, columns=headers)
+
+    @staticmethod
     def _drop_empty_rows(df):
-        """移除整列都是空白的行"""
-        mask = ~df.apply(lambda row: all(str(v).strip() == "" for v in row), axis=1)
-        return df[mask].reset_index(drop=True)
+        """移除整列都是空白的行（向量化，比 apply per-row 快）。
+        回傳 (filtered_df, non_empty_mask)，mask 可供 _capture_sheet_styles 重用。"""
+        stripped = df.apply(lambda s: s.str.strip())
+        mask = ~stripped.eq("").all(axis=1)
+        return df[mask].reset_index(drop=True), mask
 
     def _get_col_type_map(self, sheet_name):
         """取得工作表各欄位的資料型別對應"""
@@ -118,8 +170,9 @@ class DataManager:
         cell.border = style["border"]
         cell.number_format = style["number_format"]
 
-    def _capture_sheet_styles(self, sheet_name, df, ws):
-        """擷取工作表的格式資訊（背景色、字體、欄寬、列高等）"""
+    def _capture_sheet_styles(self, sheet_name, df, ws, mask=None):
+        """擷取工作表的格式資訊（背景色、字體、欄寬、列高等）。
+        mask: 來自 _drop_empty_rows 的 non-empty mask，避免重複計算。"""
         styles = {
             "col_widths": {},
             "row_heights": {},
@@ -143,8 +196,10 @@ class DataManager:
             cell = ws.cell(row=1, column=col_idx)
             styles["header_styles"][col_idx] = self._copy_cell_style(cell)
 
-        # 找出存活的行（未被空白行過濾掉的）
-        mask = ~df.apply(lambda row: all(str(v).strip() == "" for v in row), axis=1)
+        # 找出存活的行（重用已計算的 mask，避免重複 strip+eq）
+        if mask is None:
+            stripped = df.apply(lambda s: s.str.strip())
+            mask = ~stripped.eq("").all(axis=1)
         surviving_indices = df[mask].index.tolist()
 
         # 資料行格式
@@ -222,51 +277,44 @@ class DataManager:
         if "global_text_path" in self.config:
             self.load_external_text(self.config["global_text_path"])
 
-        # 使用 context manager 確保文件關閉
+        # 只開一次檔案：用 openpyxl 同時讀取資料與格式，避免雙重 I/O
         try:
-            xl = pd.ExcelFile(file_path, engine='openpyxl')
-            self._excel_file_handle = xl  # 保存句柄
+            wb = load_workbook(file_path, data_only=True)
+            try:
+                for sheet in wb.sheetnames:
+                    ws = wb[sheet]
+                    df = self._ws_to_dataframe(ws)
 
-            # 用 openpyxl 載入格式資訊
-            wb_styles = load_workbook(file_path)
+                    if sheet.endswith(".json"):
+                        # 計算空行 mask 一次，同時供格式擷取和過濾使用
+                        filtered_df, mask = self._drop_empty_rows(df)
+                        self._capture_sheet_styles(sheet, df, ws, mask=mask)
+                        self.master_dfs[sheet] = filtered_df
 
-            for sheet in xl.sheet_names:
-                if sheet.endswith(".json"):
-                    df = pd.read_excel(xl, sheet, dtype=str).fillna("")
+                        if sheet not in self.config:
+                            self.config[sheet] = {
+                                "use_icon": False,
+                                "image_path": "",
+                                "classification_key": self.master_dfs[sheet].columns[0],
+                                "primary_key": self.master_dfs[sheet].columns[0],
+                                "columns": {col: {"type": "string"} for col in self.master_dfs[sheet].columns},
+                                "sub_sheets": {}
+                            }
+                            self.need_config_alert = True
 
-                    # 擷取格式（在移除空白行之前）
-                    if sheet in wb_styles.sheetnames:
-                        self._capture_sheet_styles(sheet, df, wb_styles[sheet])
+                    elif "#" in sheet:
+                        filtered_df, mask = self._drop_empty_rows(df)
+                        self._capture_sheet_styles(sheet, df, ws, mask=mask)
+                        self.sub_dfs[sheet] = filtered_df
 
-                    self.master_dfs[sheet] = self._drop_empty_rows(df)
-
-                    if sheet not in self.config:
-                        self.config[sheet] = {
-                            "use_icon": "False",
-                            "image_path": "",
-                            "classification_key": self.master_dfs[sheet].columns[0],
-                            "primary_key": self.master_dfs[sheet].columns[0],
-                            "columns": {col: {"type": "string"} for col in self.master_dfs[sheet].columns},
-                            "sub_sheets": {}
-                        }
-                        self.need_config_alert = True
-
-                elif "#" in sheet:
-                    df = pd.read_excel(xl, sheet, dtype=str).fillna("")
-
-                    if sheet in wb_styles.sheetnames:
-                        self._capture_sheet_styles(sheet, df, wb_styles[sheet])
-
-                    self.sub_dfs[sheet] = self._drop_empty_rows(df)
-
-            wb_styles.close()
+            finally:
+                wb.close()
 
             if self.need_config_alert:
                 self.save_config()
 
         except Exception as e:
             print(f"載入 Excel 失敗: {e}")
-            self.close_excel()
             raise
 
     def close_excel(self):
@@ -294,33 +342,54 @@ class DataManager:
         try:
             self.text_file_path = path
             self.text_sheetnames = []
-
-            xls = pd.ExcelFile(path, engine='openpyxl')
-            self._text_file_handle = xls  # 保存句柄
-
             self.text_dict = {}
 
-            for sheet_name in xls.sheet_names:
-                df = pd.read_excel(xls, sheet_name=sheet_name, dtype=str).fillna("")
-                self.text_sheetnames.append(sheet_name)
+            # 使用 openpyxl read_only 模式，比 pandas 快 2-5x
+            wb = load_workbook(path, data_only=True, read_only=True)
+            try:
+                for sheet_name in wb.sheetnames:
+                    ws = wb[sheet_name]
+                    self.text_sheetnames.append(sheet_name)
 
-                if key_col not in df.columns or val_col not in df.columns:
-                    print(f"[{sheet_name}] 缺少欄位，改用前兩欄")
-                    if len(df.columns) < 2:
+                    rows = ws.iter_rows(values_only=True)
+                    # 讀取 header
+                    header = next(rows, None)
+                    if header is None:
                         continue
-                    k = df.columns[0]
-                    v = df.columns[1]
-                else:
-                    k = key_col
-                    v = val_col
 
-                for key, val in zip(df[k], df[v]):
-                    self.text_dict[key] = {
-                        "value": val,
-                        "sheet": sheet_name,
-                        "key_col": k,
-                        "val_col": v
-                    }
+                    header = [str(h).strip() if h is not None else "" for h in header]
+
+                    # 判斷 key/val 欄位索引
+                    if key_col in header and val_col in header:
+                        k_idx = header.index(key_col)
+                        v_idx = header.index(val_col)
+                        k_name = key_col
+                        v_name = val_col
+                    elif len(header) >= 2:
+                        print(f"[{sheet_name}] 缺少欄位，改用前兩欄")
+                        k_idx = 0
+                        v_idx = 1
+                        k_name = header[0]
+                        v_name = header[1]
+                    else:
+                        continue
+
+                    for row in rows:
+                        if k_idx >= len(row) or v_idx >= len(row):
+                            continue
+                        k_val = row[k_idx]
+                        v_val = row[v_idx]
+                        key_str = str(k_val) if k_val is not None else ""
+                        val_str = str(v_val) if v_val is not None else ""
+                        if key_str:
+                            self.text_dict[key_str] = {
+                                "value": val_str,
+                                "sheet": sheet_name,
+                                "key_col": k_name,
+                                "val_col": v_name
+                            }
+            finally:
+                wb.close()
 
             return True
 
@@ -354,9 +423,9 @@ class DataManager:
         try:
             # 儲存前清除空白行
             for sheet in self.master_dfs:
-                self.master_dfs[sheet] = self._drop_empty_rows(self.master_dfs[sheet])
+                self.master_dfs[sheet], _ = self._drop_empty_rows(self.master_dfs[sheet])
             for sheet in self.sub_dfs:
-                self.sub_dfs[sheet] = self._drop_empty_rows(self.sub_dfs[sheet])
+                self.sub_dfs[sheet], _ = self._drop_empty_rows(self.sub_dfs[sheet])
 
             if not os.path.exists(self.excel_path):
                 with pd.ExcelWriter(self.excel_path, engine='openpyxl', mode='w') as writer:
@@ -402,7 +471,8 @@ class DataManager:
 
     def _save_external_text(self):
         """
-        儲存外部文字表：只修改有變動的儲存格，保留格式
+        儲存外部文字表：只修改有變動的儲存格，保留格式。
+        使用按 sheet 分組 + 行索引 O(1) 查找，取代逐 key 線性掃描。
         """
         if not self.text_file_path or not os.path.exists(self.text_file_path):
             return
@@ -410,29 +480,33 @@ class DataManager:
         # 先關閉文字表句柄
         self.close_text_file()
 
+        # 按 sheet 分組 modifications
+        mods_by_sheet = {}
+        for key, new_val in self.text_modifications.items():
+            info = self.text_dict.get(key)
+            if info:
+                mods_by_sheet.setdefault(info["sheet"], []).append((key, new_val, info))
+
+        if not mods_by_sheet:
+            return
+
         wb = load_workbook(self.text_file_path)
 
         try:
-            for key, new_value in self.text_modifications.items():
-                if key not in self.text_dict:
-                    continue
-
-                text_info = self.text_dict[key]
-                sheet_name = text_info["sheet"]
-                key_col_name = text_info["key_col"]
-                val_col_name = text_info["val_col"]
-
+            for sheet_name, entries in mods_by_sheet.items():
                 if sheet_name not in wb.sheetnames:
                     print(f"警告: 工作表 {sheet_name} 不存在於文字表中")
                     continue
 
                 ws = wb[sheet_name]
 
-                header_row = 1
+                # 從 header 找出 key/val 欄位索引
+                key_col_name = entries[0][2]["key_col"]
+                val_col_name = entries[0][2]["val_col"]
                 key_col_idx = None
                 val_col_idx = None
 
-                for col_idx, cell in enumerate(ws[header_row], 1):
+                for col_idx, cell in enumerate(ws[1], 1):
                     if cell.value == key_col_name:
                         key_col_idx = col_idx
                     if cell.value == val_col_name:
@@ -442,20 +516,23 @@ class DataManager:
                     print(f"警告: 在 {sheet_name} 中找不到欄位 {key_col_name} 或 {val_col_name}")
                     continue
 
-                found = False
-                for row_idx in range(2, ws.max_row + 1):
-                    cell_key = ws.cell(row=row_idx, column=key_col_idx).value
-                    if str(cell_key) == str(key):
-                        ws.cell(row=row_idx, column=val_col_idx).value = new_value
-                        found = True
-                        break
+                # 建立行索引（一次掃描 O(n)）
+                row_index = {}
+                for r in range(2, ws.max_row + 1):
+                    cell_key = ws.cell(r, key_col_idx).value
+                    if cell_key is not None:
+                        row_index[str(cell_key)] = r
 
-                if not found:
-                    print(f"警告: 在 {sheet_name} 中找不到 key={key}")
+                # O(1) 更新每個 modification
+                for key, new_val, info in entries:
+                    if key in row_index:
+                        ws.cell(row_index[key], val_col_idx).value = new_val
+                    else:
+                        print(f"警告: 在 {sheet_name} 中找不到 key={key}")
 
             wb.save(self.text_file_path)
         finally:
-            wb.close()  # 確保關閉
+            wb.close()
             gc.collect()
 
     def _update_sheet_content(self, wb, sheet_name, df):
@@ -546,7 +623,6 @@ class DataManager:
             else:
                 df.at[row_idx, col_name] = value
 
-            df.at[row_idx, col_name] = value
             self.dirty = True
 
     def _update_external_text(self, key, new_value):
