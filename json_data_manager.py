@@ -16,6 +16,7 @@ class JsonDataManager:
         self.json_path = None
         self.tables = {}          # {table_name: DataFrame}
         self.sub_tables = {}      # {table_name.key_name: DataFrame}
+        self._sub_fk_is_data = {} # {sub_full_name: bool} — FK col is genuine data, keep on save
         self.need_config_alert = False
         self.dirty = False
         self.dirty_cells = set()   # {(table_name, row_idx, col_name)}
@@ -170,6 +171,7 @@ class JsonDataManager:
         self.need_config_alert = False
         self.tables = {}
         self.sub_tables = {}
+        self._sub_fk_is_data = {}
         self._search_index = {}
 
         file_key = os.path.normpath(file_path)
@@ -271,6 +273,7 @@ class JsonDataManager:
             for key_name, _ in sub_accumulators.items():
                 sub_full_name = f"{table_name}.{key_name}"
                 sub_row_list = []
+                fk_in_data = False   # True if FK key is a genuine field of the nested data
                 for row in rows:
                     if not isinstance(row, dict):
                         continue
@@ -284,9 +287,13 @@ class JsonDataManager:
                     for sub_row in nested:
                         if not isinstance(sub_row, dict):
                             sub_row = {"value": sub_row}
+                        if pk_key in sub_row:
+                            fk_in_data = True
                         new_row = {pk_key: fk_val}
                         new_row.update(sub_row)
                         sub_row_list.append(new_row)
+
+                self._sub_fk_is_data[sub_full_name] = fk_in_data
 
                 if sub_row_list:
                     sub_df = pd.DataFrame(sub_row_list)
@@ -383,6 +390,9 @@ class JsonDataManager:
                     sub_df = self.sub_tables[sub_full]
                     sub_cfg = cfg.get("sub_tables", {}).get(key_name, {})
                     fk_key = sub_cfg.get("foreign_key", pk_key)
+                    # Keep FK column in output only if it was genuine data,
+                    # not an editor-injected link column.
+                    keep_fk = self._sub_fk_is_data.get(sub_full, False)
 
                     if fk_key and fk_key in sub_df.columns and pk_key:
                         pk_val = str(row[pk_key]) if pk_key in row.index else ""
@@ -395,8 +405,8 @@ class JsonDataManager:
                     for _, sub_row in matched.iterrows():
                         sub_rec = {}
                         for col in sub_df.columns:
-                            if col == fk_key:
-                                continue  # Remove FK column from output
+                            if col == fk_key and not keep_fk:
+                                continue  # injected FK column — drop from output
                             sub_rec[col] = _convert_value_sub(table_name, key_name, col, sub_row[col])
                         sub_records.append(sub_rec)
 

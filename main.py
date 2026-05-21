@@ -657,7 +657,13 @@ class SubTableModel(QAbstractTableModel):
         if role == Qt.CheckStateRole:
             value = (value == Qt.Checked)
         self._manager.update_cell(self._sheet, row_idx, col, value)
-        self._df = self._manager.sub_tables.get(self._sheet, self._df)
+        # Reflect the change in this filtered view copy at the SAME index label.
+        # Do NOT swap in the full sub_table — that desyncs view rows from df rows
+        # and routes later edits to whichever skill sits at low global indices.
+        full = self._manager.sub_tables.get(self._sheet)
+        if full is not None and row_idx in full.index and col in full.columns \
+                and row_idx in self._df.index:
+            self._df.at[row_idx, col] = full.at[row_idx, col]
         self.dataChanged.emit(index, index)
         return True
 
@@ -1237,6 +1243,7 @@ class TableEditor(QWidget):
 
         # ══ MIDDLE — search + card list (flex) ════════════════════════════════
         mid = QWidget()
+        mid.setMinimumWidth(240)
         mid.setStyleSheet(f"background: {_C['bg']};")
         mv = QVBoxLayout(mid)
         mv.setContentsMargins(0, 0, 0, 0)
@@ -1290,12 +1297,11 @@ class TableEditor(QWidget):
         self._card_list.customContextMenuRequested.connect(self._item_ctx_menu)
         mv.addWidget(self._card_list, 1)
 
-        root.addWidget(mid, 1)
-        root.addWidget(_vsep())
+        # mid is placed into the draggable splitter below
 
-        # ══ RIGHT — field editor + JSON preview + sub-tables (440px) ══════════
+        # ══ RIGHT — field editor + JSON preview + sub-tables ══════════════════
         right = QWidget()
-        right.setFixedWidth(440)
+        right.setMinimumWidth(320)
         right.setStyleSheet(f"background: {_C['panel']};")
         rv = QVBoxLayout(right)
         rv.setContentsMargins(0, 0, 0, 0)
@@ -1406,7 +1412,22 @@ class TableEditor(QWidget):
         rsplit.setCollapsible(0, False)
         rsplit.setCollapsible(1, False)
         rv.addWidget(rsplit, 1)
-        root.addWidget(right)
+
+        # Draggable divider: middle list ↔ right panel (field editor + sub-tables)
+        mid_right_split = QSplitter(Qt.Horizontal)
+        mid_right_split.setObjectName("mid-right-split")
+        mid_right_split.setStyleSheet(
+            f"QSplitter#mid-right-split::handle:horizontal "
+            f"{{ background: {_C['border']}; width: 4px; }}"
+        )
+        mid_right_split.setHandleWidth(4)
+        mid_right_split.setChildrenCollapsible(False)
+        mid_right_split.addWidget(mid)
+        mid_right_split.addWidget(right)
+        mid_right_split.setStretchFactor(0, 1)
+        mid_right_split.setStretchFactor(1, 0)
+        mid_right_split.setSizes([620, 440])
+        root.addWidget(mid_right_split, 1)
 
         self._build_sub_tabs()
 
