@@ -633,7 +633,7 @@ class SubTableModel(QAbstractTableModel):
         val     = self._df.iat[r, c]
         row_idx = self._df.index[r]
 
-        if role == Qt.DisplayRole:
+        if role in (Qt.DisplayRole, Qt.EditRole):
             return None if col_type == "bool" else (str(val) if val is not None else "")
         if role == Qt.CheckStateRole and col_type == "bool":
             v = val
@@ -724,10 +724,11 @@ class SubTableModel(QAbstractTableModel):
 class EnumDelegate(QStyledItemDelegate):
     def __init__(self, options, parent=None):
         super().__init__(parent)
-        self._options = [str(o) for o in options]
+        self._options = [str(o) for o in options if str(o) != ""]
 
     def createEditor(self, parent, option, index):
         cb = QComboBox(parent)
+        cb.addItem("")              # 允許清空 / 不選 enum 值
         cb.addItems(self._options)
         return cb
 
@@ -920,9 +921,10 @@ class FieldEditorWidget(QWidget):
                 w.toggled.connect(lambda checked, c=col: self.field_changed.emit(c, checked))
 
             elif col_type == "enum":
-                opts = col_conf.get("options") or [""]
+                opts = [str(o) for o in (col_conf.get("options") or []) if str(o) != ""]
                 w = _NoscrollCombo()
-                w.addItems([str(o) for o in opts])
+                w.addItem("")
+                w.addItems(opts)
                 w.currentTextChanged.connect(
                     lambda v, c=col: self.field_changed.emit(c, v)
                 )
