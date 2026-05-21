@@ -676,11 +676,18 @@ class SubTableModel(QAbstractTableModel):
         return base | (Qt.ItemIsUserCheckable if col_type == "bool" else Qt.ItemIsEditable)
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
-        if role != Qt.DisplayRole:
-            return None
         if orientation == Qt.Horizontal:
-            return str(self._df.columns[section])
-        return str(section + 1)
+            if section < 0 or section >= len(self._df.columns):
+                return None
+            col = str(self._df.columns[section])
+            if role == Qt.DisplayRole:
+                return col
+            if role == Qt.ToolTipRole:
+                return self._cols_cfg.get(col, {}).get("note", "") or None
+            return None
+        if role == Qt.DisplayRole:
+            return str(section + 1)
+        return None
 
     def reload(self, df, cols_cfg=None):
         self.beginResetModel()
@@ -871,6 +878,10 @@ class FieldEditorWidget(QWidget):
                 f"color: {_C['txt2']}; font-size: 11px; font-weight: 500; background: transparent;"
             )
             self._lbl_widgets[col] = lbl
+            _note = col_conf.get("note", "")
+            if _note:
+                lbl.setToolTip(_note)
+                lbl_row.setToolTip(_note)
             lrlo.addWidget(dot)
             lrlo.addWidget(lbl)
             lrlo.addStretch()
@@ -2516,7 +2527,7 @@ class App(QMainWindow):
             return btn, opts_store
 
         def _col_row(col, cfg_cols, parent_dlg, df_source=None):
-            """Return (row_widget, combo, opts_store) for one column."""
+            """Return (row_widget, combo, opts_store, note_edit) for one column."""
             rw  = QWidget(); rw.setStyleSheet("background:transparent;")
             rlo = QHBoxLayout(rw)
             rlo.setContentsMargins(0, 0, 0, 0); rlo.setSpacing(6)
@@ -2533,15 +2544,22 @@ class App(QMainWindow):
             opts_btn.setVisible(cur_type == "enum")
             cb.currentTextChanged.connect(lambda t, ob=opts_btn: ob.setVisible(t == "enum"))
 
-            rlo.addWidget(cb)
-            rlo.addWidget(opts_btn, 1)
-            return rw, cb, opts_store
+            note_edit = QTextEdit()
+            note_edit.setAcceptRichText(False)
+            note_edit.setFixedHeight(50)
+            note_edit.setPlaceholderText("欄位備註（可換行；滑鼠停留欄位標題時顯示）")
+            note_edit.setPlainText(cfg_cols.get(col, {}).get("note", ""))
+
+            rlo.addWidget(cb, 0, Qt.AlignTop)
+            rlo.addWidget(opts_btn, 1, Qt.AlignTop)
+            rlo.addWidget(note_edit, 2)
+            return rw, cb, opts_store, note_edit
 
         # ── Dialog ────────────────────────────────────────────────────────────
         dlg = QDialog(self)
         dlg.setWindowTitle(f"配置 — {table_name}")
-        dlg.setMinimumWidth(520)
-        dlg.resize(540, 660)
+        dlg.setMinimumWidth(560)
+        dlg.resize(720, 680)
         dlg.setStyleSheet(APP_QSS)
 
         cfg      = self.manager.config.get(table_name, {})
@@ -2716,9 +2734,9 @@ class App(QMainWindow):
 
         main_col_widgets: dict[str, tuple] = {}  # col → (cb, opts_store)
         for col in cols:
-            rw, cb, opts_store = _col_row(col, cols_cfg, dlg, df_source=df)
+            rw, cb, opts_store, note_edit = _col_row(col, cols_cfg, dlg, df_source=df)
             vlo.addWidget(_form_row(f"  {col}", rw))
-            main_col_widgets[col] = (cb, opts_store)
+            main_col_widgets[col] = (cb, opts_store, note_edit)
 
         # ── Sub-tables ────────────────────────────────────────────────────────
         prefix = table_name + "."
@@ -2753,9 +2771,9 @@ class App(QMainWindow):
 
                 col_combos: dict[str, tuple] = {}
                 for scol in list(sub_df.columns):
-                    rw, cb, opts_store = _col_row(scol, sub_cols_cfg, dlg, df_source=sub_df)
+                    rw, cb, opts_store, note_edit = _col_row(scol, sub_cols_cfg, dlg, df_source=sub_df)
                     vlo.addWidget(_form_row(f"    {scol}", rw))
-                    col_combos[scol] = (cb, opts_store)
+                    col_combos[scol] = (cb, opts_store, note_edit)
 
                 sub_widgets[tab_name] = {"fk_edit": fk_edit, "col_combos": col_combos}
 
@@ -2815,15 +2833,18 @@ class App(QMainWindow):
             }
         else:
             cfg.pop("text_ref_source", None)
-        def _build_col_entry(t, opts_store):
+        def _build_col_entry(t, opts_store, note=""):
             entry = {"type": t}
             if t == "enum" and opts_store[0]:
                 entry["options"] = opts_store[0]
+            note = (note or "").strip()
+            if note:
+                entry["note"] = note
             return entry
 
         cfg.setdefault("columns", {})
-        for col, (cb, opts_store) in main_col_widgets.items():
-            cfg["columns"][col] = _build_col_entry(cb.currentText(), opts_store)
+        for col, (cb, opts_store, note_edit) in main_col_widgets.items():
+            cfg["columns"][col] = _build_col_entry(cb.currentText(), opts_store, note_edit.toPlainText())
 
         cfg.setdefault("sub_tables", {})
         for tab_name, data in sub_widgets.items():
@@ -2832,8 +2853,8 @@ class App(QMainWindow):
             if fk:
                 st["foreign_key"] = fk
             st.setdefault("columns", {})
-            for scol, (scb, opts_store) in data["col_combos"].items():
-                st["columns"][scol] = _build_col_entry(scb.currentText(), opts_store)
+            for scol, (scb, opts_store, note_edit) in data["col_combos"].items():
+                st["columns"][scol] = _build_col_entry(scb.currentText(), opts_store, note_edit.toPlainText())
 
         self.manager.config[table_name] = cfg
         self.manager.save_config()
