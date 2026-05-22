@@ -11,11 +11,11 @@ from PySide6.QtWidgets import (
     QTextEdit, QTableView, QHeaderView, QAbstractItemView,
     QStackedWidget, QFileDialog, QMenu, QSizePolicy, QFrame,
     QInputDialog, QMessageBox, QStyledItemDelegate, QStyle,
-    QDialog, QDialogButtonBox, QFormLayout,
+    QDialog, QDialogButtonBox, QFormLayout, QLayout,
 )
 from PySide6.QtCore import (
     Qt, Signal, QAbstractTableModel, QModelIndex,
-    QTimer, QSize, QThread, QRect, QRectF,
+    QTimer, QSize, QThread, QRect, QRectF, QPoint,
 )
 from PySide6.QtGui import (
     QAction, QColor, QKeySequence, QFont, QBrush,
@@ -745,6 +745,224 @@ class EnumDelegate(QStyledItemDelegate):
         editor.setGeometry(option.rect)
 
 
+# ── Array editor: chips widget ────────────────────────────────────────────────
+
+class FlowLayout(QLayout):
+    """Left-to-right wrapping layout used to lay out array chips."""
+
+    def __init__(self, parent=None, spacing=4):
+        super().__init__(parent)
+        self._items = []
+        self.setSpacing(spacing)
+        self.setContentsMargins(3, 3, 3, 3)
+
+    def addItem(self, item):       self._items.append(item)
+    def count(self):               return len(self._items)
+    def itemAt(self, i):           return self._items[i] if 0 <= i < len(self._items) else None
+    def takeAt(self, i):           return self._items.pop(i) if 0 <= i < len(self._items) else None
+    def expandingDirections(self): return Qt.Orientation(0)
+    def hasHeightForWidth(self):   return True
+    def heightForWidth(self, w):   return self._arrange(QRect(0, 0, w, 0), apply=False)
+    def sizeHint(self):            return self.minimumSize()
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._arrange(rect, apply=True)
+
+    def minimumSize(self):
+        s = QSize()
+        for it in self._items:
+            s = s.expandedTo(it.minimumSize())
+        m = self.contentsMargins()
+        return s + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _arrange(self, rect, apply):
+        m = self.contentsMargins()
+        x0 = rect.x() + m.left()
+        x, y = x0, rect.y() + m.top()
+        right = rect.right() - m.right()
+        line_h = 0
+        sp = self.spacing()
+        for it in self._items:
+            sz = it.sizeHint()
+            if x > x0 and x + sz.width() > right:
+                x = x0
+                y += line_h + sp
+                line_h = 0
+            if apply:
+                it.setGeometry(QRect(QPoint(x, y), sz))
+            x += sz.width() + sp
+            line_h = max(line_h, sz.height())
+        return y + line_h + m.bottom() - rect.y()
+
+
+class _Chip(QFrame):
+    """One removable array element."""
+    removed = Signal(object)
+
+    def __init__(self, text, parent=None):
+        super().__init__(parent)
+        self._text = text
+        self.setStyleSheet(
+            f"background:{_C['card']}; border:1px solid {_C['border']}; border-radius:9px;"
+        )
+        lo = QHBoxLayout(self)
+        lo.setContentsMargins(8, 2, 4, 2)
+        lo.setSpacing(3)
+        lbl = QLabel(text if text != "" else "(空)")
+        lbl.setStyleSheet(
+            f"color:{_C['txt']}; background:transparent; border:none; font-size:12px;"
+        )
+        btn = QPushButton("✕")
+        btn.setFixedSize(16, 16)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setStyleSheet(
+            f"background:transparent; border:none; color:{_C['txt3']}; font-size:11px;"
+        )
+        btn.clicked.connect(lambda: self.removed.emit(self))
+        lo.addWidget(lbl)
+        lo.addWidget(btn)
+
+    def text(self):
+        return self._text
+
+
+class ChipsEdit(QWidget):
+    """Array field editor: wrapping removable chips + add-input + copy button."""
+    changed = Signal()
+
+    def __init__(self, parent=None, chip_area_height=64):
+        super().__init__(parent)
+        self._chips = []
+        lo = QVBoxLayout(self)
+        lo.setContentsMargins(0, 0, 0, 0)
+        lo.setSpacing(4)
+
+        self._chip_box = QWidget()
+        sp = self._chip_box.sizePolicy()
+        sp.setHeightForWidth(True)
+        self._chip_box.setSizePolicy(sp)
+        self._chip_box.setStyleSheet(
+            f"background:{_C['code']}; border:1px solid {_C['border']}; border-radius:6px;"
+        )
+        self._flow = FlowLayout(self._chip_box, spacing=4)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFixedHeight(chip_area_height)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea{border:none; background:transparent;}")
+        scroll.setWidget(self._chip_box)
+        lo.addWidget(scroll)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        self._input = QLineEdit()
+        self._input.setPlaceholderText("輸入後按 Enter 或逗號新增…")
+        self._input.returnPressed.connect(self._commit_input)
+        self._input.textChanged.connect(self._on_input_text)
+        copy_btn = QPushButton("⧉ 複製")
+        copy_btn.setCursor(Qt.PointingHandCursor)
+        copy_btn.setToolTip("複製整個陣列內容（以逗號分隔）")
+        copy_btn.setStyleSheet(
+            f"background:{_C['card']}; border:1px solid {_C['border']}; "
+            f"color:{_C['txt2']}; border-radius:5px; padding:3px 8px; font-size:11px;"
+        )
+        copy_btn.clicked.connect(self._copy_all)
+        row.addWidget(self._input, 1)
+        row.addWidget(copy_btn)
+        lo.addLayout(row)
+
+    # ── public API ──
+    def set_value(self, comma_str):
+        """Populate chips from a comma-separated string (does not emit `changed`)."""
+        for ch in self._chips:
+            self._flow.removeWidget(ch)
+            ch.setParent(None)
+            ch.deleteLater()
+        self._chips = []
+        for tok in str(comma_str or "").split(","):
+            tok = tok.strip()
+            if tok != "":
+                self._add_chip(tok)
+        self._chip_box.updateGeometry()
+
+    def value(self):
+        return ", ".join(c.text() for c in self._chips)
+
+    # ── internal ──
+    def _add_chip(self, text):
+        chip = _Chip(text, self._chip_box)
+        chip.removed.connect(self._remove_chip)
+        self._flow.addWidget(chip)
+        self._chips.append(chip)
+        chip.show()
+
+    def _remove_chip(self, chip):
+        if chip in self._chips:
+            self._chips.remove(chip)
+        self._flow.removeWidget(chip)
+        chip.setParent(None)
+        chip.deleteLater()
+        self._chip_box.updateGeometry()
+        self.changed.emit()
+
+    def _commit_input(self):
+        raw = self._input.text()
+        self._input.blockSignals(True)
+        self._input.clear()
+        self._input.blockSignals(False)
+        added = False
+        for tok in raw.split(","):
+            tok = tok.strip()
+            if tok != "":
+                self._add_chip(tok)
+                added = True
+        if added:
+            self._chip_box.updateGeometry()
+            self.changed.emit()
+
+    def _on_input_text(self, text):
+        if "," in text:
+            self._commit_input()
+
+    def _copy_all(self):
+        QApplication.clipboard().setText(self.value())
+
+
+class ArrayEditDialog(QDialog):
+    """Popup chips editor for array cells in sub-tables."""
+
+    def __init__(self, comma_str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("編輯陣列")
+        self.setMinimumWidth(380)
+        self.setStyleSheet(APP_QSS)
+        lo = QVBoxLayout(self)
+        self._chips = ChipsEdit(chip_area_height=150)
+        self._chips.set_value(comma_str)
+        lo.addWidget(self._chips)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lo.addWidget(bb)
+
+    def value(self):
+        return self._chips.value()
+
+
+class ArrayDelegate(QStyledItemDelegate):
+    """Sub-table array cell — double-click opens the chips editor dialog."""
+
+    def createEditor(self, parent, option, index):
+        cur = index.data(Qt.DisplayRole) or ""
+        dlg = ArrayEditDialog(cur, parent)
+        if dlg.exec() == QDialog.Accepted:
+            index.model().setData(index, dlg.value(), Qt.EditRole)
+        return None
+
+
 # ── FieldEditorWidget ─────────────────────────────────────────────────────────
 
 class FieldEditorWidget(QWidget):
@@ -935,6 +1153,12 @@ class FieldEditorWidget(QWidget):
                     lambda v, c=col, ct=col_type: self._on_numeric(c, v, ct)
                 )
 
+            elif col_type == "array":
+                w = ChipsEdit()
+                w.changed.connect(
+                    lambda c=col, _w=w: self.field_changed.emit(c, _w.value())
+                )
+
             elif col_type == "text_ref":
                 # Editable string (same as string type) — value IS the lookup key
                 w = QTextEdit()
@@ -1074,6 +1298,8 @@ class FieldEditorWidget(QWidget):
                     w.setText(str(val) if val is not None else "")
                     w.setProperty("invalid", "false")
                     w.style().unpolish(w); w.style().polish(w)
+                elif col_type == "array":
+                    w.set_value(str(val) if val is not None else "")
                 elif col_type == "text_ref":
                     val_str = str(val) if val is not None else ""
                     w.setPlainText(val_str)
@@ -1150,6 +1376,8 @@ class SubTablePanel(QWidget):
             if col_type == "enum":
                 opts = (cols_cfg or {}).get(col, {}).get("options") or [""]
                 self._view.setItemDelegateForColumn(c, EnumDelegate(opts, self._view))
+            elif col_type == "array":
+                self._view.setItemDelegateForColumn(c, ArrayDelegate(self._view))
 
     def reload(self, df, cols_cfg=None):
         self._model.reload(df, cols_cfg)
@@ -2534,7 +2762,7 @@ class App(QMainWindow):
             rlo = QHBoxLayout(rw)
             rlo.setContentsMargins(0, 0, 0, 0); rlo.setSpacing(6)
             cb = _NoscrollCombo()
-            cb.addItems(["string", "int", "float", "bool", "enum", "text_ref"])
+            cb.addItems(["string", "int", "float", "bool", "enum", "text_ref", "array"])
             cur_type = cfg_cols.get(col, {}).get("type", "string")
             cb.setCurrentText(cur_type)
 

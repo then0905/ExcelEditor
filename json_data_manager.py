@@ -431,7 +431,23 @@ class JsonDataManager:
                     return 0
                 if col_type == "float":
                     return 0.0
+                if col_type == "array":
+                    return []
                 return val
+            if col_type == "array":
+                out = []
+                for tok in str(val).split(","):
+                    tok = tok.strip()
+                    if tok == "":
+                        continue
+                    if re.fullmatch(r"-?\d+", tok):
+                        out.append(int(tok))
+                    else:
+                        try:
+                            out.append(float(tok))
+                        except ValueError:
+                            out.append(tok)
+                return out
             try:
                 if col_type == "int":
                     return int(float(str(val)))
