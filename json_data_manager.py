@@ -290,7 +290,12 @@ class JsonDataManager:
                         if pk_key in sub_row:
                             fk_in_data = True
                         new_row = {pk_key: fk_val}
-                        new_row.update(sub_row)
+                        for sk, sv in sub_row.items():
+                            if isinstance(sv, list) and not (sv and isinstance(sv[0], dict)):
+                                # array-of-primitives → comma-joined string (same as main table)
+                                new_row[sk] = ", ".join(str(x) for x in sv)
+                            else:
+                                new_row[sk] = sv
                         sub_row_list.append(new_row)
 
                 self._sub_fk_is_data[sub_full_name] = fk_in_data
@@ -382,7 +387,10 @@ class JsonDataManager:
                 record = {}
                 for col in df.columns:
                     val = row[col]
-                    record[col] = _convert_value(table_name, col, val)
+                    col_type, cv = _convert_value(table_name, col, val)
+                    if col_type == "enum" and (cv == "" or cv is None):
+                        continue  # 空 enum → 不輸出此欄位
+                    record[col] = cv
 
                 # Reassemble sub_tables
                 for sub_full in sub_table_keys:
@@ -407,7 +415,10 @@ class JsonDataManager:
                         for col in sub_df.columns:
                             if col == fk_key and not keep_fk:
                                 continue  # injected FK column — drop from output
-                            sub_rec[col] = _convert_value_sub(table_name, key_name, col, sub_row[col])
+                            col_type, cv = _convert_value_sub(table_name, key_name, col, sub_row[col])
+                            if col_type == "enum" and (cv == "" or cv is None):
+                                continue  # 空 enum → 不輸出此欄位
+                            sub_rec[col] = cv
                         sub_records.append(sub_rec)
 
                     record[key_name] = sub_records
@@ -418,12 +429,12 @@ class JsonDataManager:
         def _convert_value(table_name, col, val):
             cfg = self.config.get(table_name, {})
             col_type = cfg.get("columns", {}).get(col, {}).get("type", "string")
-            return _coerce(val, col_type)
+            return col_type, _coerce(val, col_type)
 
         def _convert_value_sub(table_name, sub_name, col, val):
             cfg = self.config.get(table_name, {})
             col_type = cfg.get("sub_tables", {}).get(sub_name, {}).get("columns", {}).get(col, {}).get("type", "string")
-            return _coerce(val, col_type)
+            return col_type, _coerce(val, col_type)
 
         def _coerce(val, col_type):
             if val == "" or val is None:
