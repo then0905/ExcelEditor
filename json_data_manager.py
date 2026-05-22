@@ -427,8 +427,10 @@ class JsonDataManager:
 
         def _coerce(val, col_type):
             if val == "" or val is None:
-                if col_type in ("int", "float"):
-                    return None
+                if col_type == "int":
+                    return 0
+                if col_type == "float":
+                    return 0.0
                 return val
             try:
                 if col_type == "int":
