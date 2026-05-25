@@ -11,11 +11,11 @@ from PySide6.QtWidgets import (
     QTextEdit, QTableView, QHeaderView, QAbstractItemView,
     QStackedWidget, QFileDialog, QMenu, QSizePolicy, QFrame,
     QInputDialog, QMessageBox, QStyledItemDelegate, QStyle,
-    QDialog, QDialogButtonBox, QFormLayout, QLayout,
+    QDialog, QDialogButtonBox, QFormLayout, QLayout, QCompleter,
 )
 from PySide6.QtCore import (
     Qt, Signal, QAbstractTableModel, QModelIndex,
-    QTimer, QSize, QThread, QRect, QRectF, QPoint,
+    QTimer, QSize, QThread, QRect, QRectF, QPoint, QStringListModel,
 )
 from PySide6.QtGui import (
     QAction, QColor, QKeySequence, QFont, QBrush,
@@ -745,6 +745,66 @@ class EnumDelegate(QStyledItemDelegate):
         editor.setGeometry(option.rect)
 
 
+# ── Suggest field: context-filtered autocomplete ──────────────────────────────
+
+def _get_suggestions(df, this_col, context_col, context_value):
+    """Sorted, deduped previously-used values of `this_col` from `df`,
+       filtered by `df[context_col] == context_value` when context_col is set."""
+    if df is None or this_col not in df.columns:
+        return []
+    if context_col and context_col in df.columns:
+        mask = df[context_col].astype(str) == str(context_value)
+        vals = df.loc[mask, this_col]
+    else:
+        vals = df[this_col]
+    seen, out = set(), []
+    for v in vals.astype(str):
+        v = v.strip()
+        if v and v not in seen:
+            seen.add(v); out.append(v)
+    return sorted(out)
+
+
+class _SuggestLineEdit(QLineEdit):
+    """QLineEdit that auto-pops its completer on focus-in."""
+    def focusInEvent(self, e):
+        super().focusInEvent(e)
+        if self.completer():
+            QTimer.singleShot(0, self.completer().complete)
+
+
+class SuggestDelegate(QStyledItemDelegate):
+    """Sub-table cell editor: line edit + popup of previously-used values,
+       filtered by a sibling 'context' column on the same row."""
+    def __init__(self, df_provider, this_col, context_col, parent=None):
+        super().__init__(parent)
+        self._df_provider  = df_provider
+        self._this_col     = this_col
+        self._context_col  = context_col
+
+    def createEditor(self, parent, option, index):
+        df = self._df_provider()
+        ctx_val = ""
+        try:
+            ctx_val = str(index.model()._df.iloc[index.row()][self._context_col])
+        except Exception:
+            ctx_val = ""
+        items = _get_suggestions(df, self._this_col, self._context_col, ctx_val)
+        editor = _SuggestLineEdit(parent)
+        m = QStringListModel(items, editor)
+        compl = QCompleter(m, editor)
+        compl.setCompletionMode(QCompleter.PopupCompletion)
+        compl.setCaseSensitivity(Qt.CaseInsensitive)
+        editor.setCompleter(compl)
+        return editor
+
+    def setEditorData(self, editor, index):
+        editor.setText(index.data(Qt.DisplayRole) or "")
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.text(), Qt.EditRole)
+
+
 # ── Array editor: chips widget ────────────────────────────────────────────────
 
 class FlowLayout(QLayout):
@@ -797,31 +857,83 @@ class FlowLayout(QLayout):
 
 
 class _Chip(QFrame):
-    """One removable array element."""
+    """One array element — double-click to edit, ✕ to remove."""
     removed = Signal(object)
+    edited  = Signal()
 
     def __init__(self, text, parent=None):
         super().__init__(parent)
         self._text = text
+        self._editing = False
+        self.setObjectName("arrayChip")
         self.setStyleSheet(
-            f"background:{_C['card']}; border:1px solid {_C['border']}; border-radius:9px;"
+            f"QFrame#arrayChip {{ background:{_C['card']}; "
+            f"border:1px solid {_C['border']}; border-radius:9px; }}"
         )
+        self.setToolTip("雙擊可編輯")
         lo = QHBoxLayout(self)
         lo.setContentsMargins(8, 2, 4, 2)
         lo.setSpacing(3)
-        lbl = QLabel(text if text != "" else "(空)")
-        lbl.setStyleSheet(
+
+        self._lbl = QLabel(text if text != "" else "(空)")
+        self._lbl.setStyleSheet(
             f"color:{_C['txt']}; background:transparent; border:none; font-size:12px;"
         )
+        self._edit = QLineEdit(text)
+        self._edit.setStyleSheet(
+            f"color:{_C['txt']}; background:transparent; border:none; font-size:12px;"
+        )
+        self._edit.hide()
+        self._edit.editingFinished.connect(self._commit_edit)
+        self._edit.textChanged.connect(self._resize_edit)
+
         btn = QPushButton("✕")
-        btn.setFixedSize(16, 16)
+        btn.setFixedSize(18, 18)
         btn.setCursor(Qt.PointingHandCursor)
         btn.setStyleSheet(
-            f"background:transparent; border:none; color:{_C['txt3']}; font-size:11px;"
+            f"QPushButton {{ background:transparent; border:none; padding:0px; "
+            f"margin:0px; color:{_C['txt3']}; font-size:13px; }}"
+            f"QPushButton:hover {{ color:{_C['red']}; }}"
         )
         btn.clicked.connect(lambda: self.removed.emit(self))
-        lo.addWidget(lbl)
+
+        lo.addWidget(self._lbl)
+        lo.addWidget(self._edit)
         lo.addWidget(btn)
+
+    def mouseDoubleClickEvent(self, event):
+        self._start_edit()
+
+    def _start_edit(self):
+        self._editing = True
+        self._edit.setText(self._text)
+        self._resize_edit()
+        self._lbl.hide()
+        self._edit.show()
+        self._edit.setFocus()
+        self._edit.selectAll()
+        self.updateGeometry()
+
+    def _resize_edit(self):
+        fm = self._edit.fontMetrics()
+        self._edit.setFixedWidth(max(fm.horizontalAdvance(self._edit.text()) + 8, 24))
+
+    def _commit_edit(self):
+        if not self._editing:
+            return
+        self._editing = False
+        new = self._edit.text().strip()
+        self._edit.hide()
+        if new == "":
+            self.removed.emit(self)
+            return
+        changed = (new != self._text)
+        self._text = new
+        self._lbl.setText(new)
+        self._lbl.show()
+        self.updateGeometry()
+        if changed:
+            self.edited.emit()
 
     def text(self):
         return self._text
@@ -895,6 +1007,7 @@ class ChipsEdit(QWidget):
     def _add_chip(self, text):
         chip = _Chip(text, self._chip_box)
         chip.removed.connect(self._remove_chip)
+        chip.edited.connect(self.changed.emit)
         self._flow.addWidget(chip)
         self._chips.append(chip)
         chip.show()
@@ -1372,12 +1485,20 @@ class SubTablePanel(QWidget):
 
     def _refresh_delegates(self, cols_cfg):
         for c, col in enumerate(self._model.df.columns):
-            col_type = (cols_cfg or {}).get(col, {}).get("type", "string")
+            col_conf = (cols_cfg or {}).get(col, {})
+            col_type = col_conf.get("type", "string")
             if col_type == "enum":
-                opts = (cols_cfg or {}).get(col, {}).get("options") or [""]
+                opts = col_conf.get("options") or [""]
                 self._view.setItemDelegateForColumn(c, EnumDelegate(opts, self._view))
             elif col_type == "array":
                 self._view.setItemDelegateForColumn(c, ArrayDelegate(self._view))
+            elif col_conf.get("suggest_from"):
+                ctx = col_conf["suggest_from"]
+                df_getter = (lambda sheet=self._sheet:
+                             self._manager.sub_tables.get(sheet))
+                self._view.setItemDelegateForColumn(c, SuggestDelegate(
+                    df_getter, col, ctx, self._view
+                ))
 
     def reload(self, df, cols_cfg=None):
         self._model.reload(df, cols_cfg)
@@ -2780,10 +2901,23 @@ class App(QMainWindow):
             note_edit.setPlaceholderText("欄位備註（可換行；滑鼠停留欄位標題時顯示）")
             note_edit.setPlainText(cfg_cols.get(col, {}).get("note", ""))
 
+            suggest_combo = _NoscrollCombo()
+            suggest_combo.setToolTip("依此鄰欄的值過濾建議清單（空白為不啟用）")
+            suggest_combo.setMaximumWidth(130)
+            suggest_combo.addItem("(無建議)", "")
+            if df_source is not None:
+                for sc in df_source.columns:
+                    if str(sc) != col:
+                        suggest_combo.addItem(str(sc), str(sc))
+            cur_sg = cfg_cols.get(col, {}).get("suggest_from", "")
+            ix = suggest_combo.findData(cur_sg) if cur_sg else 0
+            suggest_combo.setCurrentIndex(max(ix, 0))
+
             rlo.addWidget(cb, 0, Qt.AlignTop)
             rlo.addWidget(opts_btn, 1, Qt.AlignTop)
             rlo.addWidget(note_edit, 2)
-            return rw, cb, opts_store, note_edit
+            rlo.addWidget(suggest_combo, 0, Qt.AlignTop)
+            return rw, cb, opts_store, note_edit, suggest_combo
 
         # ── Dialog ────────────────────────────────────────────────────────────
         dlg = QDialog(self)
@@ -2964,9 +3098,9 @@ class App(QMainWindow):
 
         main_col_widgets: dict[str, tuple] = {}  # col → (cb, opts_store)
         for col in cols:
-            rw, cb, opts_store, note_edit = _col_row(col, cols_cfg, dlg, df_source=df)
+            rw, cb, opts_store, note_edit, suggest_combo = _col_row(col, cols_cfg, dlg, df_source=df)
             vlo.addWidget(_form_row(f"  {col}", rw))
-            main_col_widgets[col] = (cb, opts_store, note_edit)
+            main_col_widgets[col] = (cb, opts_store, note_edit, suggest_combo)
 
         # ── Sub-tables ────────────────────────────────────────────────────────
         prefix = table_name + "."
@@ -3001,9 +3135,9 @@ class App(QMainWindow):
 
                 col_combos: dict[str, tuple] = {}
                 for scol in list(sub_df.columns):
-                    rw, cb, opts_store, note_edit = _col_row(scol, sub_cols_cfg, dlg, df_source=sub_df)
+                    rw, cb, opts_store, note_edit, suggest_combo = _col_row(scol, sub_cols_cfg, dlg, df_source=sub_df)
                     vlo.addWidget(_form_row(f"    {scol}", rw))
-                    col_combos[scol] = (cb, opts_store, note_edit)
+                    col_combos[scol] = (cb, opts_store, note_edit, suggest_combo)
 
                 sub_widgets[tab_name] = {"fk_edit": fk_edit, "col_combos": col_combos}
 
@@ -3063,18 +3197,23 @@ class App(QMainWindow):
             }
         else:
             cfg.pop("text_ref_source", None)
-        def _build_col_entry(t, opts_store, note=""):
+        def _build_col_entry(t, opts_store, note="", suggest_from=""):
             entry = {"type": t}
             if t == "enum" and opts_store[0]:
                 entry["options"] = opts_store[0]
             note = (note or "").strip()
             if note:
                 entry["note"] = note
+            sg = (suggest_from or "").strip()
+            if sg:
+                entry["suggest_from"] = sg
             return entry
 
         cfg.setdefault("columns", {})
-        for col, (cb, opts_store, note_edit) in main_col_widgets.items():
-            cfg["columns"][col] = _build_col_entry(cb.currentText(), opts_store, note_edit.toPlainText())
+        for col, (cb, opts_store, note_edit, suggest_combo) in main_col_widgets.items():
+            cfg["columns"][col] = _build_col_entry(
+                cb.currentText(), opts_store, note_edit.toPlainText(), suggest_combo.currentData()
+            )
 
         cfg.setdefault("sub_tables", {})
         for tab_name, data in sub_widgets.items():
@@ -3083,8 +3222,10 @@ class App(QMainWindow):
             if fk:
                 st["foreign_key"] = fk
             st.setdefault("columns", {})
-            for scol, (scb, opts_store, note_edit) in data["col_combos"].items():
-                st["columns"][scol] = _build_col_entry(scb.currentText(), opts_store, note_edit.toPlainText())
+            for scol, (scb, opts_store, note_edit, suggest_combo) in data["col_combos"].items():
+                st["columns"][scol] = _build_col_entry(
+                    scb.currentText(), opts_store, note_edit.toPlainText(), suggest_combo.currentData()
+                )
 
         self.manager.config[table_name] = cfg
         self.manager.save_config()
