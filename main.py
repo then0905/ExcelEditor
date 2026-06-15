@@ -2481,6 +2481,7 @@ class App(QMainWindow):
             ("📂  開啟",   "",        self.load_file),
             ("+ 新建",    "",        self._new_file),
             ("💾  儲存",  "success", self.save_file),
+            ("📤  匯出 Excel", "",  self._export_to_excel),
         ]:
             b = _mk_btn(text, role)
             b.setFixedHeight(34)
@@ -2694,6 +2695,88 @@ class App(QMainWindow):
         worker.done.connect(_done)
         worker.error.connect(_err)
         worker.start()
+
+    # ── Export to Excel ───────────────────────────────────────────────────────
+
+    def _export_to_excel(self):
+        if not self.manager.json_path:
+            QMessageBox.warning(self, "提示", "尚未載入任何 JSON 檔案"); return
+        if not self.manager.tables:
+            QMessageBox.warning(self, "提示", "沒有資料可以匯出"); return
+        base = os.path.splitext(os.path.basename(self.manager.json_path))[0]
+        default = os.path.join(os.path.dirname(self.manager.json_path), base + ".xlsx")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "匯出為 Excel（可選現有檔案直接覆蓋）",
+            default, "Excel 檔案 (*.xlsx)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+        try:
+            self._write_xlsx(path)
+        except Exception as e:
+            QMessageBox.critical(self, "匯出失敗", str(e))
+            return
+        self.show_snackbar(f"✓ 已匯出 Excel: {os.path.basename(path)}", color=_C["green"])
+
+    def _write_xlsx(self, path):
+        import openpyxl
+        from openpyxl.comments import Comment
+
+        def _safe_sheet(name):
+            bad = '\\/*?:[]'
+            s = "".join("_" if c in bad else c for c in str(name))
+            return s[:31] or "Sheet1"
+
+        def _cell(val, col_type):
+            s = "" if val is None else str(val).strip()
+            if s == "":
+                if col_type == "int":   return 0
+                if col_type == "float": return 0.0
+                if col_type == "bool":  return False
+                return None
+            if col_type == "int":
+                try: return int(float(s))
+                except (ValueError, TypeError): return s
+            if col_type == "float":
+                try: return float(s)
+                except (ValueError, TypeError): return s
+            if col_type == "bool":
+                return s.lower() in ("true", "1", "yes")
+            return s  # string / enum / array(comma-joined) / text_ref
+
+        def _write_table(ws, df, cols_cfg):
+            cols = list(df.columns)
+            for ci, col in enumerate(cols, 1):
+                cell = ws.cell(row=1, column=ci, value=str(col))
+                note = (cols_cfg.get(col, {}) or {}).get("note", "")
+                if note:
+                    cell.comment = Comment(note, "JsonEditor")
+            for ri, (_, row) in enumerate(df.iterrows(), 2):
+                for ci, col in enumerate(cols, 1):
+                    ct = (cols_cfg.get(col, {}) or {}).get("type", "string")
+                    ws.cell(row=ri, column=ci, value=_cell(row[col], ct))
+
+        wb = openpyxl.Workbook()
+        wb.remove(wb.active)  # remove default empty sheet
+
+        for tname, tdf in self.manager.tables.items():
+            cfg = self.manager.config.get(tname, {})
+            ws = wb.create_sheet(title=_safe_sheet(tname))
+            _write_table(ws, tdf, cfg.get("columns", {}))
+            prefix = tname + "."
+            for sub_full, sdf in self.manager.sub_tables.items():
+                if not sub_full.startswith(prefix):
+                    continue
+                sub_name = sub_full[len(prefix):]
+                ws2 = wb.create_sheet(title=_safe_sheet(sub_name))
+                _write_table(
+                    ws2, sdf,
+                    cfg.get("sub_tables", {}).get(sub_name, {}).get("columns", {})
+                )
+
+        wb.save(path)
 
     # ── UI refresh ────────────────────────────────────────────────────────────
 
