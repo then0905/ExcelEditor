@@ -2348,6 +2348,7 @@ class TableEditor(QWidget):
         self.manager.sub_tables[full] = sub_df
         self.manager.dirty = True
         self._build_sub_tabs()
+        self._select_sub_tab(tab_name)
         self._refresh_sub_tables()
         self.status_message.emit(f"從表欄位 [{col_name}] 已新增", _C["green"])
 
