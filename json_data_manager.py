@@ -333,6 +333,23 @@ class JsonDataManager:
                     }
                     self.need_config_alert = True
 
+            # Reconstruct config-defined sub_tables that have no data this load
+            # (e.g. created via "新增子表" but not yet populated). Without this an
+            # empty sub_table would vanish on reload; and an empty array in the
+            # JSON would otherwise be misread as a blank master column.
+            for sub_name, sub_cfg in self.config[table_name].get("sub_tables", {}).items():
+                sub_full_name = f"{table_name}.{sub_name}"
+                if sub_name in self.tables[table_name].columns:
+                    self.tables[table_name].drop(columns=[sub_name], inplace=True)
+                    self.config[table_name].get("columns", {}).pop(sub_name, None)
+                if sub_full_name in self.sub_tables:
+                    continue
+                fk = sub_cfg.get("foreign_key", pk_key) or pk_key or ""
+                cols = list(sub_cfg.get("columns", {}).keys()) or ([fk] if fk else [])
+                self.sub_tables[sub_full_name] = pd.DataFrame(columns=cols)
+                self._sub_fk_is_data[sub_full_name] = False
+                self._build_search_index(sub_full_name, self.sub_tables[sub_full_name])
+
         if self.need_config_alert:
             self.save_config()
 
@@ -606,6 +623,44 @@ class JsonDataManager:
     # ──────────────────────────────────────────────
     # Column management
     # ──────────────────────────────────────────────
+
+    def add_sub_table(self, table_name, sub_name):
+        """Create a new empty sub_table for a master table.
+
+        The FK column equals the master's primary_key (so sub-rows align to the
+        parent by ID). Returns True on success, False if it can't be created.
+        The structure is persisted to config so it survives reload even with
+        zero rows (see load_json reconstruction).
+        """
+        if table_name not in self.tables:
+            return False
+        cfg = self.config.setdefault(table_name, {})
+        cols = self.tables[table_name].columns
+        pk = cfg.get("primary_key") or (cols[0] if len(cols) > 0 else "")
+        if not pk:
+            return False
+        full = f"{table_name}.{sub_name}"
+        if full in self.sub_tables:
+            return False
+        self.sub_tables[full] = pd.DataFrame(columns=[pk])
+        self._sub_fk_is_data[full] = False
+        sub_cfg = cfg.setdefault("sub_tables", {})
+        sub_cfg[sub_name] = {"foreign_key": pk, "columns": {pk: {"type": "string"}}}
+        self._build_search_index(full, self.sub_tables[full])
+        self.dirty = True
+        self.save_config()
+        return True
+
+    def delete_sub_table(self, table_name, sub_name):
+        """Remove an entire sub_table (data + config definition)."""
+        full = f"{table_name}.{sub_name}"
+        self.sub_tables.pop(full, None)
+        self._sub_fk_is_data.pop(full, None)
+        self._search_index.pop(full, None)
+        sub_cfg = self.config.get(table_name, {}).get("sub_tables", {})
+        sub_cfg.pop(sub_name, None)
+        self.dirty = True
+        self.save_config()
 
     def add_column(self, table_name, col_name, col_type="string", default=""):
         """Add a new column to a table."""

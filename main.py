@@ -20,6 +20,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QAction, QColor, QKeySequence, QFont, QBrush,
     QPainter, QPen, QLinearGradient, QPainterPath,
+    QIcon, QPixmap, QFontDatabase,
 )
 
 from json_data_manager import JsonDataManager
@@ -356,15 +357,73 @@ QMenu::separator {{ height: 1px; background: {_C['border']}; margin: 3px 8px; }}
 QDialog {{ background: {_C['panel']}; }}
 QScrollArea {{ border: none; background: transparent; }}
 QScrollArea > QWidget > QWidget {{ background: transparent; }}
+QPushButton::menu-indicator {{ image: none; width: 0; }}
 """
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _mk_btn(text: str, role: str = "") -> QPushButton:
+# ── Tabler icon font (bundled) ──────────────────────────────────────────────
+_TI_HEX = {
+    "plus": "eb0b", "circle-plus": "ea69", "copy": "ea7a", "trash": "eb41",
+    "table": "eba1", "columns": "eb83", "arrow-up": "ea25",
+    "arrow-down": "ea16", "chevron-down": "ea5f", "folder-plus": "eaab",
+    "pencil": "eb04",
+}
+_TI_CODES = {k: chr(int(v, 16)) for k, v in _TI_HEX.items()}
+_ti_family = None
+_ti_cache = {}
+
+def _resource_path(rel: str) -> str:
+    bases = []
+    try:
+        bases.append(os.path.dirname(os.path.abspath(__file__)))
+    except NameError:
+        pass
+    bases.append(os.path.dirname(os.path.abspath(sys.argv[0])))
+    bases.append(os.getcwd())
+    for b in bases:
+        p = os.path.join(b, rel)
+        if os.path.exists(p):
+            return p
+    return os.path.join(bases[0], rel)
+
+def _ti_icon(name: str, color: str = None, px: int = 18) -> QIcon:
+    """Render a Tabler glyph into a QIcon so the label keeps the normal font."""
+    global _ti_family
+    if _ti_family is None:
+        fid = QFontDatabase.addApplicationFont(_resource_path("assets/tabler-icons.ttf"))
+        fams = QFontDatabase.applicationFontFamilies(fid) if fid != -1 else []
+        _ti_family = fams[0] if fams else ""
+    color = color or _C["txt2"]
+    ch = _TI_CODES.get(name)
+    if not ch or not _ti_family:
+        return QIcon()
+    key = (name, color, px)
+    if key in _ti_cache:
+        return _ti_cache[key]
+    pm = QPixmap(px, px)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    f = QFont(_ti_family)
+    f.setPixelSize(px)
+    p.setFont(f)
+    p.setPen(QColor(color))
+    p.drawText(pm.rect(), Qt.AlignCenter, ch)
+    p.end()
+    ic = QIcon(pm)
+    _ti_cache[key] = ic
+    return ic
+
+_ROLE_ICON_COLOR = {"success": "#10B981", "danger": "#EF4444", "primary": "white"}
+
+def _mk_btn(text: str, role: str = "", icon: str = None,
+            icon_color: str = None) -> QPushButton:
     b = QPushButton(text)
     if role:
         b.setProperty("role", role)
+    if icon:
+        b.setIcon(_ti_icon(icon, icon_color or _ROLE_ICON_COLOR.get(role)))
     return b
 
 
@@ -1592,10 +1651,10 @@ class TableEditor(QWidget):
         cls_btns = QHBoxLayout()
         cls_btns.setContentsMargins(8, 6, 8, 6)
         cls_btns.setSpacing(4)
-        b_add_cls = _mk_btn("+ 分類", "ghost"); b_add_cls.clicked.connect(self.add_classification)
-        b_del_cls = _mk_btn("−",     "ghost"); b_del_cls.setFixedWidth(28); b_del_cls.clicked.connect(self.delete_classification)
-        b_up_cls  = _mk_btn("▲",     "ghost"); b_up_cls.setFixedWidth(28);  b_up_cls.clicked.connect(lambda: self.move_classification(-1))
-        b_dn_cls  = _mk_btn("▼",     "ghost"); b_dn_cls.setFixedWidth(28);  b_dn_cls.clicked.connect(lambda: self.move_classification(1))
+        b_add_cls = _mk_btn("分類", "ghost", icon="folder-plus", icon_color="#10B981"); b_add_cls.clicked.connect(self.add_classification)
+        b_del_cls = _mk_btn("", "ghost", icon="trash", icon_color="#EF4444"); b_del_cls.setFixedWidth(30); b_del_cls.setToolTip("刪除分類"); b_del_cls.clicked.connect(self.delete_classification)
+        b_up_cls  = _mk_btn("", "ghost", icon="arrow-up");   b_up_cls.setFixedWidth(30); b_up_cls.setToolTip("上移"); b_up_cls.clicked.connect(lambda: self.move_classification(-1))
+        b_dn_cls  = _mk_btn("", "ghost", icon="arrow-down"); b_dn_cls.setFixedWidth(30); b_dn_cls.setToolTip("下移"); b_dn_cls.clicked.connect(lambda: self.move_classification(1))
         for b in [b_add_cls, b_del_cls, b_up_cls, b_dn_cls]:
             cls_btns.addWidget(b)
         lv.addLayout(cls_btns)
@@ -1631,17 +1690,17 @@ class TableEditor(QWidget):
         alo.addWidget(self._filter_edit, 1)
         alo.addWidget(_vsep())
 
-        for text, role, slot in [
-            ("+ 新增",  "primary", self.add_master_item),
-            ("複製",    "",        self.copy_master_item),
-            ("▲",       "ghost",   lambda: self.move_master_item(-1)),
-            ("▼",       "ghost",   lambda: self.move_master_item(1)),
-            ("刪除",    "danger",  self.delete_master_item),
+        for text, role, icon, tip, slot in [
+            ("新增", "success", "circle-plus", "",   self.add_master_item),
+            ("複製", "",        "copy",        "",   self.copy_master_item),
+            ("",     "ghost",   "arrow-up",    "上移", lambda: self.move_master_item(-1)),
+            ("",     "ghost",   "arrow-down",  "下移", lambda: self.move_master_item(1)),
+            ("刪除", "danger",  "trash",       "",   self.delete_master_item),
         ]:
-            b = _mk_btn(text, role)
+            b = _mk_btn(text, role, icon=icon)
             b.setFixedHeight(32)
-            if text in ("▲", "▼"):
-                b.setFixedWidth(32)
+            if not text:
+                b.setFixedWidth(36); b.setToolTip(tip)
             b.clicked.connect(slot)
             alo.addWidget(b)
 
@@ -1682,9 +1741,13 @@ class TableEditor(QWidget):
         self._panel_hdr.setStyleSheet(
             f"color: {_C['txt2']}; font-size: 13px; font-weight: 500; background: transparent;"
         )
-        _col_btn = _mk_btn("⊞ 欄位", "ghost")
+        _col_btn = _mk_btn("欄位 ▾", "ghost", icon="columns")
         _col_btn.setFixedHeight(28)
-        _col_btn.clicked.connect(self.add_master_column)
+        _col_menu = QMenu(_col_btn)
+        _col_menu.addAction(_ti_icon("plus", "#10B981"), "新增欄位", self.add_master_column)
+        _col_menu.addAction(_ti_icon("pencil", "#A5B4FC"), "重新命名", self.rename_master_column)
+        _col_menu.addAction(_ti_icon("trash", "#EF4444"), "刪除欄位", self.delete_master_column)
+        _col_btn.setMenu(_col_menu)
         _ph_lo.addWidget(self._panel_hdr, 1)
         _ph_lo.addWidget(_col_btn)
         rv.addWidget(_ph_widget)
@@ -1747,20 +1810,36 @@ class TableEditor(QWidget):
         )
         sh.addWidget(lbl_sub, 1)
 
-        for text, slot in [
-            ("+ 新增",  self.add_sub_item),
-            ("複製",    self.copy_sub_item),
-            ("▲",       lambda: self.move_sub_item(-1)),
-            ("▼",       lambda: self.move_sub_item(1)),
-            ("刪除",    self.delete_sub_item),
-            ("⊞ 欄位", self.add_sub_column),
+        for text, role, icon, tip, slot in [
+            ("新增列", "success", "circle-plus", "",   self.add_sub_item),
+            ("複製",   "ghost",   "copy",        "",   self.copy_sub_item),
+            ("",       "ghost",   "arrow-up",    "上移", lambda: self.move_sub_item(-1)),
+            ("",       "ghost",   "arrow-down",  "下移", lambda: self.move_sub_item(1)),
+            ("刪除",   "danger",  "trash",       "",   self.delete_sub_item),
         ]:
-            b = _mk_btn(text, "ghost")
+            b = _mk_btn(text, role, icon=icon)
             b.setFixedHeight(28)
-            if text in ("▲", "▼"):
-                b.setFixedWidth(28)
+            if not text:
+                b.setFixedWidth(32); b.setToolTip(tip)
             b.clicked.connect(slot)
             sh.addWidget(b)
+
+        sh.addWidget(_vsep())
+
+        _scol_btn = _mk_btn("欄位 ▾", "ghost", icon="columns"); _scol_btn.setFixedHeight(28)
+        _scol_menu = QMenu(_scol_btn)
+        _scol_menu.addAction(_ti_icon("plus", "#10B981"), "新增欄位", self.add_sub_column)
+        _scol_menu.addAction(_ti_icon("pencil", "#A5B4FC"), "重新命名", self.rename_sub_column)
+        _scol_menu.addAction(_ti_icon("trash", "#EF4444"), "刪除欄位", self.delete_sub_column)
+        _scol_btn.setMenu(_scol_menu)
+        sh.addWidget(_scol_btn)
+
+        _stbl_btn = _mk_btn("子表 ▾", "ghost", icon="table"); _stbl_btn.setFixedHeight(28)
+        _stbl_menu = QMenu(_stbl_btn)
+        _stbl_menu.addAction(_ti_icon("plus", "#10B981"), "新增子表", self.add_sub_table)
+        _stbl_menu.addAction(_ti_icon("trash", "#EF4444"), "刪除子表", self.delete_sub_table)
+        _stbl_btn.setMenu(_stbl_menu)
+        sh.addWidget(_stbl_btn)
 
         sv.addWidget(sub_hdr)
         self._sub_tabs = QTabWidget()
@@ -2271,6 +2350,122 @@ class TableEditor(QWidget):
         self._build_sub_tabs()
         self._refresh_sub_tables()
         self.status_message.emit(f"從表欄位 [{col_name}] 已新增", _C["green"])
+
+    def add_sub_table(self):
+        if self.table_name not in self.manager.tables:
+            return
+        if not self.pk_key:
+            QMessageBox.warning(self, "提示", "母表沒有主鍵，無法建立子表"); return
+        name, ok = QInputDialog.getText(self, "新增子表", "子表名稱（巢狀陣列欄位名）:")
+        if not ok or not name.strip(): return
+        name = name.strip()
+        full = self.table_name + "." + name
+        if full in self.manager.sub_tables:
+            QMessageBox.warning(self, "錯誤", f"子表 [{name}] 已存在"); return
+        if name in self.df.columns:
+            QMessageBox.warning(self, "錯誤", f"名稱 [{name}] 與母表欄位重複"); return
+        if not self.manager.add_sub_table(self.table_name, name):
+            QMessageBox.warning(self, "錯誤", "建立子表失敗"); return
+        self._build_sub_tabs()
+        self._select_sub_tab(name)
+        self._refresh_sub_tables()
+        self.status_message.emit(f"子表 [{name}]（FK={self.pk_key}）已新增", _C["green"])
+
+    def delete_sub_table(self):
+        tab_name, full = self._current_sub_full()
+        if full is None:
+            QMessageBox.information(self, "提示", "目前沒有可刪除的子表"); return
+        if QMessageBox.question(
+                self, "確認刪除",
+                f"確定刪除整張子表 [{tab_name}]？\n會移除其所有資料列與欄位定義。") != QMessageBox.Yes:
+            return
+        self.manager.delete_sub_table(self.table_name, tab_name)
+        self._build_sub_tabs()
+        self._refresh_sub_tables()
+        self.status_message.emit(f"子表 [{tab_name}] 已刪除", _C["yellow"])
+
+    # ── Column rename / delete (master + sub) ───────────────────────────────────
+
+    def _select_sub_tab(self, name):
+        for i in range(self._sub_tabs.count()):
+            if self._sub_tabs.tabText(i) == name:
+                self._sub_tabs.setCurrentIndex(i); return
+
+    def _current_sub_full(self):
+        idx = self._sub_tabs.currentIndex()
+        if idx < 0:
+            return None, None
+        tab_name = self._sub_tabs.tabText(idx)
+        if not tab_name or tab_name == "—":
+            return None, None
+        return tab_name, self.table_name + "." + tab_name
+
+    def _pick_column(self, columns, exclude, title):
+        choices = [c for c in columns if c not in exclude]
+        if not choices:
+            QMessageBox.information(self, "提示", "沒有可操作的欄位"); return None
+        col, ok = QInputDialog.getItem(self, title, "選擇欄位:", choices, 0, False)
+        if not ok or not col:
+            return None
+        return col
+
+    def rename_master_column(self):
+        col = self._pick_column(list(self.df.columns), {self.pk_key, self.cls_key}, "重新命名欄位")
+        if col is None: return
+        new, ok = QInputDialog.getText(self, "重新命名", f"新欄位名稱（{col} →）:")
+        if not ok or not new.strip(): return
+        new = new.strip()
+        if new in self.df.columns:
+            QMessageBox.warning(self, "錯誤", f"欄位 [{new}] 已存在"); return
+        self.manager.rename_column(self.table_name, col, new)
+        self.df = self.manager.tables[self.table_name]
+        if self._field_panel:
+            self._field_panel.deleteLater(); self._field_panel = None
+        self._reload_all(select_cls=self.current_cls_val, select_idx=self.current_master_idx)
+        self.status_message.emit(f"欄位 [{col}] → [{new}]", _C["green"])
+
+    def delete_master_column(self):
+        col = self._pick_column(list(self.df.columns), {self.pk_key, self.cls_key}, "刪除欄位")
+        if col is None: return
+        if QMessageBox.question(self, "確認刪除", f"確定刪除欄位 [{col}]？") != QMessageBox.Yes:
+            return
+        self.manager.delete_column(self.table_name, col)
+        self.df = self.manager.tables[self.table_name]
+        if self._field_panel:
+            self._field_panel.deleteLater(); self._field_panel = None
+        self._reload_all(select_cls=self.current_cls_val, select_idx=self.current_master_idx)
+        self.status_message.emit(f"欄位 [{col}] 已刪除", _C["yellow"])
+
+    def rename_sub_column(self):
+        tab_name, full = self._current_sub_full()
+        if full is None: return
+        sub_df = self.manager.sub_tables.get(full)
+        if sub_df is None: return
+        fk = self.cfg.get("sub_tables", {}).get(tab_name, {}).get("foreign_key", self.pk_key)
+        col = self._pick_column(list(sub_df.columns), {fk}, f"重新命名欄位（子表: {tab_name}）")
+        if col is None: return
+        new, ok = QInputDialog.getText(self, "重新命名", f"新欄位名稱（{col} →）:")
+        if not ok or not new.strip(): return
+        new = new.strip()
+        if new in sub_df.columns:
+            QMessageBox.warning(self, "錯誤", f"欄位 [{new}] 已存在"); return
+        self.manager.rename_column(full, col, new)
+        self._build_sub_tabs(); self._select_sub_tab(tab_name); self._refresh_sub_tables()
+        self.status_message.emit(f"子表欄位 [{col}] → [{new}]", _C["green"])
+
+    def delete_sub_column(self):
+        tab_name, full = self._current_sub_full()
+        if full is None: return
+        sub_df = self.manager.sub_tables.get(full)
+        if sub_df is None: return
+        fk = self.cfg.get("sub_tables", {}).get(tab_name, {}).get("foreign_key", self.pk_key)
+        col = self._pick_column(list(sub_df.columns), {fk}, f"刪除欄位（子表: {tab_name}）")
+        if col is None: return
+        if QMessageBox.question(self, "確認刪除", f"確定刪除子表欄位 [{col}]？") != QMessageBox.Yes:
+            return
+        self.manager.delete_column(full, col)
+        self._build_sub_tabs(); self._select_sub_tab(tab_name); self._refresh_sub_tables()
+        self.status_message.emit(f"子表欄位 [{col}] 已刪除", _C["yellow"])
 
     def reload_after_config(self):
         self.cfg     = self.manager.config.get(self.table_name, {})
