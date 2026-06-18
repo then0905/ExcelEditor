@@ -368,7 +368,7 @@ _TI_HEX = {
     "plus": "eb0b", "circle-plus": "ea69", "copy": "ea7a", "trash": "eb41",
     "table": "eba1", "columns": "eb83", "arrow-up": "ea25",
     "arrow-down": "ea16", "chevron-down": "ea5f", "folder-plus": "eaab",
-    "pencil": "eb04",
+    "pencil": "eb04", "note": "eb6d",
 }
 _TI_CODES = {k: chr(int(v, 16)) for k, v in _TI_HEX.items()}
 _ti_family = None
@@ -1724,6 +1724,7 @@ class TableEditor(QWidget):
         right = QWidget()
         right.setMinimumWidth(320)
         right.setStyleSheet(f"background: {_C['panel']};")
+        self._right_panel = right
         rv = QVBoxLayout(right)
         rv.setContentsMargins(0, 0, 0, 0)
         rv.setSpacing(0)
@@ -1797,6 +1798,7 @@ class TableEditor(QWidget):
         sv.setSpacing(0)
 
         sub_hdr = QWidget()
+        self._sub_hdr = sub_hdr
         sub_hdr.setFixedHeight(40)
         sub_hdr.setStyleSheet(
             f"background:{_C['sidebar']}; border-top:1px solid {_C['border']}; border-bottom:1px solid {_C['border']};"
@@ -1808,7 +1810,13 @@ class TableEditor(QWidget):
         lbl_sub.setStyleSheet(
             f"color:{_C['txt3']}; font-size:10px; font-weight:600; letter-spacing:1px; background:transparent;"
         )
-        sh.addWidget(lbl_sub, 1)
+        sh.addWidget(lbl_sub)
+        self._sub_picker = _NoscrollCombo()
+        self._sub_picker.setFixedWidth(150)
+        self._sub_picker.setToolTip("跳到子表")
+        self._sub_picker.activated.connect(self._on_sub_picker)
+        sh.addWidget(self._sub_picker)
+        sh.addStretch(1)
 
         for text, role, icon, tip, slot in [
             ("新增列", "success", "circle-plus", "",   self.add_sub_item),
@@ -1845,6 +1853,7 @@ class TableEditor(QWidget):
         self._sub_tabs = QTabWidget()
         self._sub_tabs.setObjectName("sub-tabs")
         self._sub_tabs.setDocumentMode(True)
+        self._sub_tabs.currentChanged.connect(self._sync_sub_picker)
         sv.addWidget(self._sub_tabs, 1)
         sub_area.setMinimumHeight(110)     # ensure header + tab bar always visible
         rsplit.addWidget(sub_area)
@@ -2151,7 +2160,10 @@ class TableEditor(QWidget):
             panel = SubTablePanel(key, cols_cfg, self.manager)
             panel.row_deleted.connect(self._on_sub_delete)
             self._sub_panels[tab_name] = panel
-            self._sub_tabs.addTab(panel, tab_name)
+            idx = self._sub_tabs.addTab(panel, tab_name)
+            note = sub_cfg.get("note", "")
+            if note:
+                self._sub_tabs.setTabToolTip(idx, note)
 
         if not self._sub_tab_order:
             no_sub = QLabel("此表格無巢狀子表")
@@ -2160,6 +2172,16 @@ class TableEditor(QWidget):
                 f"color:{_C['txt3']}; font-size:12px; background:{_C['panel']};"
             )
             self._sub_tabs.addTab(no_sub, "—")
+
+        # Sub-table quick-jump picker (handy when there are many sub-tables)
+        if hasattr(self, "_sub_picker"):
+            self._sub_picker.blockSignals(True)
+            self._sub_picker.clear()
+            self._sub_picker.addItems(self._sub_tab_order)
+            self._sub_picker.blockSignals(False)
+            self._sub_picker.setVisible(len(self._sub_tab_order) > 1)
+
+        self._fit_right_panel()
 
         self.status_message.emit(
             f"從表: 偵測到 {len(self._sub_tab_order)} 個"
@@ -2391,6 +2413,30 @@ class TableEditor(QWidget):
         for i in range(self._sub_tabs.count()):
             if self._sub_tabs.tabText(i) == name:
                 self._sub_tabs.setCurrentIndex(i); return
+
+    def _fit_right_panel(self):
+        """Make the right panel's min width track what the sub-table toolbar
+        actually needs, so its buttons never get squeezed (hardcoded → adaptive)."""
+        if not hasattr(self, "_sub_hdr") or not hasattr(self, "_right_panel"):
+            return
+        self._sub_hdr.layout().activate()
+        need = self._sub_hdr.sizeHint().width() + 24
+        self._right_panel.setMinimumWidth(max(320, need))
+
+    def _on_sub_picker(self, idx):
+        name = self._sub_picker.itemText(idx)
+        if name:
+            self._select_sub_tab(name)
+
+    def _sync_sub_picker(self, idx):
+        if not hasattr(self, "_sub_picker"):
+            return
+        name = self._sub_tabs.tabText(idx) if idx >= 0 else ""
+        pi = self._sub_picker.findText(name)
+        if pi >= 0 and pi != self._sub_picker.currentIndex():
+            self._sub_picker.blockSignals(True)
+            self._sub_picker.setCurrentIndex(pi)
+            self._sub_picker.blockSignals(False)
 
     def _current_sub_full(self):
         idx = self._sub_tabs.currentIndex()
@@ -2704,6 +2750,7 @@ class App(QMainWindow):
         # Util buttons
         for text, slot in [
             ("🔍", self._show_search),
+            ("🩺", self.open_health_check),
             ("⚙",  self.open_config),
             ("🕓", self._show_recent_menu),
         ]:
@@ -3066,6 +3113,66 @@ class App(QMainWindow):
         if tname not in self.manager.tables: return
         self._show_config_dialog(tname)
 
+    def open_health_check(self):
+        idx = self._tab_widget.currentIndex()
+        if idx < 0:
+            return
+        tname = self._tab_widget.tabText(idx)
+        if tname not in self.manager.tables:
+            return
+        issues = self.manager.health_check(tname)
+        self._show_health_dialog(tname, issues)
+
+    def _show_health_dialog(self, table_name, issues):
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"資料健檢 — {table_name}")
+        dlg.setMinimumWidth(480)
+        dlg.resize(560, 460)
+        dlg.setStyleSheet(APP_QSS)
+        outer = QVBoxLayout(dlg)
+        outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
+
+        errs = sum(1 for s, _ in issues if s == "error")
+        warns = sum(1 for s, _ in issues if s == "warn")
+        hdr = QLabel(
+            "✓  未發現問題" if not issues
+            else f"發現 {errs} 個錯誤、{warns} 個警告"
+        )
+        hdr.setStyleSheet(
+            f"color:{_C['green'] if not issues else _C['txt']}; font-size:13px; "
+            f"font-weight:600; background:{_C['sidebar']}; padding:12px 16px; "
+            f"border-bottom:1px solid {_C['border']};"
+        )
+        outer.addWidget(hdr)
+
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        content = QWidget(); content.setStyleSheet(f"background:{_C['panel']};")
+        vlo = QVBoxLayout(content)
+        vlo.setContentsMargins(14, 12, 14, 12); vlo.setSpacing(8)
+        if not issues:
+            ok = QLabel("主鍵唯一、子表 FK 都對得到母表，沒有空白主鍵/FK。")
+            ok.setStyleSheet(f"color:{_C['txt2']}; font-size:12px; background:transparent;")
+            ok.setWordWrap(True)
+            vlo.addWidget(ok)
+        else:
+            for sev, msg in issues:
+                color = _C["red"] if sev == "error" else _C["yellow"]
+                row = QLabel(f'<span style="color:{color}">●</span>&nbsp;&nbsp;'
+                             f'<span style="color:{_C["txt"]}">{msg}</span>')
+                row.setWordWrap(True)
+                row.setStyleSheet("background:transparent; font-size:12px;")
+                vlo.addWidget(row)
+        vlo.addStretch(1)
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
+
+        bb = QWidget(); bb.setStyleSheet(f"background:{_C['sidebar']}; border-top:1px solid {_C['border']};")
+        bl = QHBoxLayout(bb); bl.setContentsMargins(16, 10, 16, 10); bl.addStretch(1)
+        btn = _mk_btn("關閉", "primary"); btn.setFixedHeight(32); btn.clicked.connect(dlg.accept)
+        bl.addWidget(btn)
+        outer.addWidget(bb)
+        dlg.exec()
+
     def _show_config_dialog(self, table_name):
         _btn_ss = (
             f"background:{_C['input']}; border:1px solid {_C['border']}; "
@@ -3412,13 +3519,19 @@ class App(QMainWindow):
                 fk_edit.setText(sub_cfg.get("foreign_key", ""))
                 vlo.addWidget(_form_row("  Foreign Key", fk_edit))
 
+                st_note_edit = QLineEdit()
+                st_note_edit.setPlaceholderText("這張子表的用途說明（滑鼠停在分頁標題時顯示）")
+                st_note_edit.setText(sub_cfg.get("note", ""))
+                vlo.addWidget(_form_row("  說明 / 備註", st_note_edit))
+
                 col_combos: dict[str, tuple] = {}
                 for scol in list(sub_df.columns):
                     rw, cb, opts_store, note_edit, suggest_combo = _col_row(scol, sub_cols_cfg, dlg, df_source=sub_df)
                     vlo.addWidget(_form_row(f"    {scol}", rw))
                     col_combos[scol] = (cb, opts_store, note_edit, suggest_combo)
 
-                sub_widgets[tab_name] = {"fk_edit": fk_edit, "col_combos": col_combos}
+                sub_widgets[tab_name] = {"fk_edit": fk_edit, "note_edit": st_note_edit,
+                                         "col_combos": col_combos}
 
         else:
             # Inform user if no sub-tables detected
@@ -3500,6 +3613,11 @@ class App(QMainWindow):
             fk = data["fk_edit"].text().strip()
             if fk:
                 st["foreign_key"] = fk
+            st_note = data["note_edit"].text().strip()
+            if st_note:
+                st["note"] = st_note
+            else:
+                st.pop("note", None)
             st.setdefault("columns", {})
             for scol, (scb, opts_store, note_edit, suggest_combo) in data["col_combos"].items():
                 st["columns"][scol] = _build_col_entry(

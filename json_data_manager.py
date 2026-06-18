@@ -651,6 +651,55 @@ class JsonDataManager:
         self.save_config()
         return True
 
+    def health_check(self, table_name):
+        """Scan a master table + its sub_tables for common data problems.
+
+        Returns a list of (severity, message) where severity is 'error' or 'warn'.
+        Detects: blank/duplicate primary keys, and blank/orphan foreign keys.
+        """
+        issues = []
+        df = self.tables.get(table_name)
+        if df is None:
+            return issues
+        cfg = self.config.get(table_name, {})
+        pk = cfg.get("primary_key") or (df.columns[0] if len(df.columns) else "")
+
+        pk_set = set()
+        if pk and pk in df.columns:
+            pk_series = df[pk].astype(str).str.strip()
+            blanks = int((pk_series == "").sum())
+            if blanks:
+                issues.append(("warn", f"母表有 {blanks} 列主鍵（{pk}）空白"))
+            nonblank = pk_series[pk_series != ""]
+            dups = sorted(set(nonblank[nonblank.duplicated(keep=False)].tolist()))
+            if dups:
+                issues.append(("error", f"母表主鍵重複（{pk}）："
+                               + "、".join(dups[:20]) + (" …" if len(dups) > 20 else "")))
+            pk_set = set(nonblank.tolist())
+        else:
+            issues.append(("warn", "母表未設定有效主鍵"))
+
+        prefix = table_name + "."
+        for full in self.sub_tables:
+            if not full.startswith(prefix):
+                continue
+            sub_name = full[len(prefix):]
+            sdf = self.sub_tables[full]
+            fk = cfg.get("sub_tables", {}).get(sub_name, {}).get("foreign_key", pk)
+            if not fk or fk not in sdf.columns:
+                continue
+            fk_series = sdf[fk].astype(str).str.strip()
+            blank_fk = int((fk_series == "").sum())
+            if blank_fk:
+                issues.append(("warn", f"子表 [{sub_name}] 有 {blank_fk} 列 FK（{fk}）空白"))
+            if pk_set:
+                orphan = sorted(set(fk_series[(fk_series != "") & (~fk_series.isin(pk_set))].tolist()))
+                if orphan:
+                    issues.append(("error", f"子表 [{sub_name}] 有 {len(orphan)} 種孤兒 FK"
+                                   "（對不到母表主鍵）：" + "、".join(orphan[:20])
+                                   + (" …" if len(orphan) > 20 else "")))
+        return issues
+
     def delete_sub_table(self, table_name, sub_name):
         """Remove an entire sub_table (data + config definition)."""
         full = f"{table_name}.{sub_name}"
