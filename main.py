@@ -948,6 +948,7 @@ class _Chip(QFrame):
 
         btn = QPushButton("✕")
         btn.setFixedSize(18, 18)
+        btn.setAutoDefault(False); btn.setDefault(False)
         btn.setCursor(Qt.PointingHandCursor)
         btn.setStyleSheet(
             f"QPushButton {{ background:transparent; border:none; padding:0px; "
@@ -1034,6 +1035,7 @@ class ChipsEdit(QWidget):
         self._input.returnPressed.connect(self._commit_input)
         self._input.textChanged.connect(self._on_input_text)
         copy_btn = QPushButton("⧉ 複製")
+        copy_btn.setAutoDefault(False); copy_btn.setDefault(False)
         copy_btn.setCursor(Qt.PointingHandCursor)
         copy_btn.setToolTip("複製整個陣列內容（以逗號分隔）")
         copy_btn.setStyleSheet(
@@ -1118,7 +1120,18 @@ class ArrayEditDialog(QDialog):
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
+        for _b in bb.buttons():
+            _b.setAutoDefault(False); _b.setDefault(False)
         lo.addWidget(bb)
+
+    def keyPressEvent(self, event):
+        # Enter is for committing/adding an item (handled by the child QLineEdits'
+        # returnPressed/editingFinished, which fire first). Swallow it here so it
+        # doesn't trigger a default button (close dialog / delete chip). OK closes.
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def value(self):
         return self._chips.value()
