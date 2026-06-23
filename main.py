@@ -2915,6 +2915,7 @@ class App(QMainWindow):
             self._refresh_ui()
             self.manager._full_config["_last_file"] = path
             self.manager.save_config()
+            self._check_config_paths()
 
         def _err(msg):
             sys.setswitchinterval(orig)
@@ -2925,6 +2926,67 @@ class App(QMainWindow):
         worker.done.connect(_done)
         worker.error.connect(_err)
         worker.start()
+
+    # ── Config path validation (offer to re-pick stale external paths) ──────────
+    def _store_path(self, p, base):
+        """Store relative to the json dir when possible (mirrors config dialog)."""
+        if not base:
+            return p
+        try:
+            return os.path.relpath(p, base)
+        except ValueError:
+            return p
+
+    def _check_config_paths(self):
+        """After load: if config has external paths that no longer exist, offer
+        to re-pick them (外部文字表 json_path / 圖片資料夾 base_folder)."""
+        if not self.manager.json_path:
+            return
+        json_dir = os.path.dirname(self.manager.json_path)
+        changed = False
+        for tname, cfg in list(self.manager.config.items()):
+            if not isinstance(cfg, dict):
+                continue
+            trs = cfg.get("text_ref_source", {})
+            ref = (trs.get("json_path") or "").strip() if isinstance(trs, dict) else ""
+            if ref:
+                abs_ref = ref if os.path.isabs(ref) else os.path.join(json_dir, ref)
+                if not os.path.isfile(abs_ref):
+                    if self._prompt_repath(tname, "外部文字表", abs_ref):
+                        new, _ = QFileDialog.getOpenFileName(
+                            self, f"重新選擇外部文字表（{tname}）", json_dir,
+                            "JSON 檔案 (*.json);;所有檔案 (*.*)")
+                        if new:
+                            trs["json_path"] = self._store_path(new, json_dir)
+                            cfg["text_ref_source"] = trs
+                            changed = True
+            imgp = cfg.get("image_preview", {})
+            base = (imgp.get("base_folder") or "").strip() if isinstance(imgp, dict) else ""
+            if base:
+                abs_base = base if os.path.isabs(base) else os.path.join(json_dir, base)
+                if not os.path.isdir(abs_base):
+                    if self._prompt_repath(tname, "圖片資料夾", abs_base):
+                        new = QFileDialog.getExistingDirectory(
+                            self, f"重新選擇圖片資料夾（{tname}）", json_dir)
+                        if new:
+                            imgp["base_folder"] = self._store_path(new, json_dir)
+                            cfg["image_preview"] = imgp
+                            changed = True
+        if changed:
+            self.manager.save_config()
+            self.manager.invalidate_ref_cache()
+            idx = self._tab_widget.currentIndex()
+            if idx >= 0:
+                ed = self._editors.get(self._tab_widget.tabText(idx))
+                if ed:
+                    ed.reload_after_config()
+            self.show_snackbar("✓ 路徑已更新", color=_C["green"])
+
+    def _prompt_repath(self, tname, label, badpath):
+        return QMessageBox.question(
+            self, "路徑不存在",
+            f"[{tname}] 的{label}路徑找不到：\n{badpath}\n\n是否要重新設定？",
+            QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes
 
     def save_file(self):
         if not self.manager.json_path:
