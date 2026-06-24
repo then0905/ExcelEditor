@@ -368,7 +368,7 @@ _TI_HEX = {
     "plus": "eb0b", "circle-plus": "ea69", "copy": "ea7a", "trash": "eb41",
     "table": "eba1", "columns": "eb83", "arrow-up": "ea25",
     "arrow-down": "ea16", "chevron-down": "ea5f", "folder-plus": "eaab",
-    "pencil": "eb04", "note": "eb6d",
+    "pencil": "eb04", "note": "eb6d", "clipboard-plus": "efb2",
 }
 _TI_CODES = {k: chr(int(v, 16)) for k, v in _TI_HEX.items()}
 _ti_family = None
@@ -1522,7 +1522,9 @@ class FieldEditorWidget(QWidget):
 # ── SubTablePanel ─────────────────────────────────────────────────────────────
 
 class SubTablePanel(QWidget):
-    row_deleted = Signal(str, object)
+    row_deleted    = Signal(str, object)
+    copy_requested = Signal()
+    paste_requested = Signal()
 
     def __init__(self, sheet_full_name, cols_cfg, manager, parent=None):
         super().__init__(parent)
@@ -1539,7 +1541,7 @@ class SubTablePanel(QWidget):
         self._view.setModel(self._model)
         self._view.setSortingEnabled(True)
         self._view.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self._view.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._view.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._view.setEditTriggers(
             QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked)
         self._view.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -1580,16 +1582,21 @@ class SubTablePanel(QWidget):
             self._view.resizeColumnsToContents()
 
     def _ctx_menu(self, pos):
-        idx = self._view.indexAt(pos)
-        if not idx.isValid():
-            return
         menu = QMenu(self)
-        menu.addAction("刪除此列", self._delete_selected)
+        menu.addAction("複製列", self.copy_requested.emit)
+        menu.addAction("貼上列", self.paste_requested.emit)
+        if self._view.indexAt(pos).isValid():
+            menu.addSeparator()
+            menu.addAction("刪除此列", self._delete_selected)
         menu.exec(self._view.viewport().mapToGlobal(pos))
 
     def _key_press(self, event):
         if event.key() == Qt.Key_Delete:
             self._delete_selected()
+        elif event.matches(QKeySequence.Copy):
+            self.copy_requested.emit()
+        elif event.matches(QKeySequence.Paste):
+            self.paste_requested.emit()
         else:
             QTableView.keyPressEvent(self._view, event)
 
@@ -1607,11 +1614,21 @@ class SubTablePanel(QWidget):
             return None
         return self._model.df_index(sel[0].row())
 
+    def selected_df_indices(self):
+        rows = sorted(i.row() for i in self._view.selectionModel().selectedRows())
+        out = []
+        for r in rows:
+            di = self._model.df_index(r)
+            if di is not None:
+                out.append(di)
+        return out
+
 
 # ── TableEditor ───────────────────────────────────────────────────────────────
 
 class TableEditor(QWidget):
     status_message = Signal(str, str)
+    _sub_clipboard = None  # {"sub": tab_name, "rows": [ {col: val, ...} ]} — shared across items/tables
 
     def __init__(self, table_name, manager, parent=None):
         super().__init__(parent)
@@ -1833,15 +1850,19 @@ class TableEditor(QWidget):
 
         for text, role, icon, tip, slot in [
             ("新增列", "success", "circle-plus", "",   self.add_sub_item),
-            ("複製",   "ghost",   "copy",        "",   self.copy_sub_item),
+            ("複製",   "ghost",   "copy",        "原地複製一列", self.copy_sub_item),
             ("",       "ghost",   "arrow-up",    "上移", lambda: self.move_sub_item(-1)),
             ("",       "ghost",   "arrow-down",  "下移", lambda: self.move_sub_item(1)),
             ("刪除",   "danger",  "trash",       "",   self.delete_sub_item),
+            ("複製列", "ghost",   "copy",        "複製選取列到剪貼簿（可跨筆/跨子表貼上）", self.copy_sub_rows),
+            ("貼上列", "ghost",   "clipboard-plus", "把剪貼簿的列貼到目前子表", self.paste_sub_rows),
         ]:
             b = _mk_btn(text, role, icon=icon)
             b.setFixedHeight(28)
+            if tip:
+                b.setToolTip(tip)
             if not text:
-                b.setFixedWidth(32); b.setToolTip(tip)
+                b.setFixedWidth(32)
             b.clicked.connect(slot)
             sh.addWidget(b)
 
@@ -2172,6 +2193,8 @@ class TableEditor(QWidget):
             cols_cfg = sub_cfg.get("columns", {})
             panel = SubTablePanel(key, cols_cfg, self.manager)
             panel.row_deleted.connect(self._on_sub_delete)
+            panel.copy_requested.connect(self.copy_sub_rows)
+            panel.paste_requested.connect(self.paste_sub_rows)
             self._sub_panels[tab_name] = panel
             idx = self._sub_tabs.addTab(panel, tab_name)
             note = sub_cfg.get("note", "")
@@ -2309,6 +2332,61 @@ class TableEditor(QWidget):
         self.manager.sub_tables[full] = pd.concat([sub_df, pd.DataFrame([new_row])], ignore_index=True)
         self.manager.dirty = True
         self._refresh_sub_tables()
+
+    # ── Cross-item row copy / paste ─────────────────────────────────────────────
+    def copy_sub_rows(self):
+        """Copy the selected sub-table row(s) to a shared buffer (FK excluded),
+        so they can be pasted into another master item's (or sheet's) sub-table."""
+        panel = self._current_sub_panel()
+        if panel is None: return
+        tab_name, full = self._current_sub_full()
+        if full is None: return
+        sub_df = self.manager.sub_tables.get(full)
+        if sub_df is None: return
+        idxs = panel.selected_df_indices()
+        if not idxs:
+            self.status_message.emit("請先選取要複製的子表列", _C["yellow"]); return
+        fk_key = self.cfg.get("sub_tables", {}).get(tab_name, {}).get("foreign_key", self.pk_key)
+        rows = []
+        for di in idxs:
+            if di not in sub_df.index: continue
+            row = {c: sub_df.at[di, c] for c in sub_df.columns if c != fk_key}
+            rows.append(row)
+        TableEditor._sub_clipboard = {"sub": tab_name, "rows": rows}
+        self.status_message.emit(f"已複製 {len(rows)} 列（子表: {tab_name}）", _C["green"])
+
+    def paste_sub_rows(self):
+        """Paste buffered rows into the current sub-table under the current master
+        item's FK. Only columns that exist in the target sub-table are filled."""
+        if self.current_master_pk is None:
+            self.status_message.emit("請先選擇一個母表項目", _C["yellow"]); return
+        buf = TableEditor._sub_clipboard
+        if not buf or not buf.get("rows"):
+            self.status_message.emit("列剪貼簿是空的", _C["yellow"]); return
+        tab_name, full = self._current_sub_full()
+        if full is None: return
+        sub_df = self.manager.sub_tables.get(full)
+        if sub_df is None: return
+        fk_key = self.cfg.get("sub_tables", {}).get(tab_name, {}).get("foreign_key", self.pk_key)
+        cols = list(sub_df.columns)
+        new_rows = []
+        for src in buf["rows"]:
+            nr = {c: "" for c in cols}
+            nr[fk_key] = self.current_master_pk
+            for c in cols:
+                if c != fk_key and c in src:
+                    nr[c] = src[c]
+            new_rows.append(nr)
+        if not new_rows: return
+        siblings = sub_df[sub_df[fk_key].astype(str) == str(self.current_master_pk)]
+        insert_at = siblings.index.max() + 1 if not siblings.empty else len(sub_df)
+        top, bot = sub_df.iloc[:insert_at], sub_df.iloc[insert_at:]
+        self.manager.sub_tables[full] = pd.concat(
+            [top, pd.DataFrame(new_rows), bot], ignore_index=True)
+        self.manager.dirty = True
+        self._refresh_sub_tables()
+        note = "" if buf["sub"] == tab_name else f"（來源子表: {buf['sub']}，只貼同名欄位）"
+        self.status_message.emit(f"已貼上 {len(new_rows)} 列{note}", _C["green"])
 
     # ── Context menus ─────────────────────────────────────────────────────────
 
