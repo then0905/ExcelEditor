@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QStackedWidget, QFileDialog, QMenu, QSizePolicy, QFrame,
     QInputDialog, QMessageBox, QStyledItemDelegate, QStyle,
     QDialog, QDialogButtonBox, QFormLayout, QLayout, QCompleter,
+    QTableWidget, QTableWidgetItem,
 )
 from PySide6.QtCore import (
     Qt, Signal, QAbstractTableModel, QModelIndex,
@@ -1525,6 +1526,7 @@ class SubTablePanel(QWidget):
     row_deleted    = Signal(str, object)
     copy_requested = Signal()
     paste_requested = Signal()
+    compare_requested = Signal(object)  # df_index of the right-clicked row
 
     def __init__(self, sheet_full_name, cols_cfg, manager, parent=None):
         super().__init__(parent)
@@ -1585,7 +1587,10 @@ class SubTablePanel(QWidget):
         menu = QMenu(self)
         menu.addAction("複製列", self.copy_requested.emit)
         menu.addAction("貼上列", self.paste_requested.emit)
-        if self._view.indexAt(pos).isValid():
+        idx = self._view.indexAt(pos)
+        if idx.isValid():
+            di = self._model.df_index(idx.row())
+            menu.addAction("對照相同效果…", lambda: self.compare_requested.emit(di))
             menu.addSeparator()
             menu.addAction("刪除此列", self._delete_selected)
         menu.exec(self._view.viewport().mapToGlobal(pos))
@@ -1622,6 +1627,89 @@ class SubTablePanel(QWidget):
             if di is not None:
                 out.append(di)
         return out
+
+
+class EffectCompareDialog(QDialog):
+    """Read-only cross-skill effect comparison: list every row in the sub-table
+    that matches the seed row's key columns (InfluenceStatus / EffectReceive…)."""
+
+    _FILTERS = [("InfluenceStatus", "影響屬性"), ("EffectReceive", "目標"),
+                ("SkillComponentID", "組件")]
+    _SHOW = ["SkillComponentID", "EffectValue", "InfluenceStatus",
+             "EffectReceive", "AddType", "EffectDurationTime"]
+
+    def __init__(self, sub_df, fk_key, seed, name_of, sub_name, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"對照相同效果 — {sub_name}")
+        self.resize(700, 540)
+        self.setStyleSheet(APP_QSS)
+        self._df = sub_df
+        self._fk = fk_key
+        self._name_of = name_of
+        self._cols = [c for c in self._SHOW if c in sub_df.columns]
+
+        outer = QVBoxLayout(self)
+        frow = QWidget(); frow.setStyleSheet("background:transparent;")
+        fl = QHBoxLayout(frow); fl.setContentsMargins(10, 8, 10, 2); fl.setSpacing(12)
+        fl.addWidget(QLabel("篩選："))
+        self._filters = {}
+        for col, label in self._FILTERS:
+            if col not in sub_df.columns:
+                continue
+            val = str(seed.get(col, "")).strip()
+            cb = QCheckBox(f"{label} =")
+            cb.setChecked(col in ("InfluenceStatus", "EffectReceive") and val != "")
+            cb.stateChanged.connect(self._rebuild)
+            combo = _NoscrollCombo()
+            combo.setMaximumWidth(150)
+            vals = sorted({str(v).strip() for v in sub_df[col] if str(v).strip() != ""})
+            combo.addItems(vals)
+            if val in vals:
+                combo.setCurrentText(val)
+            combo.currentTextChanged.connect(self._rebuild)
+            self._filters[col] = (cb, combo)
+            fl.addWidget(cb); fl.addWidget(combo)
+        fl.addStretch(1)
+        outer.addWidget(frow)
+
+        self._tbl = QTableWidget()
+        self._tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._tbl.setSelectionBehavior(QTableWidget.SelectRows)
+        self._tbl.setSortingEnabled(True)
+        self._tbl.verticalHeader().setVisible(False)
+        outer.addWidget(self._tbl, 1)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(self.reject)
+        outer.addWidget(bb)
+        self._rebuild()
+
+    def _rebuild(self):
+        df = self._df
+        mask = pd.Series([True] * len(df), index=df.index)
+        for col, (cb, combo) in self._filters.items():
+            if cb.isChecked():
+                mask &= (df[col].astype(str).str.strip() == combo.currentText())
+        sub = df[mask]
+        headers = ["來源 ID", "名稱"] + self._cols
+        self._tbl.setSortingEnabled(False)
+        self._tbl.clear()
+        self._tbl.setColumnCount(len(headers))
+        self._tbl.setHorizontalHeaderLabels(headers)
+        self._tbl.setRowCount(len(sub))
+        for r, (_idx, row) in enumerate(sub.iterrows()):
+            fkval = str(row[self._fk])
+            cells = [fkval, self._name_of(fkval)] + [str(row[c]) for c in self._cols]
+            for c, v in enumerate(cells):
+                it = QTableWidgetItem(v)
+                if headers[c] == "EffectValue":
+                    try: it.setData(Qt.EditRole, float(v))
+                    except (ValueError, TypeError): pass
+                self._tbl.setItem(r, c, it)
+        self._tbl.setSortingEnabled(True)
+        self._tbl.resizeColumnsToContents()
+        self.setWindowTitle(
+            self.windowTitle().split("　(")[0] + f"　({len(sub)} 筆符合)")
 
 
 # ── TableEditor ───────────────────────────────────────────────────────────────
@@ -2195,6 +2283,7 @@ class TableEditor(QWidget):
             panel.row_deleted.connect(self._on_sub_delete)
             panel.copy_requested.connect(self.copy_sub_rows)
             panel.paste_requested.connect(self.paste_sub_rows)
+            panel.compare_requested.connect(self.compare_sub_effect)
             self._sub_panels[tab_name] = panel
             idx = self._sub_tabs.addTab(panel, tab_name)
             note = sub_cfg.get("note", "")
@@ -2387,6 +2476,39 @@ class TableEditor(QWidget):
         self._refresh_sub_tables()
         note = "" if buf["sub"] == tab_name else f"（來源子表: {buf['sub']}，只貼同名欄位）"
         self.status_message.emit(f"已貼上 {len(new_rows)} 列{note}", _C["green"])
+
+    def _make_name_resolver(self):
+        """Return fk_value -> readable name (via master 'Name' column + text_ref)."""
+        df = self.df; pk = self.pk_key
+        namecol = "Name" if "Name" in df.columns else None
+        raw_map = {}
+        if namecol and pk in df.columns:
+            for _, row in df.iterrows():
+                raw_map[str(row[pk])] = str(row[namecol])
+        trs = self.cfg.get("text_ref_source", {})
+        ref = (trs.get("json_path") or "").strip()
+        kc = trs.get("key_col", "TextID"); vc = trs.get("val_col", "TextContent")
+        abs_ref = None
+        if ref and self.manager.json_path:
+            jd = os.path.dirname(self.manager.json_path)
+            abs_ref = ref if os.path.isabs(ref) else os.path.join(jd, ref)
+        def resolve(fk):
+            raw = raw_map.get(str(fk), "")
+            if abs_ref and raw:
+                r = self.manager.get_ref_text(abs_ref, kc, raw, vc)
+                if r: return r
+            return raw or str(fk)
+        return resolve
+
+    def compare_sub_effect(self, df_idx):
+        tab_name, full = self._current_sub_full()
+        if full is None: return
+        sub_df = self.manager.sub_tables.get(full)
+        if sub_df is None or df_idx not in sub_df.index: return
+        seed = {c: sub_df.at[df_idx, c] for c in sub_df.columns}
+        fk_key = self.cfg.get("sub_tables", {}).get(tab_name, {}).get("foreign_key", self.pk_key)
+        dlg = EffectCompareDialog(sub_df, fk_key, seed, self._make_name_resolver(), tab_name, self)
+        dlg.exec()
 
     # ── Context menus ─────────────────────────────────────────────────────────
 
