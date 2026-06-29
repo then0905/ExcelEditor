@@ -1165,9 +1165,7 @@ class FieldEditorWidget(QWidget):
         self._img_path_segments:  list = []  # [{"type":"col","col":"X"} | {"type":"lit","value":"Y"}]
         self._img_base_folder:    str  = ""  # configured base folder for images
         self._img_ext:            str  = ""  # file extension appended to assembled path e.g. ".png"
-        self._text_ref_json:    str = ""   # table-level external text-ref JSON path
-        self._text_ref_key_col: str = "TextID"
-        self._text_ref_val_col: str = "TextContent"
+        self._text_ref_cfg  = {}   # col → {"json_path","key_col","val_col"} (per-column text_ref)
         self._ref_labels    = {}   # col → QLabel (resolved lookup text for "text_ref" type)
         self._row_idx     = None
         self._table_name  = None
@@ -1204,9 +1202,7 @@ class FieldEditorWidget(QWidget):
         self._img_path_segments  = []
         self._img_base_folder    = ""
         self._img_ext            = ""
-        self._text_ref_json     = ""
-        self._text_ref_key_col  = "TextID"
-        self._text_ref_val_col  = "TextContent"
+        self._text_ref_cfg = {}
         self._ref_labels.clear()
         self._table_name = table_name
         self._manager    = manager
@@ -1221,10 +1217,11 @@ class FieldEditorWidget(QWidget):
             if _old_col and _old_col in df.columns:
                 _segs = [{"type": "col", "col": _old_col}]
         self._img_path_segments = _segs
-        _trs = cfg.get("text_ref_source", {})
-        self._text_ref_json    = _trs.get("json_path", "")
-        self._text_ref_key_col = _trs.get("key_col", "TextID")   or "TextID"
-        self._text_ref_val_col = _trs.get("val_col", "TextContent") or "TextContent"
+        self._text_ref_cfg = {
+            c: cc.get("text_ref", {})
+            for c, cc in cols_cfg.items()
+            if isinstance(cc, dict) and cc.get("type") == "text_ref"
+        }
 
         # ── Table-level image preview (shown at top if configured) ─────────────
         if self._img_path_segments:
@@ -1363,7 +1360,7 @@ class FieldEditorWidget(QWidget):
                 def _on_text_ref(c=col, widget=w, lbl=ref_lbl):
                     val = widget.toPlainText()
                     self.field_changed.emit(c, val)
-                    self._update_ref_label(lbl, val)
+                    self._update_ref_label(c, lbl, val)
 
                 w.textChanged.connect(_on_text_ref)
                 glo.addWidget(w)
@@ -1419,18 +1416,19 @@ class FieldEditorWidget(QWidget):
 
     # ── Text-ref lookup ───────────────────────────────────────────────────────
 
-    def _update_ref_label(self, lbl: "QLabel", key_val: str) -> None:
-        if not self._text_ref_json:
-            lbl.setText("（未設定外部文字表）")
+    def _update_ref_label(self, col: str, lbl: "QLabel", key_val: str) -> None:
+        src = self._text_ref_cfg.get(col, {})
+        jp  = (src.get("json_path") or "").strip()
+        if not jp:
+            lbl.setText("（此欄未設定外部文字表）")
             return
         if not self._manager:
             return
         json_dir = os.path.dirname(self._manager.json_path) if self._manager.json_path else ""
-        abs_ref  = (os.path.join(json_dir, self._text_ref_json)
-                    if json_dir and not os.path.isabs(self._text_ref_json)
-                    else self._text_ref_json)
+        abs_ref  = jp if os.path.isabs(jp) else (os.path.join(json_dir, jp) if json_dir else jp)
         resolved = self._manager.get_ref_text(
-            abs_ref, self._text_ref_key_col, key_val, self._text_ref_val_col
+            abs_ref, src.get("key_col", "TextID") or "TextID",
+            key_val, src.get("val_col", "TextContent") or "TextContent"
         )
         lbl.setText(resolved if resolved else "（找不到對應文字）")
 
@@ -1491,7 +1489,7 @@ class FieldEditorWidget(QWidget):
                     w.setPlainText(val_str)
                     ref_lbl = self._ref_labels.get(col)
                     if ref_lbl:
-                        self._update_ref_label(ref_lbl, val_str)
+                        self._update_ref_label(col, ref_lbl, val_str)
                 else:
                     w.setPlainText(str(val) if val is not None else "")
 
@@ -2121,23 +2119,11 @@ class TableEditor(QWidget):
             None
         )
 
-        # Build text-ref resolver for display
+        # Build text-ref resolver for display (per-column source)
         cols_cfg = self.cfg.get("columns", {})
-        _trs     = self.cfg.get("text_ref_source", {})
-        _trs_json = _trs.get("json_path", "")
-        _trs_key  = _trs.get("key_col", "TextID")
-        _trs_val  = _trs.get("val_col", "TextContent")
-        if _trs_json and self.manager.json_path:
-            _json_dir = os.path.dirname(self.manager.json_path)
-            _abs_ref  = os.path.join(_json_dir, _trs_json) if not os.path.isabs(_trs_json) else _trs_json
-        else:
-            _abs_ref  = ""
 
         def _disp(col, raw):
-            if _abs_ref and cols_cfg.get(col, {}).get("type") == "text_ref":
-                resolved = self.manager.get_ref_text(_abs_ref, _trs_key, str(raw), _trs_val)
-                return resolved if resolved else str(raw)
-            return str(raw)
+            return self._resolve_textref(col, raw, cols_cfg)
 
         for df_idx, row in sub_df.iterrows():
             pk_raw   = str(row[self.pk_key])
@@ -2477,26 +2463,34 @@ class TableEditor(QWidget):
         note = "" if buf["sub"] == tab_name else f"（來源子表: {buf['sub']}，只貼同名欄位）"
         self.status_message.emit(f"已貼上 {len(new_rows)} 列{note}", _C["green"])
 
+    def _resolve_textref(self, col, raw, cols_cfg=None):
+        """Resolve a text_ref column's value via that column's own text_ref source."""
+        cols_cfg = cols_cfg if cols_cfg is not None else self.cfg.get("columns", {})
+        cc = cols_cfg.get(col, {})
+        if not isinstance(cc, dict) or cc.get("type") != "text_ref":
+            return str(raw)
+        src = cc.get("text_ref", {})
+        jp = (src.get("json_path") or "").strip()
+        if not jp or not self.manager.json_path:
+            return str(raw)
+        jd = os.path.dirname(self.manager.json_path)
+        ab = jp if os.path.isabs(jp) else os.path.join(jd, jp)
+        r = self.manager.get_ref_text(ab, src.get("key_col", "TextID") or "TextID",
+                                      str(raw), src.get("val_col", "TextContent") or "TextContent")
+        return r if r else str(raw)
+
     def _make_name_resolver(self):
-        """Return fk_value -> readable name (via master 'Name' column + text_ref)."""
+        """Return fk_value -> readable name (via master 'Name' column + its text_ref)."""
         df = self.df; pk = self.pk_key
         namecol = "Name" if "Name" in df.columns else None
         raw_map = {}
         if namecol and pk in df.columns:
             for _, row in df.iterrows():
                 raw_map[str(row[pk])] = str(row[namecol])
-        trs = self.cfg.get("text_ref_source", {})
-        ref = (trs.get("json_path") or "").strip()
-        kc = trs.get("key_col", "TextID"); vc = trs.get("val_col", "TextContent")
-        abs_ref = None
-        if ref and self.manager.json_path:
-            jd = os.path.dirname(self.manager.json_path)
-            abs_ref = ref if os.path.isabs(ref) else os.path.join(jd, ref)
         def resolve(fk):
             raw = raw_map.get(str(fk), "")
-            if abs_ref and raw:
-                r = self.manager.get_ref_text(abs_ref, kc, raw, vc)
-                if r: return r
+            if namecol and raw:
+                return self._resolve_textref(namecol, raw)
             return raw or str(fk)
         return resolve
 
@@ -3147,18 +3141,29 @@ class App(QMainWindow):
         for tname, cfg in list(self.manager.config.items()):
             if not isinstance(cfg, dict):
                 continue
-            trs = cfg.get("text_ref_source", {})
-            ref = (trs.get("json_path") or "").strip() if isinstance(trs, dict) else ""
-            if ref:
-                abs_ref = ref if os.path.isabs(ref) else os.path.join(json_dir, ref)
-                if not os.path.isfile(abs_ref):
-                    if self._prompt_repath(tname, "外部文字表", abs_ref):
+            # per-column text_ref sources (master + sub-table columns)
+            scopes = [(cfg.get("columns", {}), "")]
+            for sname, scfg in cfg.get("sub_tables", {}).items():
+                if isinstance(scfg, dict):
+                    scopes.append((scfg.get("columns", {}), f"（子表 {sname}）"))
+            for cols, suffix in scopes:
+                for cname, ccfg in cols.items():
+                    if not (isinstance(ccfg, dict) and ccfg.get("type") == "text_ref"):
+                        continue
+                    src = ccfg.get("text_ref", {}) if isinstance(ccfg.get("text_ref"), dict) else {}
+                    ref = (src.get("json_path") or "").strip()
+                    if not ref:
+                        continue
+                    abs_ref = ref if os.path.isabs(ref) else os.path.join(json_dir, ref)
+                    if os.path.isfile(abs_ref):
+                        continue
+                    if self._prompt_repath(tname, f"欄位「{cname}」{suffix}的外部文字表", abs_ref):
                         new, _ = QFileDialog.getOpenFileName(
-                            self, f"重新選擇外部文字表（{tname}）", json_dir,
+                            self, f"重新選擇外部文字表（{cname}）", json_dir,
                             "JSON 檔案 (*.json);;所有檔案 (*.*)")
                         if new:
-                            trs["json_path"] = self._store_path(new, json_dir)
-                            cfg["text_ref_source"] = trs
+                            src["json_path"] = self._store_path(new, json_dir)
+                            ccfg["text_ref"] = src
                             changed = True
             imgp = cfg.get("image_preview", {})
             base = (imgp.get("base_folder") or "").strip() if isinstance(imgp, dict) else ""
@@ -3540,9 +3545,16 @@ class App(QMainWindow):
 
         def _col_row(col, cfg_cols, parent_dlg, df_source=None):
             """Return (row_widget, combo, opts_store, note_edit) for one column."""
-            rw  = QWidget(); rw.setStyleSheet("background:transparent;")
-            rlo = QHBoxLayout(rw)
-            rlo.setContentsMargins(0, 0, 0, 0); rlo.setSpacing(6)
+            rw  = QFrame(); rw.setObjectName("colCard")
+            rw.setStyleSheet(
+                f"QFrame#colCard {{ background:{_C['card']}; "
+                f"border:1px solid {_C['border']}; border-radius:8px; }}")
+            _rwv = QVBoxLayout(rw)
+            _rwv.setContentsMargins(10, 8, 10, 8); _rwv.setSpacing(5)
+            _hdr = QLabel(str(col))
+            _hdr.setStyleSheet(
+                f"color:{_C['txtAcc']}; font-weight:600; font-size:12px; background:transparent;")
+            _rwv.addWidget(_hdr)
             cb = _NoscrollCombo()
             cb.addItems(["string", "int", "float", "bool", "enum", "text_ref", "array"])
             cur_type = cfg_cols.get(col, {}).get("type", "string")
@@ -3574,11 +3586,48 @@ class App(QMainWindow):
             ix = suggest_combo.findData(cur_sg) if cur_sg else 0
             suggest_combo.setCurrentIndex(max(ix, 0))
 
-            rlo.addWidget(cb, 0, Qt.AlignTop)
-            rlo.addWidget(opts_btn, 1, Qt.AlignTop)
-            rlo.addWidget(note_edit, 2)
-            rlo.addWidget(suggest_combo, 0, Qt.AlignTop)
-            return rw, cb, opts_store, note_edit, suggest_combo
+            def _labeled(label_text, *widgets, stretch_idx=None):
+                row = QWidget(); row.setStyleSheet("background:transparent;")
+                h = QHBoxLayout(row); h.setContentsMargins(0, 0, 0, 0); h.setSpacing(6)
+                _l = QLabel(label_text); _l.setFixedWidth(60)
+                _l.setStyleSheet(f"color:{_C['txt3']}; font-size:11px; background:transparent;")
+                h.addWidget(_l, 0, Qt.AlignTop)
+                for i, wd in enumerate(widgets):
+                    h.addWidget(wd, 1 if i == stretch_idx else 0, Qt.AlignTop)
+                if stretch_idx is None:
+                    h.addStretch(1)
+                return row
+
+            _rwv.addWidget(_labeled("型別", cb, opts_btn))
+            _rwv.addWidget(_labeled("備註", note_edit, stretch_idx=0))
+            _rwv.addWidget(_labeled("建議來源", suggest_combo))
+
+            # per-column external text-ref source (only shown when type == text_ref)
+            _tref = cfg_cols.get(col, {}).get("text_ref", {}) or {}
+            tr_path = QLineEdit(_tref.get("json_path", ""))
+            tr_path.setPlaceholderText("外部文字表路徑（相對/絕對）")
+            tr_browse = QPushButton("…"); tr_browse.setFixedWidth(28); tr_browse.setAutoDefault(False)
+            tr_browse.setStyleSheet(
+                f"background:{_C['card']}; border:1px solid {_C['border']}; "
+                f"color:{_C['txt']}; border-radius:5px;")
+            def _tr_browse(edit=tr_path):
+                base = os.path.dirname(self.manager.json_path) if self.manager.json_path else ""
+                p, _ = QFileDialog.getOpenFileName(parent_dlg, "選擇外部文字表", base,
+                                                   "JSON (*.json);;所有檔案 (*.*)")
+                if p:
+                    try: p = os.path.relpath(p, base) if base else p
+                    except ValueError: pass
+                    edit.setText(p)
+            tr_browse.clicked.connect(lambda *_a, _b=_tr_browse: _b())
+            tr_key = QLineEdit(_tref.get("key_col", "") or ""); tr_key.setMaximumWidth(120)
+            tr_key.setPlaceholderText("key欄(預設TextID)")
+            tr_val = QLineEdit(_tref.get("val_col", "") or ""); tr_val.setMaximumWidth(150)
+            tr_val.setPlaceholderText("val欄(預設TextContent)")
+            tr_row = _labeled("文字表", tr_path, tr_browse, tr_key, tr_val, stretch_idx=0)
+            tr_row.setVisible(cur_type == "text_ref")
+            cb.currentTextChanged.connect(lambda t, _w=tr_row: _w.setVisible(t == "text_ref"))
+            _rwv.addWidget(tr_row)
+            return rw, cb, opts_store, note_edit, suggest_combo, (tr_path, tr_key, tr_val)
 
         # ── Dialog ────────────────────────────────────────────────────────────
         dlg = QDialog(self)
@@ -3739,18 +3788,11 @@ class App(QMainWindow):
 
         vlo.addWidget(_form_row("Image 路徑結構", _img_segs_container))
 
-        # External text-ref JSON path row
-        _trs_cfg = cfg.get("text_ref_source", {})
-        text_ref_edit = QLineEdit(_trs_cfg.get("json_path", ""))
-        text_ref_edit.setPlaceholderText("外部文字表路徑（相對路徑或絕對路徑）")
-        vlo.addWidget(_form_row("外部文字表路徑", _browse_row(text_ref_edit, is_folder=False)))
-
-        trs_key_edit = QLineEdit(_trs_cfg.get("key_col", "TextID"))
-        trs_key_edit.setPlaceholderText("key 欄名（預設 TextID）")
-        trs_val_edit = QLineEdit(_trs_cfg.get("val_col", "TextContent"))
-        trs_val_edit.setPlaceholderText("value 欄名（預設 TextContent）")
-        vlo.addWidget(_form_row("  文字表 Key 欄", trs_key_edit))
-        vlo.addWidget(_form_row("  文字表 Val 欄", trs_val_edit))
+        # （外部文字表已改為「逐欄位」設定：在下方各欄位 type 選 text_ref 後即可填）
+        _trs_hint = QLabel("※ 外部文字表改為逐欄位設定：把欄位型別設成 text_ref，下方就會出現該欄的文字表路徑/key/val")
+        _trs_hint.setWordWrap(True)
+        _trs_hint.setStyleSheet(f"color:{_C['txt3']}; font-size:11px; background:transparent;")
+        vlo.addWidget(_trs_hint)
 
         sep1 = QFrame(); sep1.setFixedHeight(1)
         sep1.setStyleSheet(f"background:{_C['border']}; border:none;")
@@ -3759,9 +3801,9 @@ class App(QMainWindow):
 
         main_col_widgets: dict[str, tuple] = {}  # col → (cb, opts_store)
         for col in cols:
-            rw, cb, opts_store, note_edit, suggest_combo = _col_row(col, cols_cfg, dlg, df_source=df)
-            vlo.addWidget(_form_row(f"  {col}", rw))
-            main_col_widgets[col] = (cb, opts_store, note_edit, suggest_combo)
+            rw, cb, opts_store, note_edit, suggest_combo, tref = _col_row(col, cols_cfg, dlg, df_source=df)
+            vlo.addWidget(rw)
+            main_col_widgets[col] = (cb, opts_store, note_edit, suggest_combo, tref)
 
         # ── Sub-tables ────────────────────────────────────────────────────────
         prefix = table_name + "."
@@ -3801,9 +3843,9 @@ class App(QMainWindow):
 
                 col_combos: dict[str, tuple] = {}
                 for scol in list(sub_df.columns):
-                    rw, cb, opts_store, note_edit, suggest_combo = _col_row(scol, sub_cols_cfg, dlg, df_source=sub_df)
-                    vlo.addWidget(_form_row(f"    {scol}", rw))
-                    col_combos[scol] = (cb, opts_store, note_edit, suggest_combo)
+                    rw, cb, opts_store, note_edit, suggest_combo, tref = _col_row(scol, sub_cols_cfg, dlg, df_source=sub_df)
+                    vlo.addWidget(rw)
+                    col_combos[scol] = (cb, opts_store, note_edit, suggest_combo, tref)
 
                 sub_widgets[tab_name] = {"fk_edit": fk_edit, "note_edit": st_note_edit,
                                          "col_combos": col_combos}
@@ -3855,16 +3897,9 @@ class App(QMainWindow):
         else:
             cfg.pop("image_preview", None)
 
-        text_ref_path = text_ref_edit.text().strip()
-        if text_ref_path:
-            cfg["text_ref_source"] = {
-                "json_path": text_ref_path,
-                "key_col":   trs_key_edit.text().strip() or "TextID",
-                "val_col":   trs_val_edit.text().strip() or "TextContent",
-            }
-        else:
-            cfg.pop("text_ref_source", None)
-        def _build_col_entry(t, opts_store, note="", suggest_from=""):
+        cfg.pop("text_ref_source", None)  # legacy table-level key removed (now per-column)
+
+        def _build_col_entry(t, opts_store, note="", suggest_from="", tref=None):
             entry = {"type": t}
             if t == "enum" and opts_store[0]:
                 entry["options"] = opts_store[0]
@@ -3874,12 +3909,21 @@ class App(QMainWindow):
             sg = (suggest_from or "").strip()
             if sg:
                 entry["suggest_from"] = sg
+            if t == "text_ref" and tref is not None:
+                path = tref[0].text().strip()
+                if path:
+                    entry["text_ref"] = {
+                        "json_path": path,
+                        "key_col":   tref[1].text().strip() or "TextID",
+                        "val_col":   tref[2].text().strip() or "TextContent",
+                    }
             return entry
 
         cfg.setdefault("columns", {})
-        for col, (cb, opts_store, note_edit, suggest_combo) in main_col_widgets.items():
+        for col, (cb, opts_store, note_edit, suggest_combo, tref) in main_col_widgets.items():
             cfg["columns"][col] = _build_col_entry(
-                cb.currentText(), opts_store, note_edit.toPlainText(), suggest_combo.currentData()
+                cb.currentText(), opts_store, note_edit.toPlainText(),
+                suggest_combo.currentData(), tref
             )
 
         cfg.setdefault("sub_tables", {})
@@ -3894,9 +3938,10 @@ class App(QMainWindow):
             else:
                 st.pop("note", None)
             st.setdefault("columns", {})
-            for scol, (scb, opts_store, note_edit, suggest_combo) in data["col_combos"].items():
+            for scol, (scb, opts_store, note_edit, suggest_combo, tref) in data["col_combos"].items():
                 st["columns"][scol] = _build_col_entry(
-                    scb.currentText(), opts_store, note_edit.toPlainText(), suggest_combo.currentData()
+                    scb.currentText(), opts_store, note_edit.toPlainText(),
+                    suggest_combo.currentData(), tref
                 )
 
         self.manager.config[table_name] = cfg

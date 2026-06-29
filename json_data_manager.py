@@ -350,12 +350,41 @@ class JsonDataManager:
                 self._sub_fk_is_data[sub_full_name] = False
                 self._build_search_index(sub_full_name, self.sub_tables[sub_full_name])
 
+            # Migrate legacy table-level text_ref_source → per-column text_ref
+            if self._migrate_text_ref(self.config[table_name]):
+                self.need_config_alert = True
+
         if self.need_config_alert:
             self.save_config()
 
         self._add_recent_file(file_path)
         self.dirty = False
         self.dirty_cells.clear()
+
+    @staticmethod
+    def _migrate_text_ref(tcfg):
+        """One-time migration: copy the legacy table-level `text_ref_source` into
+        each text_ref column that lacks its own `text_ref`, then drop the table-level
+        key. text_ref is now per-column. Returns True if anything changed."""
+        trs = tcfg.get("text_ref_source")
+        if not isinstance(trs, dict):
+            return False
+        src = {
+            "json_path": trs.get("json_path", ""),
+            "key_col":   trs.get("key_col", "TextID") or "TextID",
+            "val_col":   trs.get("val_col", "TextContent") or "TextContent",
+        }
+        scopes = [tcfg.get("columns", {})]
+        for sc in tcfg.get("sub_tables", {}).values():
+            if isinstance(sc, dict):
+                scopes.append(sc.get("columns", {}))
+        for cols in scopes:
+            for ccfg in cols.values():
+                if (isinstance(ccfg, dict) and ccfg.get("type") == "text_ref"
+                        and not ccfg.get("text_ref")):
+                    ccfg["text_ref"] = dict(src)
+        tcfg.pop("text_ref_source", None)
+        return True
 
     def _make_default_table_config(self, table_name, df):
         pk = df.columns[0] if len(df.columns) > 0 else ""
