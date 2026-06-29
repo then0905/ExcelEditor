@@ -1754,6 +1754,15 @@ class TableEditor(QWidget):
 
         lv.addWidget(_sec_lbl(f"Groups · {self.cls_key}"))
 
+        _clsf_wrap = QWidget(); _clsf_wrap.setStyleSheet("background:transparent;")
+        _cfl = QHBoxLayout(_clsf_wrap); _cfl.setContentsMargins(8, 0, 8, 6); _cfl.setSpacing(0)
+        self._cls_filter = QLineEdit()
+        self._cls_filter.setPlaceholderText("篩選分類…")
+        self._cls_filter.setClearButtonEnabled(True)
+        self._cls_filter.textChanged.connect(self._apply_cls_filter)
+        _cfl.addWidget(self._cls_filter)
+        lv.addWidget(_clsf_wrap)
+
         self._cls_list = QListWidget()
         self._cls_list.setObjectName("cls-list")
         self._cls_list.setFocusPolicy(Qt.NoFocus)
@@ -2038,6 +2047,16 @@ class TableEditor(QWidget):
             if str(g) == str(self.current_cls_val):
                 self._cls_list.setCurrentItem(item)
         self._cls_list.blockSignals(False)
+        self._apply_cls_filter()
+
+    def _apply_cls_filter(self, text=None):
+        if not hasattr(self, "_cls_filter"):
+            return
+        q = (text if text is not None else self._cls_filter.text()).strip().lower()
+        for i in range(self._cls_list.count()):
+            it = self._cls_list.item(i)
+            g = str(it.data(Qt.UserRole))
+            it.setHidden(q != "" and q not in g.lower())
 
     def _on_cls_changed(self, cur, _prev):
         if cur is None:
