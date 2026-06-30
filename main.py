@@ -1712,6 +1712,140 @@ class EffectCompareDialog(QDialog):
 
 # ── TableEditor ───────────────────────────────────────────────────────────────
 
+_ALL_GROUPS = "__ALL_GROUPS__"   # sentinel: the "(全部)" pseudo-classification
+
+
+class CompareView(QWidget):
+    """Reference panel comparing several master items side by side (rows = fields,
+    columns = items; differing rows highlighted). Items are tracked by primary-key
+    value so the set survives reordering/deletes. Can be docked as a tab or floated.
+    Read-only — you keep editing in the main panel and this refreshes live."""
+
+    def __init__(self, editor, parent=None):
+        super().__init__(parent)
+        self._editor = editor
+        self._pks = []          # primary-key values being compared
+        self.setStyleSheet(f"background:{_C['panel']};")
+        v = QVBoxLayout(self); v.setContentsMargins(8, 6, 8, 8); v.setSpacing(6)
+        bar = QHBoxLayout(); bar.setSpacing(8)
+        self._info = QLabel("尚未加入項目")
+        self._info.setStyleSheet(f"color:{_C['txt2']}; font-size:11px; background:transparent;")
+        self._diff_only = QCheckBox("只顯示有差異")
+        self._diff_only.stateChanged.connect(self.refresh)
+        clr = _mk_btn("清空", "ghost"); clr.setFixedHeight(24); clr.clicked.connect(self.clear)
+        bar.addWidget(self._info, 1); bar.addWidget(self._diff_only); bar.addWidget(clr)
+        v.addLayout(bar)
+        # removable chips (one per compared item) — click ✕ to drop it
+        self._chips_box = QWidget(); self._chips_box.setStyleSheet("background:transparent;")
+        self._chips_flow = FlowLayout(self._chips_box, spacing=4)
+        v.addWidget(self._chips_box)
+        self._tbl = QTableWidget()
+        self._tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._tbl.verticalHeader().setVisible(False)
+        self._tbl.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
+        self._tbl.horizontalHeader().customContextMenuRequested.connect(self._hdr_menu)
+        v.addWidget(self._tbl, 1)
+        hint = QLabel("在「項目」分頁選取後按「加入比較」可累積（可跨分類）；右鍵欄位標題可移除")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color:{_C['txt3']}; font-size:10px; background:transparent;")
+        v.addWidget(hint)
+
+    def add_indices(self, idxs):
+        df = self._editor.df; pk = self._editor.pk_key
+        if pk not in df.columns:
+            return
+        for i in idxs:
+            if i in df.index:
+                p = str(df.at[i, pk])
+                if p not in self._pks:
+                    self._pks.append(p)
+        self.refresh()
+
+    def clear(self):
+        self._pks = []; self.refresh()
+
+    def _hdr_menu(self, pos):
+        col = self._tbl.horizontalHeader().logicalIndexAt(pos)
+        if col <= 0 or col - 1 >= len(self._pks):
+            return
+        p = self._pks[col - 1]
+        m = QMenu(self)
+        m.addAction("從比較移除", lambda: self._remove(p))
+        m.exec(self._tbl.horizontalHeader().mapToGlobal(pos))
+
+    def _remove(self, pk):
+        if pk in self._pks:
+            self._pks.remove(pk)
+        self.refresh()
+
+    def _make_chip(self, pk, label):
+        w = QFrame()
+        w.setStyleSheet(f"QFrame{{background:{_C['card']}; border:1px solid {_C['border']}; border-radius:9px;}}")
+        h = QHBoxLayout(w); h.setContentsMargins(8, 2, 4, 2); h.setSpacing(4)
+        l = QLabel(label or pk)
+        l.setStyleSheet(f"color:{_C['txt']}; background:transparent; border:none; font-size:11px;")
+        x = QPushButton("✕"); x.setFixedSize(16, 16); x.setAutoDefault(False)
+        x.setStyleSheet(
+            f"QPushButton{{background:transparent; border:none; color:{_C['txt3']}; font-size:12px;}}"
+            f"QPushButton:hover{{color:{_C['red']};}}")
+        x.clicked.connect(lambda *_a, _p=pk: self._remove(_p))
+        h.addWidget(l); h.addWidget(x)
+        return w
+
+    def refresh(self, *_a):
+        ed = self._editor; df = ed.df; pk = ed.pk_key
+        idxs = []
+        if pk in df.columns:
+            pkser = df[pk].astype(str)
+            kept = []
+            for p in self._pks:
+                m = df.index[pkser == p]
+                if len(m):
+                    kept.append(p); idxs.append(m[0])
+            self._pks = kept
+        else:
+            self._pks = []
+        self._info.setText(
+            f"比較 {len(idxs)} 個項目" if idxs
+            else "尚未加入項目（在「項目」分頁選取後按「加入比較」）")
+        cols_cfg = ed.cfg.get("columns", {})
+        disp = lambda c, r: ed._resolve_textref(c, r, cols_cfg)
+        diff_only = self._diff_only.isChecked()
+        labels = [disp(pk, str(df.at[i, pk])) for i in idxs]
+        headers = ["欄位"] + labels
+        # rebuild removable chips
+        while self._chips_flow.count():
+            itm = self._chips_flow.takeAt(0)
+            w = itm.widget() if itm else None
+            if w is not None:
+                w.setParent(None); w.deleteLater()
+        for p, lbl in zip(self._pks, labels):
+            self._chips_flow.addWidget(self._make_chip(p, lbl))
+        self._chips_box.setVisible(bool(self._pks))
+        rows = []
+        for col in list(df.columns):
+            vals = [disp(col, str(df.at[i, col])) for i in idxs]
+            differ = len(set(vals)) > 1
+            if diff_only and not differ:
+                continue
+            rows.append((col, vals, differ))
+        self._tbl.clear()
+        self._tbl.setColumnCount(len(headers))
+        self._tbl.setHorizontalHeaderLabels(headers)
+        self._tbl.setRowCount(len(rows))
+        for r, (col, vals, differ) in enumerate(rows):
+            name = QTableWidgetItem(col)
+            if differ:
+                name.setForeground(QBrush(QColor(_C["yellow"])))
+            self._tbl.setItem(r, 0, name)
+            for ci, vv in enumerate(vals):
+                it = QTableWidgetItem(vv)
+                if differ:
+                    it.setBackground(QColor(234, 179, 8, 30))
+                self._tbl.setItem(r, ci + 1, it)
+        self._tbl.resizeColumnsToContents()
+
+
 class TableEditor(QWidget):
     status_message = Signal(str, str)
     _sub_clipboard = None  # {"sub": tab_name, "rows": [ {col: val, ...} ]} — shared across items/tables
@@ -1821,27 +1955,47 @@ class TableEditor(QWidget):
             ("",     "ghost",   "arrow-up",    "上移", lambda: self.move_master_item(-1)),
             ("",     "ghost",   "arrow-down",  "下移", lambda: self.move_master_item(1)),
             ("刪除", "danger",  "trash",       "",   self.delete_master_item),
+            ("加入比較", "ghost", "columns",   "把選取項目加入「比較」分頁（Ctrl／Shift 多選，可跨分類）", self.add_to_compare),
         ]:
             b = _mk_btn(text, role, icon=icon)
             b.setFixedHeight(32)
+            if tip:
+                b.setToolTip(tip)
             if not text:
-                b.setFixedWidth(36); b.setToolTip(tip)
+                b.setFixedWidth(36)
             b.clicked.connect(slot)
             alo.addWidget(b)
 
-        mv.addWidget(action_bar)
+        items_page = QWidget(); items_page.setStyleSheet("background:transparent;")
+        ipv = QVBoxLayout(items_page); ipv.setContentsMargins(0, 0, 0, 0); ipv.setSpacing(0)
+        ipv.addWidget(action_bar)
 
         # Card list
         self._card_list = QListWidget()
         self._card_list.setObjectName("card-list")
         self._card_list.setItemDelegate(ItemCardDelegate(self._card_list))
         self._card_list.setMouseTracking(True)
+        self._card_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._card_list.setFocusPolicy(Qt.NoFocus)
         self._card_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self._card_list.currentItemChanged.connect(self._on_item_changed)
         self._card_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self._card_list.customContextMenuRequested.connect(self._item_ctx_menu)
-        mv.addWidget(self._card_list, 1)
+        ipv.addWidget(self._card_list, 1)
+
+        # 項目 / 比較 tabs, with a float-out corner button
+        self._mid_tabs = QTabWidget()
+        self._mid_tabs.setDocumentMode(True)
+        self._mid_tabs.addTab(items_page, "項目")
+        self._compare_view = CompareView(self)
+        self._mid_tabs.addTab(self._compare_view, "比較")
+        self._compare_float = None
+        self._compare_float_btn = _mk_btn("⤢ 浮動", "ghost")
+        self._compare_float_btn.setFixedHeight(24)
+        self._compare_float_btn.setToolTip("把「比較」浮出成獨立視窗（可一邊編輯一邊參考）／收回")
+        self._compare_float_btn.clicked.connect(self._toggle_float_compare)
+        self._mid_tabs.setCornerWidget(self._compare_float_btn)
+        mv.addWidget(self._mid_tabs, 1)
 
         # mid is placed into the draggable splitter below
 
@@ -2036,6 +2190,13 @@ class TableEditor(QWidget):
         if self.cls_key not in self.df.columns:
             self._cls_list.blockSignals(False)
             return
+        # "(全部)" pseudo-group on top → middle list shows every item (cross-class)
+        all_item = QListWidgetItem(f"  (全部)  ({len(self.df)})")
+        all_item.setData(Qt.UserRole, _ALL_GROUPS)
+        all_item.setForeground(QBrush(QColor(_C["txtAcc"])))
+        self._cls_list.addItem(all_item)
+        if self.current_cls_val == _ALL_GROUPS:
+            self._cls_list.setCurrentItem(all_item)
         groups = self.df[self.cls_key].unique()
         for g in groups:
             cat   = _cat_for(str(g))
@@ -2044,7 +2205,7 @@ class TableEditor(QWidget):
             item.setData(Qt.UserRole, g)
             item.setForeground(QBrush(QColor(cat["text"])))
             self._cls_list.addItem(item)
-            if str(g) == str(self.current_cls_val):
+            if self.current_cls_val != _ALL_GROUPS and str(g) == str(self.current_cls_val):
                 self._cls_list.setCurrentItem(item)
         self._cls_list.blockSignals(False)
         self._apply_cls_filter()
@@ -2055,8 +2216,10 @@ class TableEditor(QWidget):
         q = (text if text is not None else self._cls_filter.text()).strip().lower()
         for i in range(self._cls_list.count()):
             it = self._cls_list.item(i)
-            g = str(it.data(Qt.UserRole))
-            it.setHidden(q != "" and q not in g.lower())
+            g = it.data(Qt.UserRole)
+            if g == _ALL_GROUPS:
+                it.setHidden(False); continue
+            it.setHidden(q != "" and q not in str(g).lower())
 
     def _on_cls_changed(self, cur, _prev):
         if cur is None:
@@ -2096,7 +2259,7 @@ class TableEditor(QWidget):
 
     def delete_classification(self):
         g = self.current_cls_val
-        if g is None: return
+        if g is None or g == _ALL_GROUPS: return
         if QMessageBox.question(self, "確認刪除", f"刪除分類 [{g}] 及其所有資料？",
                                 QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
             return
@@ -2108,7 +2271,7 @@ class TableEditor(QWidget):
         self._reload_all()
 
     def move_classification(self, delta):
-        if self.current_cls_val is None: return
+        if self.current_cls_val is None or self.current_cls_val == _ALL_GROUPS: return
         groups = list(self.df[self.cls_key].unique())
         try:    pos = [str(g) for g in groups].index(str(self.current_cls_val))
         except: return
@@ -2132,7 +2295,8 @@ class TableEditor(QWidget):
             self._card_list.blockSignals(False)
             return
 
-        sub_df   = self.df[self.df[self.cls_key] == self.current_cls_val]
+        all_mode = (self.current_cls_val == _ALL_GROUPS)
+        sub_df   = self.df if all_mode else self.df[self.df[self.cls_key] == self.current_cls_val]
         sub_col  = next(
             (c for c in self.df.columns if c != self.pk_key and c != self.cls_key),
             None
@@ -2154,16 +2318,20 @@ class TableEditor(QWidget):
                      and query not in sub_raw.lower() and query not in sub_disp.lower():
                 continue
 
+            cat_val = str(row[self.cls_key]) if (all_mode and self.cls_key in self.df.columns) \
+                      else str(self.current_cls_val)
             item = QListWidgetItem()
             item.setData(Qt.UserRole,            df_idx)
             item.setData(ItemCardDelegate.R_PK,  pk_disp)
-            item.setData(ItemCardDelegate.R_SUB, sub_disp)
-            item.setData(ItemCardDelegate.R_CAT, str(self.current_cls_val))
+            item.setData(ItemCardDelegate.R_SUB, sub_disp if not all_mode else f"{cat_val} · {sub_disp}")
+            item.setData(ItemCardDelegate.R_CAT, cat_val)
             self._card_list.addItem(item)
             if df_idx == self.current_master_idx:
                 self._card_list.setCurrentItem(item)
 
         self._card_list.blockSignals(False)
+        if hasattr(self, "_compare_view"):
+            self._compare_view.refresh()
 
     def _apply_filter(self, _text=""):
         self._load_item_list()
@@ -2173,8 +2341,8 @@ class TableEditor(QWidget):
         self._load_editor(cur.data(Qt.UserRole))
 
     def add_master_item(self):
-        if self.current_cls_val is None:
-            QMessageBox.warning(self, "提示", "請先選擇分類"); return
+        if self.current_cls_val is None or self.current_cls_val == _ALL_GROUPS:
+            QMessageBox.warning(self, "提示", "請先選擇一個分類（「(全部)」檢視下無法新增）"); return
         new_id, ok = QInputDialog.getText(self, "新增項目", f"{self.pk_key}:")
         if not ok or not new_id.strip(): return
         new_id = new_id.strip()
@@ -2265,9 +2433,66 @@ class TableEditor(QWidget):
         self._update_json(row_data)
         self._refresh_sub_tables()
 
+    def add_to_compare(self):
+        idxs = [it.data(Qt.UserRole) for it in self._card_list.selectedItems()]
+        idxs = [i for i in idxs if i in self.df.index]
+        if not idxs:
+            self.status_message.emit("請先選取要加入比較的項目", _C["yellow"]); return
+        self._compare_view.add_indices(idxs)
+        if self._compare_float is None:
+            self._mid_tabs.setCurrentWidget(self._compare_view)
+        else:
+            self._compare_float.raise_()
+        self.status_message.emit(f"已加入 {len(idxs)} 個到比較", _C["green"])
+
+    def _toggle_float_compare(self):
+        if self._compare_float is None:
+            # dock → float: pull the compare view out of the tab into a window
+            idx = self._mid_tabs.indexOf(self._compare_view)
+            if idx >= 0:
+                self._mid_tabs.removeTab(idx)
+            win = QDialog(self)
+            win.setWindowTitle("比較（參考）")
+            win.setStyleSheet(APP_QSS)
+            win.resize(760, 600)
+            lo = QVBoxLayout(win); lo.setContentsMargins(0, 0, 0, 0)
+            lo.addWidget(self._compare_view)
+            self._compare_view.show()        # removeTab hid it — show again
+            self._compare_view.refresh()
+            win.finished.connect(lambda *_: self._dock_compare())
+            self._compare_float = win
+            self._compare_float_btn.setText("⤡ 收回")
+            self._mid_tabs.setCurrentIndex(0)
+            win.show()
+        else:
+            self._compare_float.close()  # triggers finished → _dock_compare
+
+    def _dock_compare(self):
+        if self._compare_float is None:
+            return
+        win = self._compare_float
+        self._compare_float = None
+        self._compare_view.setParent(None)
+        self._mid_tabs.addTab(self._compare_view, "比較")
+        self._compare_float_btn.setText("⤢ 浮動")
+        win.deleteLater()
+
     def _on_field_change(self, col, value):
         if self.current_master_idx is None: return
         self.manager.update_cell(self.table_name, self.current_master_idx, col, value)
+        # If the edited column drives the left/middle lists, refresh them so the
+        # grouping / labels reflect the new value.
+        if col == self.cls_key:
+            self._load_cls_list()    # groups + counts
+            self._load_item_list()   # current group's items (regrouped item leaves)
+        elif col == self.pk_key:
+            self.current_master_pk = str(value)
+            if self._panel_hdr is not None:
+                self._panel_hdr.setText(f"{self.current_master_pk}")
+            self._load_item_list()
+        # keep the live comparison reference in sync with edits
+        if hasattr(self, "_compare_view"):
+            self._compare_view.refresh()
 
     # ── Sub-tables ────────────────────────────────────────────────────────────
 
@@ -2550,6 +2775,10 @@ class TableEditor(QWidget):
         menu = QMenu(self)
         menu.addAction("複製", self.copy_master_item)
         menu.addAction("刪除", self.delete_master_item)
+        sel = len(self._card_list.selectedItems())
+        if sel >= 1:
+            menu.addSeparator()
+            menu.addAction(f"加入比較（{sel} 項）", self.add_to_compare)
         menu.exec(self._card_list.mapToGlobal(pos))
 
     # ── Refresh ───────────────────────────────────────────────────────────────
