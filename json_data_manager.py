@@ -94,7 +94,9 @@ class JsonDataManager:
             if len(results) >= limit:
                 break
             is_sub = table_name in self.sub_tables
-            df = self.sub_tables.get(table_name) or self.tables.get(table_name)
+            # NB: don't use `a or b` on DataFrames — bool(df) is ambiguous and
+            # raises. Pick the source explicitly by whether it's a sub-table.
+            df = self.sub_tables.get(table_name) if is_sub else self.tables.get(table_name)
             if df is None or row_idx not in df.index:
                 continue
             # Get matched columns for display

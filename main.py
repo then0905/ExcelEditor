@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QStackedWidget, QFileDialog, QMenu, QSizePolicy, QFrame,
     QInputDialog, QMessageBox, QStyledItemDelegate, QStyle,
     QDialog, QDialogButtonBox, QFormLayout, QLayout, QCompleter,
-    QTableWidget, QTableWidgetItem,
+    QTableWidget, QTableWidgetItem, QPlainTextEdit,
 )
 from PySide6.QtCore import (
     Qt, Signal, QAbstractTableModel, QModelIndex,
@@ -1176,6 +1176,7 @@ class FieldEditorWidget(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setStyleSheet("background: transparent; border: none;")
+        self._scroll = scroll
 
         self._content = QWidget()
         self._content.setStyleSheet(f"background: {_C['panel']};")
@@ -1393,6 +1394,27 @@ class FieldEditorWidget(QWidget):
         self._form_lo.addStretch(1)
         self._built = True
 
+    # ── Quick-nav focus (from search results / compare view) ────────────────────
+    def focus_field(self, col):
+        """Scroll the given field into view and briefly flash its label so the
+        user can see where the search/compare jump landed. No-op if unknown."""
+        w   = self._widgets.get(col)
+        lbl = self._lbl_widgets.get(col)
+        if w is None:
+            return
+        self._scroll.ensureWidgetVisible(w, 0, 40)
+        try:
+            w.setFocus()
+        except Exception:
+            pass
+        if lbl is not None:
+            base = (f"color: {_C['txt2']}; font-size: 11px; font-weight: 500; "
+                    f"background: transparent;")
+            flash = (f"color: {_C['accent']}; font-size: 11px; font-weight: 700; "
+                     f"background: rgba(99,102,241,0.20); border-radius: 3px;")
+            lbl.setStyleSheet(flash)
+            QTimer.singleShot(900, lambda l=lbl, b=base: l.setStyleSheet(b))
+
     # ── Validation ────────────────────────────────────────────────────────────
 
     def _on_numeric(self, col, value, col_type):
@@ -1581,6 +1603,24 @@ class SubTablePanel(QWidget):
         if not df.empty:
             self._view.resizeColumnsToContents()
 
+    def select_by_df_index(self, df_idx, col=None):
+        """Select the row whose underlying DataFrame index == df_idx and scroll
+        to `col` (best-effort). Used by global-search quick-nav into sub-tables."""
+        model = self._model
+        cols  = list(model.df.columns)
+        target_col = cols.index(col) if (col and col in cols) else 0
+        for r in range(model.rowCount()):
+            try:
+                if model.df_index(r) == df_idx:
+                    idx = model.index(r, target_col)
+                    self._view.setCurrentIndex(idx)
+                    self._view.selectRow(r)
+                    self._view.scrollTo(idx, QAbstractItemView.PositionAtCenter)
+                    return True
+            except Exception:
+                pass
+        return False
+
     def _ctx_menu(self, pos):
         menu = QMenu(self)
         menu.addAction("複製列", self.copy_requested.emit)
@@ -1744,8 +1784,11 @@ class CompareView(QWidget):
         self._tbl.verticalHeader().setVisible(False)
         self._tbl.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
         self._tbl.horizontalHeader().customContextMenuRequested.connect(self._hdr_menu)
+        self._tbl.cellDoubleClicked.connect(self._cell_dblclick)
+        self._row_cols = []   # table row → field (column) name, for quick-nav
         v.addWidget(self._tbl, 1)
-        hint = QLabel("在「項目」分頁選取後按「加入比較」可累積（可跨分類）；右鍵欄位標題可移除")
+        hint = QLabel("在「項目」分頁選取後按「加入比較」可累積（可跨分類）；"
+                      "右鍵欄位標題可移除；雙擊儲存格可跳到該項目該欄位")
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color:{_C['txt3']}; font-size:10px; background:transparent;")
         v.addWidget(hint)
@@ -1792,6 +1835,27 @@ class CompareView(QWidget):
         h.addWidget(l); h.addWidget(x)
         return w
 
+    def _cell_dblclick(self, r, c):
+        """Double-click a value cell → jump the main editor to that item's field.
+        Column 0 is the field-name column; data columns map to compared items."""
+        if c <= 0 or c - 1 >= len(self._pks):
+            return
+        if not (0 <= r < len(self._row_cols)):
+            return
+        pk  = self._pks[c - 1]
+        col = self._row_cols[r]
+        ed  = self._editor
+        df  = ed.df
+        m = df.index[df[ed.pk_key].astype(str) == str(pk)]
+        if not len(m):
+            return
+        idx = m[0]
+        ed.current_cls_val = df.at[idx, ed.cls_key]
+        ed._load_cls_list()
+        ed._load_item_list()
+        ed._load_editor(idx)
+        ed.focus_master_field(col)
+
     def refresh(self, *_a):
         ed = self._editor; df = ed.df; pk = ed.pk_key
         idxs = []
@@ -1829,6 +1893,7 @@ class CompareView(QWidget):
             if diff_only and not differ:
                 continue
             rows.append((col, vals, differ))
+        self._row_cols = [col for col, _v, _d in rows]
         self._tbl.clear()
         self._tbl.setColumnCount(len(headers))
         self._tbl.setHorizontalHeaderLabels(headers)
@@ -2877,6 +2942,18 @@ class TableEditor(QWidget):
             if self._sub_tabs.tabText(i) == name:
                 self._sub_tabs.setCurrentIndex(i); return
 
+    def focus_master_field(self, col):
+        """Scroll/flash a master field — used by search & compare quick-nav."""
+        if col and self._field_panel is not None:
+            self._field_panel.focus_field(col)
+
+    def focus_sub(self, tab_name, df_idx, col=None):
+        """Open a sub-table tab and select the given sub-row (quick-nav)."""
+        self._select_sub_tab(tab_name)
+        panel = self._sub_panels.get(tab_name)
+        if panel is not None:
+            panel.select_by_df_index(df_idx, col)
+
     def _fit_right_panel(self):
         """Make the right panel's min width track what the sub-table toolbar
         actually needs, so its buttons never get squeezed (hardcoded → adaptive)."""
@@ -3111,6 +3188,215 @@ class WelcomeWidget(QWidget):
         self._setup_ui()
 
 
+# ── Notes (free-form text / table pages, saved into config with the DB) ────────
+
+class NotePage(QWidget):
+    """A single note page — either a free-form multi-line text note or an editable
+    grid. Content is flushed into config and persisted by the normal 儲存 action."""
+    changed = Signal()
+
+    def __init__(self, note, parent=None):
+        super().__init__(parent)
+        self._type = note.get("type", "text")
+        v = QVBoxLayout(self)
+        v.setContentsMargins(10, 8, 10, 10); v.setSpacing(8)
+
+        if self._type == "table":
+            bar = QHBoxLayout(); bar.setSpacing(6)
+            for txt, fn in (("＋ 列", self._add_row), ("－ 列", self._del_row),
+                            ("＋ 欄", self._add_col), ("－ 欄", self._del_col)):
+                b = _mk_btn(txt, "ghost"); b.setFixedHeight(26); b.clicked.connect(fn)
+                bar.addWidget(b)
+            bar.addStretch(1)
+            tip = QLabel("雙擊儲存格編輯；雙擊欄標題可改名")
+            tip.setStyleSheet(f"color:{_C['txt3']}; font-size:10px; background:transparent;")
+            bar.addWidget(tip)
+            v.addLayout(bar)
+
+            content = note.get("content") or [["", ""], ["", ""]]
+            ncols   = len(content[0]) if content and content[0] else 2
+            headers = note.get("headers") or [f"欄{i+1}" for i in range(ncols)]
+            self._tbl = QTableWidget()
+            self._tbl.setColumnCount(len(headers))
+            self._tbl.setHorizontalHeaderLabels(headers)
+            self._tbl.setRowCount(len(content))
+            for r, rowv in enumerate(content):
+                for c in range(len(headers)):
+                    val = rowv[c] if c < len(rowv) else ""
+                    self._tbl.setItem(r, c, QTableWidgetItem(str(val)))
+            self._tbl.verticalHeader().setDefaultSectionSize(28)
+            self._tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+            self._tbl.horizontalHeader().setStretchLastSection(True)
+            v.addWidget(self._tbl, 1)
+            # connect AFTER populating so initial fill doesn't mark dirty
+            self._tbl.itemChanged.connect(lambda *_: self.changed.emit())
+            self._tbl.horizontalHeader().sectionDoubleClicked.connect(self._rename_col)
+        else:
+            self._edit = QPlainTextEdit()
+            self._edit.setPlainText(note.get("content", "") or "")
+            self._edit.setStyleSheet(
+                f"background:{_C['code']}; color:{_C['txt']}; "
+                f"border:1px solid {_C['border']}; border-radius:6px; "
+                f"padding:8px; font-size:13px;")
+            v.addWidget(self._edit, 1)
+            self._edit.textChanged.connect(self.changed.emit)
+
+    # ── table operations ──
+    def _add_row(self):
+        self._tbl.insertRow(self._tbl.rowCount()); self.changed.emit()
+
+    def _del_row(self):
+        r = self._tbl.currentRow()
+        if r < 0:
+            r = self._tbl.rowCount() - 1
+        if r >= 0:
+            self._tbl.removeRow(r); self.changed.emit()
+
+    def _add_col(self):
+        c = self._tbl.columnCount()
+        self._tbl.insertColumn(c)
+        self._tbl.setHorizontalHeaderItem(c, QTableWidgetItem(f"欄{c + 1}"))
+        self.changed.emit()
+
+    def _del_col(self):
+        c = self._tbl.currentColumn()
+        if c < 0:
+            c = self._tbl.columnCount() - 1
+        if c >= 0:
+            self._tbl.removeColumn(c); self.changed.emit()
+
+    def _rename_col(self, c):
+        cur = self._tbl.horizontalHeaderItem(c)
+        old = cur.text() if cur else f"欄{c + 1}"
+        name, ok = QInputDialog.getText(self, "欄位改名", "名稱:", text=old)
+        if ok and name.strip():
+            self._tbl.setHorizontalHeaderItem(c, QTableWidgetItem(name.strip()))
+            self.changed.emit()
+
+    def to_data(self):
+        """Serialize back to the config note dict."""
+        if self._type == "table":
+            headers = [
+                (self._tbl.horizontalHeaderItem(c).text()
+                 if self._tbl.horizontalHeaderItem(c) else f"欄{c + 1}")
+                for c in range(self._tbl.columnCount())
+            ]
+            content = []
+            for r in range(self._tbl.rowCount()):
+                content.append([
+                    (self._tbl.item(r, c).text() if self._tbl.item(r, c) else "")
+                    for c in range(self._tbl.columnCount())
+                ])
+            return {"type": "table", "headers": headers, "content": content}
+        return {"type": "text", "content": self._edit.toPlainText()}
+
+
+# ── Global search (results window with quick-nav into the editor) ──────────────
+
+class GlobalSearchDialog(QDialog):
+    """Non-modal global search: type a keyword, list every matching record across
+    all tables (master + sub); double-click a row to jump the main editor to that
+    record's matching field."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self._app = app
+        self.setWindowTitle("全域搜尋")
+        self.setStyleSheet(APP_QSS)
+        self.setWindowFlag(Qt.Window, True)
+        self.resize(760, 540)
+        self._rows = []  # [(table_name, is_sub, row_idx, col)]
+
+        v = QVBoxLayout(self); v.setContentsMargins(12, 12, 12, 12); v.setSpacing(8)
+        row = QHBoxLayout(); row.setSpacing(6)
+        self._input = QLineEdit()
+        self._input.setPlaceholderText("輸入關鍵字，搜尋所有資料表…")
+        self._input.returnPressed.connect(self._run)
+        btn = _mk_btn("搜尋", "primary"); btn.setFixedHeight(30); btn.clicked.connect(self._run)
+        row.addWidget(self._input, 1); row.addWidget(btn)
+        v.addLayout(row)
+
+        self._info = QLabel("輸入關鍵字後按 Enter")
+        self._info.setStyleSheet(f"color:{_C['txt2']}; font-size:11px; background:transparent;")
+        v.addWidget(self._info)
+
+        self._tbl = QTableWidget()
+        self._tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._tbl.setSelectionBehavior(QTableWidget.SelectRows)
+        self._tbl.setColumnCount(4)
+        self._tbl.setHorizontalHeaderLabels(["資料表", "來源", "命中欄位", "命中內容"])
+        self._tbl.verticalHeader().setVisible(False)
+        self._tbl.doubleClicked.connect(self._open)
+        v.addWidget(self._tbl, 1)
+
+        hint = QLabel("雙擊任一列 → 跳到主編輯區的該筆該欄位")
+        hint.setStyleSheet(f"color:{_C['txt3']}; font-size:10px; background:transparent;")
+        v.addWidget(hint)
+
+    def focus_input(self):
+        self._input.setFocus(); self._input.selectAll()
+
+    def _run(self):
+        q = self._input.text().strip()
+        self._tbl.setRowCount(0); self._rows = []
+        if not q:
+            self._info.setText("請輸入關鍵字"); return
+        results = self._app.manager.search_index(q)
+        ql = q.lower()
+        display = []
+        for table_name, is_sub, row_idx, matched in results:
+            for col, val in matched.items():
+                display.append((table_name, is_sub, row_idx, col, val))
+        self._tbl.setRowCount(len(display))
+        for r, (tn, is_sub, ridx, col, val) in enumerate(display):
+            cells = [tn, self._source_label(tn, is_sub, ridx), col,
+                     self._snippet(val, ql)]
+            for c, txt in enumerate(cells):
+                it = QTableWidgetItem(txt)
+                it.setToolTip(str(val) if c == 3 else txt)
+                self._tbl.setItem(r, c, it)
+            self._rows.append((tn, is_sub, ridx, col))
+        self._tbl.resizeColumnsToContents()
+        self._tbl.horizontalHeader().setStretchLastSection(True)
+        self._info.setText(
+            f"找到 {len(display)} 筆命中（{len(results)} 筆資料）" if display else "無結果")
+
+    def _source_label(self, table_name, is_sub, row_idx):
+        mgr = self._app.manager
+        try:
+            if is_sub:
+                master, sub = table_name.split(".", 1)
+                df = mgr.sub_tables.get(table_name)
+                fk = (mgr.config.get(master, {}).get("sub_tables", {})
+                      .get(sub, {}).get("foreign_key"))
+                if df is not None and fk in (df.columns if df is not None else []) \
+                        and row_idx in df.index:
+                    return str(df.at[row_idx, fk])
+            else:
+                df = mgr.tables.get(table_name)
+                pk = mgr.config.get(table_name, {}).get("primary_key")
+                if df is not None and pk in (df.columns if df is not None else []) \
+                        and row_idx in df.index:
+                    return str(df.at[row_idx, pk])
+        except Exception:
+            pass
+        return str(row_idx)
+
+    @staticmethod
+    def _snippet(val, ql, width=40):
+        s = str(val); i = s.lower().find(ql)
+        if i < 0:
+            return s[:width]
+        start = max(0, i - 12); end = min(len(s), i + len(ql) + 24)
+        return f"{'…' if start else ''}{s[start:end]}{'…' if end < len(s) else ''}"
+
+    def _open(self, index):
+        r = index.row()
+        if 0 <= r < len(self._rows):
+            tn, is_sub, ridx, col = self._rows[r]
+            self._app.navigate_to(tn, is_sub, ridx, col)
+
+
 # ── App ───────────────────────────────────────────────────────────────────────
 
 class App(QMainWindow):
@@ -3211,14 +3497,16 @@ class App(QMainWindow):
         tlo.addSpacing(14)
 
         # Util buttons
-        for text, slot in [
-            ("🔍", self._show_search),
-            ("🩺", self.open_health_check),
-            ("⚙",  self.open_config),
-            ("🕓", self._show_recent_menu),
+        for text, slot, tip in [
+            ("🔍", self._show_search,      "全域搜尋（Ctrl+F）"),
+            ("📝", self._add_note,         "新增筆記分頁"),
+            ("🩺", self.open_health_check, "資料健檢"),
+            ("⚙",  self.open_config,       "配置設定"),
+            ("🕓", self._show_recent_menu, "最近開啟"),
         ]:
             b = _mk_btn(text, "ghost")
             b.setFixedSize(36, 34)
+            b.setToolTip(tip)
             b.clicked.connect(slot)
             tlo.addWidget(b)
 
@@ -3238,6 +3526,8 @@ class App(QMainWindow):
         self._tab_widget.setObjectName("main-tabs")
         self._tab_widget.setDocumentMode(True)
         self._tab_widget.currentChanged.connect(self._on_tab_changed)
+        self._tab_widget.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
+        self._tab_widget.tabBar().customContextMenuRequested.connect(self._note_tab_menu)
         self._stack.addWidget(self._tab_widget)
 
         # ── Status strip ──
@@ -3452,6 +3742,9 @@ class App(QMainWindow):
     def save_file(self):
         if not self.manager.json_path:
             QMessageBox.warning(self, "提示", "尚未載入任何 JSON 檔案"); return
+        # notes live in config → flush widget state and persist alongside the DB
+        self._flush_notes()
+        self.manager.save_config()
         self._set_loading(True, "儲存中…")
         orig = sys.getswitchinterval()
         sys.setswitchinterval(0.001)
@@ -3569,6 +3862,7 @@ class App(QMainWindow):
             self._editors[tname] = None
             self._tab_widget.addTab(QWidget(), tname)
         self._tab_widget.blockSignals(False)
+        self._rebuild_note_tabs()
 
         if tables:
             self._show_editor()
@@ -3587,6 +3881,8 @@ class App(QMainWindow):
         if idx < 0 or idx >= self._tab_widget.count():
             return
         tname = self._tab_widget.tabText(idx)
+        if tname not in self.manager.tables:
+            return  # note tab (or other non-table page) — nothing to build
         if self._editors.get(tname) is not None:
             return
         editor = TableEditor(tname, self.manager)
@@ -3620,27 +3916,183 @@ class App(QMainWindow):
         menu.exec(self.mapToGlobal(self.rect().topLeft()))
 
     def _show_search(self):
-        query, ok = QInputDialog.getText(self, "搜尋", "搜尋所有資料表:")
-        if not ok or not query.strip(): return
-        results = self.manager.search_index(query.strip())
-        if not results:
-            self.show_snackbar("無結果"); return
-        tname, is_sub, row_idx, _cols = results[0]
-        if is_sub: return
+        if not self.manager.json_path:
+            self.show_snackbar("尚未載入任何 JSON 檔案"); return
+        dlg = getattr(self, "_search_dlg", None)
+        if dlg is None:
+            dlg = GlobalSearchDialog(self)
+            dlg.finished.connect(lambda *_: setattr(self, "_search_dlg", None))
+            self._search_dlg = dlg
+            dlg.show()
+        else:
+            dlg.raise_(); dlg.activateWindow()
+        dlg.focus_input()
+
+    def navigate_to(self, table_name, is_sub, row_idx, col=None):
+        """Jump the main editor to a record (and field). Shared by global-search
+        results and the compare view. Sub-table hits open the parent master record
+        and switch to the matching sub-table tab."""
+        master_table, sub_tab, sub_df = table_name, None, None
+        if is_sub:
+            if "." not in table_name:
+                return
+            master_table, sub_tab = table_name.split(".", 1)
+            sub_df = self.manager.sub_tables.get(table_name)
+            if sub_df is None or row_idx not in sub_df.index:
+                return
+        if master_table not in self.manager.tables:
+            return
+        # activate the master tab (build its editor lazily)
         for i in range(self._tab_widget.count()):
-            if self._tab_widget.tabText(i) == tname:
+            if self._tab_widget.tabText(i) == master_table:
                 self._tab_widget.setCurrentIndex(i)
                 self._ensure_editor(i)
-                editor = self._editors.get(tname)
-                if editor:
-                    df      = self.manager.tables[tname]
-                    cls_val = df.at[row_idx, editor.cls_key]
-                    editor.current_cls_val = cls_val
-                    editor._load_cls_list()
-                    editor._load_item_list()
-                    editor._load_editor(row_idx)
                 break
-        self.show_snackbar(f"找到 {len(results)} 筆結果 (已跳至第一筆)")
+        else:
+            return
+        editor = self._editors.get(master_table)
+        mdf = self.manager.tables.get(master_table)
+        if editor is None or mdf is None:
+            return
+        if is_sub:
+            fk_key = (self.manager.config.get(master_table, {})
+                      .get("sub_tables", {}).get(sub_tab, {})
+                      .get("foreign_key") or editor.pk_key)
+            if fk_key not in sub_df.columns or fk_key not in mdf.columns:
+                return
+            fk_val = str(sub_df.at[row_idx, fk_key])
+            m = mdf.index[mdf[fk_key].astype(str) == fk_val]
+            if not len(m):
+                return
+            master_idx = m[0]
+        else:
+            if row_idx not in mdf.index:
+                return
+            master_idx = row_idx
+        editor.current_cls_val = mdf.at[master_idx, editor.cls_key]
+        editor._load_cls_list()
+        editor._load_item_list()
+        editor._load_editor(master_idx)
+        if is_sub and sub_tab:
+            editor.focus_sub(sub_tab, row_idx, col)
+        elif col:
+            editor.focus_master_field(col)
+        self.raise_(); self.activateWindow()
+
+    # ── Notes (text / table pages persisted in config, saved with the DB) ───────
+    def _notes_cfg(self):
+        """Mutable note list stored in the current file's config (reserved key)."""
+        notes = self.manager.config.get("__notes__")
+        if not isinstance(notes, list):
+            notes = []
+            self.manager.config["__notes__"] = notes
+        return notes
+
+    def _rebuild_note_tabs(self):
+        """Drop existing note tabs and rebuild them from config. Callers that may
+        have unsaved edits in live note widgets must _flush_notes() first."""
+        for i in range(self._tab_widget.count() - 1, -1, -1):
+            w = self._tab_widget.widget(i)
+            if isinstance(w, NotePage):
+                self._tab_widget.removeTab(i)
+                w.deleteLater()
+        if not self.manager.json_path:
+            return
+        for note in self._notes_cfg():
+            page = NotePage(note)
+            page.changed.connect(self._on_note_changed)
+            self._tab_widget.addTab(page, "📝 " + (note.get("name") or "筆記"))
+
+    def _on_note_changed(self):
+        self.manager.dirty = True
+        self._update_sync()
+
+    def _add_note(self):
+        if not self.manager.json_path:
+            self.show_snackbar("尚未載入任何 JSON 檔案"); return
+        name, ok = QInputDialog.getText(self, "新增筆記", "分頁名稱:")
+        if not ok or not name.strip():
+            return
+        kind, ok2 = QInputDialog.getItem(
+            self, "新增筆記", "型態:", ["純文字", "表格"], 0, False)
+        if not ok2:
+            return
+        note = ({"name": name.strip(), "type": "text", "content": ""}
+                if kind == "純文字" else
+                {"name": name.strip(), "type": "table",
+                 "headers": ["欄1", "欄2"], "content": [["", ""], ["", ""]]})
+        self._flush_notes()            # preserve edits in existing note widgets
+        self._notes_cfg().append(note)
+        self._rebuild_note_tabs()
+        self.manager.dirty = True
+        self._update_sync()
+        for i in range(self._tab_widget.count() - 1, -1, -1):
+            if isinstance(self._tab_widget.widget(i), NotePage):
+                self._tab_widget.setCurrentIndex(i); break
+
+    def _note_tab_menu(self, pos):
+        bar = self._tab_widget.tabBar()
+        idx = bar.tabAt(pos)
+        if idx < 0 or not isinstance(self._tab_widget.widget(idx), NotePage):
+            return
+        note_pos = self._note_index_of(idx)
+        if note_pos is None:
+            return
+        m = QMenu(self)
+        m.addAction("重新命名", lambda: self._rename_note(note_pos))
+        m.addAction("刪除筆記", lambda: self._delete_note(note_pos))
+        m.exec(bar.mapToGlobal(pos))
+
+    def _note_index_of(self, tab_idx):
+        """Config-list index for a note tab, by counting NotePage tabs in order."""
+        seen = -1
+        for i in range(self._tab_widget.count()):
+            if isinstance(self._tab_widget.widget(i), NotePage):
+                seen += 1
+                if i == tab_idx:
+                    return seen
+        return None
+
+    def _rename_note(self, note_pos):
+        notes = self._notes_cfg()
+        if not (0 <= note_pos < len(notes)):
+            return
+        name, ok = QInputDialog.getText(
+            self, "重新命名", "分頁名稱:", text=notes[note_pos].get("name", ""))
+        if not (ok and name.strip()):
+            return
+        self._flush_notes()
+        notes[note_pos]["name"] = name.strip()
+        self._rebuild_note_tabs()
+        self.manager.dirty = True
+        self._update_sync()
+
+    def _delete_note(self, note_pos):
+        notes = self._notes_cfg()
+        if not (0 <= note_pos < len(notes)):
+            return
+        nm = notes[note_pos].get("name", "筆記")
+        if QMessageBox.question(self, "刪除筆記", f"確定刪除筆記「{nm}」？") \
+                != QMessageBox.Yes:
+            return
+        self._flush_notes()
+        del notes[note_pos]
+        self._rebuild_note_tabs()
+        self.manager.dirty = True
+        self._update_sync()
+
+    def _flush_notes(self):
+        """Copy live NotePage widget state back into the config note list."""
+        notes = self._notes_cfg()
+        pos = 0
+        for i in range(self._tab_widget.count()):
+            w = self._tab_widget.widget(i)
+            if isinstance(w, NotePage):
+                if pos < len(notes):
+                    data = w.to_data()
+                    data["name"] = notes[pos].get("name", "筆記")
+                    notes[pos] = data
+                pos += 1
 
     def open_config(self):
         idx = self._tab_widget.currentIndex()
