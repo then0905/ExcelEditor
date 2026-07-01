@@ -1840,10 +1840,18 @@ class CompareView(QWidget):
             self._tbl.setItem(r, 0, name)
             for ci, vv in enumerate(vals):
                 it = QTableWidgetItem(vv)
+                it.setToolTip(vv)  # 欄寬受限被截斷時，可 hover 看完整內容
                 if differ:
                     it.setBackground(QColor(234, 179, 8, 30))
                 self._tbl.setItem(r, ci + 1, it)
-        self._tbl.resizeColumnsToContents()
+        # 欄位名稱欄依內容決定寬度（設上限避免過寬）；其餘資料欄依目前視窗寬度平均分配，
+        # 這樣單一欄位內容過長也不會把整列撐爆、超出比較視窗的可視範圍。
+        hdr = self._tbl.horizontalHeader()
+        self._tbl.resizeColumnToContents(0)
+        hdr.setSectionResizeMode(0, QHeaderView.Interactive)
+        self._tbl.setColumnWidth(0, min(self._tbl.columnWidth(0), 160))
+        for c in range(1, len(headers)):
+            hdr.setSectionResizeMode(c, QHeaderView.Stretch)
 
 
 class TableEditor(QWidget):
