@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """JsonEditor Pro — PySide6 · App-quality dark UI (Spec v2)"""
 
-import sys, os, json, re
+import sys, os, json, re, uuid
 import pandas as pd
 
 from PySide6.QtWidgets import (
@@ -21,7 +21,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QAction, QColor, QKeySequence, QFont, QBrush,
     QPainter, QPen, QLinearGradient, QPainterPath,
-    QIcon, QPixmap, QFontDatabase,
+    QIcon, QPixmap, QFontDatabase, QCursor,
 )
 
 from json_data_manager import JsonDataManager
@@ -3191,31 +3191,54 @@ class WelcomeWidget(QWidget):
 # ── Notes (free-form text / table pages, saved into config with the DB) ────────
 
 class NotePage(QWidget):
-    """A single note page — either a free-form multi-line text note or an editable
-    grid. Content is flushed into config and persisted by the normal 儲存 action."""
+    """A single note page. Three kinds:
+      • text  — free-form multi-line text
+      • table — editable grid (Excel range copy/paste supported)
+      • group — holds a one-level QTabWidget of child text/table pages
+    Content is flushed into config and persisted by the normal 儲存 action."""
     changed = Signal()
 
     def __init__(self, note, parent=None):
         super().__init__(parent)
-        self._type = note.get("type", "text")
+        self._note_id = note.get("id", "")
+        self._type    = note.get("type", "text")
         v = QVBoxLayout(self)
         v.setContentsMargins(10, 8, 10, 10); v.setSpacing(8)
 
-        if self._type == "table":
+        if self._type == "group":
+            bar = QHBoxLayout(); bar.setSpacing(6)
+            b = _mk_btn("＋ 小分頁", "ghost"); b.setFixedHeight(26)
+            b.clicked.connect(self._add_child)
+            bar.addWidget(b); bar.addStretch(1)
+            tip = QLabel("右鍵小分頁標題可改名／刪除")
+            tip.setStyleSheet(f"color:{_C['txt3']}; font-size:10px; background:transparent;")
+            bar.addWidget(tip)
+            v.addLayout(bar)
+            self._inner = QTabWidget(); self._inner.setObjectName("sub-tabs")
+            self._inner.setDocumentMode(True)
+            self._inner.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
+            self._inner.tabBar().customContextMenuRequested.connect(self._inner_menu)
+            v.addWidget(self._inner, 1)
+            for child in (note.get("children") or []):
+                self._add_child_page(child)
+
+        elif self._type == "table":
             bar = QHBoxLayout(); bar.setSpacing(6)
             for txt, fn in (("＋ 列", self._add_row), ("－ 列", self._del_row),
                             ("＋ 欄", self._add_col), ("－ 欄", self._del_col)):
                 b = _mk_btn(txt, "ghost"); b.setFixedHeight(26); b.clicked.connect(fn)
                 bar.addWidget(b)
             bar.addStretch(1)
-            tip = QLabel("雙擊儲存格編輯；雙擊欄標題可改名")
+            tip = QLabel("雙擊儲存格編輯；雙擊欄標題改名；可從 Excel 複製範圍 Ctrl+V 貼上")
             tip.setStyleSheet(f"color:{_C['txt3']}; font-size:10px; background:transparent;")
             bar.addWidget(tip)
             v.addLayout(bar)
 
             content = note.get("content") or [["", ""], ["", ""]]
-            ncols   = len(content[0]) if content and content[0] else 2
+            ncols   = max((len(r) for r in content), default=2) if content else 2
             headers = note.get("headers") or [f"欄{i+1}" for i in range(ncols)]
+            if len(headers) < ncols:
+                headers += [f"欄{i+1}" for i in range(len(headers), ncols)]
             self._tbl = QTableWidget()
             self._tbl.setColumnCount(len(headers))
             self._tbl.setHorizontalHeaderLabels(headers)
@@ -3227,10 +3250,13 @@ class NotePage(QWidget):
             self._tbl.verticalHeader().setDefaultSectionSize(28)
             self._tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
             self._tbl.horizontalHeader().setStretchLastSection(True)
+            self._tbl.setSelectionMode(QAbstractItemView.ExtendedSelection)
+            self._tbl.keyPressEvent = self._table_key   # Excel-style copy/paste
             v.addWidget(self._tbl, 1)
             # connect AFTER populating so initial fill doesn't mark dirty
             self._tbl.itemChanged.connect(lambda *_: self.changed.emit())
             self._tbl.horizontalHeader().sectionDoubleClicked.connect(self._rename_col)
+
         else:
             self._edit = QPlainTextEdit()
             self._edit.setPlainText(note.get("content", "") or "")
@@ -3273,8 +3299,111 @@ class NotePage(QWidget):
             self._tbl.setHorizontalHeaderItem(c, QTableWidgetItem(name.strip()))
             self.changed.emit()
 
+    def _table_key(self, event):
+        if event.matches(QKeySequence.Paste):
+            self._paste_clipboard()
+        elif event.matches(QKeySequence.Copy):
+            self._copy_selection()
+        else:
+            QTableWidget.keyPressEvent(self._tbl, event)
+
+    def _paste_clipboard(self):
+        """Paste an Excel range (TSV: tabs = columns, newlines = rows), auto-
+        expanding the grid so any N×M selection fits from the current cell."""
+        text = QApplication.clipboard().text()
+        if not text:
+            return
+        grid = [row.split("\t") for row in text.replace("\r\n", "\n").rstrip("\n").split("\n")]
+        if not grid:
+            return
+        r0 = max(0, self._tbl.currentRow())
+        c0 = max(0, self._tbl.currentColumn())
+        need_r = r0 + len(grid)
+        need_c = c0 + max(len(row) for row in grid)
+        if self._tbl.rowCount() < need_r:
+            self._tbl.setRowCount(need_r)
+        if self._tbl.columnCount() < need_c:
+            old = self._tbl.columnCount()
+            self._tbl.setColumnCount(need_c)
+            for c in range(old, need_c):
+                self._tbl.setHorizontalHeaderItem(c, QTableWidgetItem(f"欄{c + 1}"))
+        self._tbl.blockSignals(True)
+        for dr, row in enumerate(grid):
+            for dc, val in enumerate(row):
+                self._tbl.setItem(r0 + dr, c0 + dc, QTableWidgetItem(val))
+        self._tbl.blockSignals(False)
+        self.changed.emit()
+
+    def _copy_selection(self):
+        """Copy the selected rectangle back out as Excel-compatible TSV."""
+        ranges = self._tbl.selectedRanges()
+        if not ranges:
+            return
+        rng = ranges[0]
+        lines = []
+        for r in range(rng.topRow(), rng.bottomRow() + 1):
+            cells = []
+            for c in range(rng.leftColumn(), rng.rightColumn() + 1):
+                it = self._tbl.item(r, c)
+                cells.append(it.text() if it else "")
+            lines.append("\t".join(cells))
+        QApplication.clipboard().setText("\n".join(lines))
+
+    # ── group (inner sub-tab) operations ──
+    def _add_child_page(self, child):
+        page = NotePage(child)
+        page.changed.connect(self.changed.emit)
+        self._inner.addTab(page, child.get("name") or "小分頁")
+
+    def _add_child(self):
+        name, ok = QInputDialog.getText(self, "新增小分頁", "名稱:")
+        if not ok or not name.strip():
+            return
+        kind, ok2 = QInputDialog.getItem(
+            self, "新增小分頁", "型態:", ["純文字", "表格"], 0, False)
+        if not ok2:
+            return
+        child = ({"name": name.strip(), "type": "text", "content": ""}
+                 if kind == "純文字" else
+                 {"name": name.strip(), "type": "table",
+                  "headers": ["欄1", "欄2"], "content": [["", ""], ["", ""]]})
+        self._add_child_page(child)
+        self._inner.setCurrentIndex(self._inner.count() - 1)
+        self.changed.emit()
+
+    def _inner_menu(self, pos):
+        bar = self._inner.tabBar(); idx = bar.tabAt(pos)
+        if idx < 0:
+            return
+        m = QMenu(self)
+        m.addAction("重新命名", lambda: self._rename_child(idx))
+        m.addAction("刪除", lambda: self._del_child(idx))
+        m.exec(bar.mapToGlobal(pos))
+
+    def _rename_child(self, idx):
+        name, ok = QInputDialog.getText(
+            self, "重新命名", "名稱:", text=self._inner.tabText(idx))
+        if ok and name.strip():
+            self._inner.setTabText(idx, name.strip()); self.changed.emit()
+
+    def _del_child(self, idx):
+        w = self._inner.widget(idx)
+        self._inner.removeTab(idx)
+        if w is not None:
+            w.deleteLater()
+        self.changed.emit()
+
     def to_data(self):
-        """Serialize back to the config note dict."""
+        """Serialize back to the config note dict (type-specific payload)."""
+        if self._type == "group":
+            children = []
+            for i in range(self._inner.count()):
+                w = self._inner.widget(i)
+                if isinstance(w, NotePage):
+                    d = w.to_data()
+                    d["name"] = self._inner.tabText(i)
+                    children.append(d)
+            return {"type": "group", "children": children}
         if self._type == "table":
             headers = [
                 (self._tbl.horizontalHeaderItem(c).text()
@@ -3407,6 +3536,7 @@ class App(QMainWindow):
         self.setMinimumSize(900, 600)
         self.manager         = JsonDataManager()
         self._editors:       dict[str, TableEditor | None] = {}
+        self._note_floats:   dict[str, dict] = {}   # note id → {win, page}
         self._active_worker  = None
         self._snackbar_timer = QTimer(self)
         self._snackbar_timer.setSingleShot(True)
@@ -3499,7 +3629,7 @@ class App(QMainWindow):
         # Util buttons
         for text, slot, tip in [
             ("🔍", self._show_search,      "全域搜尋（Ctrl+F）"),
-            ("📝", self._add_note,         "新增筆記分頁"),
+            ("📝", self._note_menu,        "筆記：新增／重新開啟已關閉"),
             ("🩺", self.open_health_check, "資料健檢"),
             ("⚙",  self.open_config,       "配置設定"),
             ("🕓", self._show_recent_menu, "最近開啟"),
@@ -3854,6 +3984,7 @@ class App(QMainWindow):
 
     def _refresh_ui(self):
         _cat_assign.clear()  # Reset category color assignments for new file
+        self._close_all_note_floats()   # drop any floats from the previous file
         self._tab_widget.blockSignals(True)
         self._tab_widget.clear()
         self._editors.clear()
@@ -3979,18 +4110,55 @@ class App(QMainWindow):
             editor.focus_master_field(col)
         self.raise_(); self.activateWindow()
 
-    # ── Notes (text / table pages persisted in config, saved with the DB) ───────
+    # ── Notes (text / table / group pages persisted in config, saved w/ the DB) ─
+    # Notes are tracked by a stable id so float-out / close / reopen stay robust.
     def _notes_cfg(self):
-        """Mutable note list stored in the current file's config (reserved key)."""
+        """Mutable note list stored in the current file's config (reserved key).
+        Also migrates older notes so each has a stable id and an open flag."""
         notes = self.manager.config.get("__notes__")
         if not isinstance(notes, list):
             notes = []
             self.manager.config["__notes__"] = notes
+        for n in notes:
+            if isinstance(n, dict):
+                n.setdefault("id", uuid.uuid4().hex)
+                n.setdefault("open", True)
         return notes
 
+    def _note_by_id(self, nid):
+        for n in self._notes_cfg():
+            if n.get("id") == nid:
+                return n
+        return None
+
+    def _live_note_pages(self):
+        """Every live NotePage — docked tabs plus floated windows."""
+        pages = []
+        for i in range(self._tab_widget.count()):
+            w = self._tab_widget.widget(i)
+            if isinstance(w, NotePage):
+                pages.append(w)
+        for entry in self._note_floats.values():
+            if isinstance(entry.get("page"), NotePage):
+                pages.append(entry["page"])
+        return pages
+
+    def _flush_notes(self):
+        """Copy live NotePage widget state back into its config note (by id)."""
+        for page in self._live_note_pages():
+            note = self._note_by_id(page._note_id)
+            if note is None:
+                continue
+            data = page.to_data()
+            data["id"]   = note["id"]
+            data["name"] = note.get("name", "筆記")
+            data["open"] = note.get("open", True)
+            note.clear(); note.update(data)
+
     def _rebuild_note_tabs(self):
-        """Drop existing note tabs and rebuild them from config. Callers that may
-        have unsaved edits in live note widgets must _flush_notes() first."""
+        """Rebuild docked note tabs from config. Flushes live widgets first so no
+        in-progress edits are lost, then recreates open, non-floated notes."""
+        self._flush_notes()
         for i in range(self._tab_widget.count() - 1, -1, -1):
             w = self._tab_widget.widget(i)
             if isinstance(w, NotePage):
@@ -3998,7 +4166,10 @@ class App(QMainWindow):
                 w.deleteLater()
         if not self.manager.json_path:
             return
+        floated = set(self._note_floats.keys())
         for note in self._notes_cfg():
+            if not note.get("open", True) or note.get("id") in floated:
+                continue
             page = NotePage(note)
             page.changed.connect(self._on_note_changed)
             self._tab_widget.addTab(page, "📝 " + (note.get("name") or "筆記"))
@@ -4007,6 +4178,27 @@ class App(QMainWindow):
         self.manager.dirty = True
         self._update_sync()
 
+    def _select_note_tab(self, nid):
+        for i in range(self._tab_widget.count() - 1, -1, -1):
+            w = self._tab_widget.widget(i)
+            if isinstance(w, NotePage) and w._note_id == nid:
+                self._tab_widget.setCurrentIndex(i); return
+
+    def _note_menu(self):
+        """📝 top-bar button: add a note, or reopen a previously-closed one."""
+        if not self.manager.json_path:
+            self.show_snackbar("尚未載入任何 JSON 檔案"); return
+        m = QMenu(self)
+        m.addAction("新增筆記…", self._add_note)
+        closed = [n for n in self._notes_cfg() if not n.get("open", True)]
+        if closed:
+            m.addSeparator()
+            sub = m.addMenu("重新開啟已關閉")
+            for n in closed:
+                sub.addAction(n.get("name") or "筆記",
+                              lambda _=False, nid=n["id"]: self._reopen_note(nid))
+        m.exec(QCursor.pos())
+
     def _add_note(self):
         if not self.manager.json_path:
             self.show_snackbar("尚未載入任何 JSON 檔案"); return
@@ -4014,85 +4206,141 @@ class App(QMainWindow):
         if not ok or not name.strip():
             return
         kind, ok2 = QInputDialog.getItem(
-            self, "新增筆記", "型態:", ["純文字", "表格"], 0, False)
+            self, "新增筆記", "型態:", ["純文字", "表格", "群組（可放小分頁）"], 0, False)
         if not ok2:
             return
-        note = ({"name": name.strip(), "type": "text", "content": ""}
-                if kind == "純文字" else
-                {"name": name.strip(), "type": "table",
-                 "headers": ["欄1", "欄2"], "content": [["", ""], ["", ""]]})
-        self._flush_notes()            # preserve edits in existing note widgets
+        nid = uuid.uuid4().hex
+        if kind == "純文字":
+            note = {"id": nid, "name": name.strip(), "type": "text",
+                    "content": "", "open": True}
+        elif kind == "表格":
+            note = {"id": nid, "name": name.strip(), "type": "table",
+                    "headers": ["欄1", "欄2"], "content": [["", ""], ["", ""]],
+                    "open": True}
+        else:
+            note = {"id": nid, "name": name.strip(), "type": "group",
+                    "children": [], "open": True}
         self._notes_cfg().append(note)
         self._rebuild_note_tabs()
         self.manager.dirty = True
         self._update_sync()
-        for i in range(self._tab_widget.count() - 1, -1, -1):
-            if isinstance(self._tab_widget.widget(i), NotePage):
-                self._tab_widget.setCurrentIndex(i); break
+        self._select_note_tab(nid)
 
     def _note_tab_menu(self, pos):
         bar = self._tab_widget.tabBar()
         idx = bar.tabAt(pos)
-        if idx < 0 or not isinstance(self._tab_widget.widget(idx), NotePage):
+        w = self._tab_widget.widget(idx) if idx >= 0 else None
+        if not isinstance(w, NotePage):
             return
-        note_pos = self._note_index_of(idx)
-        if note_pos is None:
-            return
+        nid = w._note_id
         m = QMenu(self)
-        m.addAction("重新命名", lambda: self._rename_note(note_pos))
-        m.addAction("刪除筆記", lambda: self._delete_note(note_pos))
+        m.addAction("浮出視窗", lambda: self._float_note(nid))
+        m.addAction("重新命名", lambda: self._rename_note(nid))
+        m.addAction("關閉分頁", lambda: self._close_note(nid))
+        m.addSeparator()
+        m.addAction("刪除筆記", lambda: self._delete_note(nid))
         m.exec(bar.mapToGlobal(pos))
 
-    def _note_index_of(self, tab_idx):
-        """Config-list index for a note tab, by counting NotePage tabs in order."""
-        seen = -1
-        for i in range(self._tab_widget.count()):
-            if isinstance(self._tab_widget.widget(i), NotePage):
-                seen += 1
-                if i == tab_idx:
-                    return seen
-        return None
-
-    def _rename_note(self, note_pos):
-        notes = self._notes_cfg()
-        if not (0 <= note_pos < len(notes)):
+    def _rename_note(self, nid):
+        note = self._note_by_id(nid)
+        if note is None:
             return
         name, ok = QInputDialog.getText(
-            self, "重新命名", "分頁名稱:", text=notes[note_pos].get("name", ""))
+            self, "重新命名", "分頁名稱:", text=note.get("name", ""))
         if not (ok and name.strip()):
             return
-        self._flush_notes()
-        notes[note_pos]["name"] = name.strip()
+        note["name"] = name.strip()
+        if nid in self._note_floats:
+            self._note_floats[nid]["win"].setWindowTitle("筆記 — " + name.strip())
         self._rebuild_note_tabs()
         self.manager.dirty = True
         self._update_sync()
 
-    def _delete_note(self, note_pos):
+    def _delete_note(self, nid):
+        note = self._note_by_id(nid)
+        if note is None:
+            return
+        if QMessageBox.question(
+                self, "刪除筆記",
+                f"確定刪除筆記「{note.get('name', '筆記')}」？") != QMessageBox.Yes:
+            return
+        if nid in self._note_floats:
+            entry = self._note_floats.pop(nid)
+            entry["page"].deleteLater()
+            entry["win"].blockSignals(True); entry["win"].deleteLater()
         notes = self._notes_cfg()
-        if not (0 <= note_pos < len(notes)):
-            return
-        nm = notes[note_pos].get("name", "筆記")
-        if QMessageBox.question(self, "刪除筆記", f"確定刪除筆記「{nm}」？") \
-                != QMessageBox.Yes:
-            return
-        self._flush_notes()
-        del notes[note_pos]
+        for i, n in enumerate(notes):
+            if n.get("id") == nid:
+                del notes[i]; break
         self._rebuild_note_tabs()
         self.manager.dirty = True
         self._update_sync()
 
-    def _flush_notes(self):
-        """Copy live NotePage widget state back into the config note list."""
-        notes = self._notes_cfg()
-        pos = 0
-        for i in range(self._tab_widget.count()):
-            w = self._tab_widget.widget(i)
-            if isinstance(w, NotePage):
-                if pos < len(notes):
-                    data = w.to_data()
-                    data["name"] = notes[pos].get("name", "筆記")
-                    notes[pos] = data
-                pos += 1
+    def _close_note(self, nid):
+        note = self._note_by_id(nid)
+        if note is None:
+            return
+        if nid in self._note_floats:
+            self._dock_note(nid)   # dock back first (also flushes)
+        note["open"] = False
+        self._rebuild_note_tabs()
+        self.manager.dirty = True
+        self._update_sync()
+
+    def _reopen_note(self, nid):
+        note = self._note_by_id(nid)
+        if note is None:
+            return
+        note["open"] = True
+        self._rebuild_note_tabs()
+        self.manager.dirty = True
+        self._update_sync()
+        self._select_note_tab(nid)
+
+    def _float_note(self, nid):
+        note = self._note_by_id(nid)
+        if note is None or nid in self._note_floats:
+            return
+        self._flush_notes()
+        page = NotePage(note)
+        page.changed.connect(self._on_note_changed)
+        win = QDialog(self)
+        win.setWindowTitle("筆記 — " + (note.get("name") or ""))
+        win.setStyleSheet(APP_QSS)
+        win.resize(660, 540)
+        lo = QVBoxLayout(win); lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(0)
+        barw = QWidget(); barw.setStyleSheet("background:transparent;")
+        bl = QHBoxLayout(barw); bl.setContentsMargins(8, 6, 8, 0)
+        dock = _mk_btn("⤡ 收回分頁", "ghost"); dock.setFixedHeight(26)
+        dock.clicked.connect(lambda: self._dock_note(nid))
+        bl.addStretch(1); bl.addWidget(dock)
+        lo.addWidget(barw); lo.addWidget(page, 1)
+        win.finished.connect(lambda *_: self._dock_note(nid))
+        self._note_floats[nid] = {"win": win, "page": page}
+        self._rebuild_note_tabs()   # drop its docked tab
+        win.show()
+
+    def _dock_note(self, nid):
+        entry = self._note_floats.get(nid)
+        if entry is None:
+            return
+        self._flush_notes()               # capture edits from the floated widget
+        del self._note_floats[nid]        # guard against re-entrancy via finished
+        entry["page"].deleteLater()
+        entry["win"].blockSignals(True); entry["win"].deleteLater()
+        self._rebuild_note_tabs()
+
+    def _close_all_note_floats(self):
+        """Tear down floating note windows (e.g. on switching data files)."""
+        entries = list(self._note_floats.values())
+        self._note_floats.clear()
+        for entry in entries:
+            try:
+                entry["page"].deleteLater()
+                entry["win"].blockSignals(True); entry["win"].close()
+                entry["win"].deleteLater()
+            except Exception:
+                pass
 
     def open_config(self):
         idx = self._tab_widget.currentIndex()
