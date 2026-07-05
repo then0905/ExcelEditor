@@ -5,7 +5,7 @@ import sys, os, json, re, uuid
 import pandas as pd
 
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QSplitter, QTabWidget,
+    QApplication, QMainWindow, QWidget, QSplitter, QTabWidget, QTabBar,
     QListWidget, QListWidgetItem, QLineEdit, QPushButton, QLabel,
     QVBoxLayout, QHBoxLayout, QScrollArea, QCheckBox, QComboBox,
     QTextEdit, QTableView, QHeaderView, QAbstractItemView,
@@ -1414,6 +1414,21 @@ class FieldEditorWidget(QWidget):
                      f"background: rgba(99,102,241,0.20); border-radius: 3px;")
             lbl.setStyleSheet(flash)
             QTimer.singleShot(900, lambda l=lbl, b=base: l.setStyleSheet(b))
+
+    def refresh_ref_labels(self):
+        """Re-resolve every text_ref display label from its current field value.
+        Used when a referenced external text table was saved."""
+        if not self._built:
+            return
+        for col, lbl in self._ref_labels.items():
+            w = self._widgets.get(col)
+            if w is None:
+                continue
+            try:
+                val = w.toPlainText()
+            except Exception:
+                val = ""
+            self._update_ref_label(col, lbl, val)
 
     # ── Validation ────────────────────────────────────────────────────────────
 
@@ -2954,6 +2969,19 @@ class TableEditor(QWidget):
         if panel is not None:
             panel.select_by_df_index(df_idx, col)
 
+    def refresh_ref_display(self):
+        """Re-resolve external text_ref display (field labels + compare view)
+        after a referenced text table changed. Item-list names refresh on the
+        next reselect."""
+        if self._field_panel is not None:
+            self._field_panel.refresh_ref_labels()
+        cv = getattr(self, "_compare_view", None)
+        if cv is not None:
+            try:
+                cv.refresh()
+            except Exception:
+                pass
+
     def _fit_right_panel(self):
         """Make the right panel's min width track what the sub-table toolbar
         actually needs, so its buttons never get squeezed (hardcoded → adaptive)."""
@@ -3528,15 +3556,33 @@ class GlobalSearchDialog(QDialog):
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
+class _Doc:
+    """One open JSON file: its own data manager, tables/notes tab widget, lazily
+    built table editors, and floating note windows."""
+    __slots__ = ("manager", "tab_widget", "editors", "note_floats")
+
+    def __init__(self, manager, tab_widget):
+        self.manager = manager
+        self.tab_widget = tab_widget
+        self.editors: dict[str, "TableEditor | None"] = {}
+        self.note_floats: dict[str, dict] = {}
+
+
 class App(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("JsonEditor")
         self.resize(1280, 800)
         self.setMinimumSize(900, 600)
-        self.manager         = JsonDataManager()
-        self._editors:       dict[str, TableEditor | None] = {}
-        self._note_floats:   dict[str, dict] = {}   # note id → {win, page}
+        # Multi-document: each open file is a _Doc (own manager + tab widget +
+        # editors + note floats). A "boot" manager holds shared config / recent /
+        # ref-cache and acts as the fallback when no file is open.
+        self._boot_mgr       = JsonDataManager()
+        self._shared         = self._boot_mgr.shared_state()
+        self._docs:          list["_Doc"] = []
+        self._active         = -1
+        self._empty_editors  = {}
+        self._empty_floats   = {}
         self._active_worker  = None
         self._snackbar_timer = QTimer(self)
         self._snackbar_timer.setSingleShot(True)
@@ -3547,10 +3593,39 @@ class App(QMainWindow):
         # Keyboard shortcuts
         self.addAction(QAction(parent=self, shortcut=QKeySequence("Ctrl+S"), triggered=self.save_file))
         self.addAction(QAction(parent=self, shortcut=QKeySequence("Ctrl+O"), triggered=self.load_file))
+        self.addAction(QAction(parent=self, shortcut=QKeySequence("Ctrl+W"), triggered=self._close_active_doc))
         self.addAction(QAction(parent=self, shortcut=QKeySequence("Ctrl+F"), triggered=self._show_search))
 
         self._show_welcome()
         self._update_sync()
+
+    # ── Active-document accessors (most methods operate on the active doc) ──────
+    @property
+    def manager(self):
+        if 0 <= self._active < len(self._docs):
+            return self._docs[self._active].manager
+        return self._boot_mgr
+
+    @property
+    def _tab_widget(self):
+        if 0 <= self._active < len(self._docs):
+            return self._docs[self._active].tab_widget
+        return self._empty_tabs
+
+    @property
+    def _editors(self):
+        if 0 <= self._active < len(self._docs):
+            return self._docs[self._active].editors
+        return self._empty_editors
+
+    @property
+    def _note_floats(self):
+        if 0 <= self._active < len(self._docs):
+            return self._docs[self._active].note_floats
+        return self._empty_floats
+
+    def _active_doc(self):
+        return self._docs[self._active] if 0 <= self._active < len(self._docs) else None
 
     # ── Content layout ────────────────────────────────────────────────────────
 
@@ -3642,23 +3717,40 @@ class App(QMainWindow):
 
         clo.addWidget(topbar)
 
-        # ── Stack ──
+        # ── Stack: welcome  ↔  documents page ──
         self._stack = QStackedWidget()
         clo.addWidget(self._stack, 1)
 
-        self._welcome = WelcomeWidget(self.manager)
+        self._welcome = WelcomeWidget(self._boot_mgr)
         self._welcome.open_file.connect(self.load_file)
         self._welcome.new_file.connect(self._new_file)
         self._welcome.open_recent.connect(self._load_recent)
         self._stack.addWidget(self._welcome)
 
-        self._tab_widget = QTabWidget()
-        self._tab_widget.setObjectName("main-tabs")
-        self._tab_widget.setDocumentMode(True)
-        self._tab_widget.currentChanged.connect(self._on_tab_changed)
-        self._tab_widget.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
-        self._tab_widget.tabBar().customContextMenuRequested.connect(self._note_tab_menu)
-        self._stack.addWidget(self._tab_widget)
+        # documents page = file tab bar (one tab per open json) + a stack of the
+        # per-file table/note tab widgets
+        docs_page = QWidget(); docs_page.setStyleSheet("background:transparent;")
+        dpl = QVBoxLayout(docs_page); dpl.setContentsMargins(0, 0, 0, 0); dpl.setSpacing(0)
+        file_row = QWidget()
+        file_row.setStyleSheet(f"background:{_C['bg']}; border-bottom:1px solid {_C['border']};")
+        frl = QHBoxLayout(file_row); frl.setContentsMargins(6, 4, 6, 0); frl.setSpacing(6)
+        self._file_bar = QTabBar()
+        self._file_bar.setExpanding(False)
+        self._file_bar.setTabsClosable(True)
+        self._file_bar.setMovable(False)   # keep index aligned with _docs/_doc_stack
+        self._file_bar.setDrawBase(False)
+        self._file_bar.currentChanged.connect(self._switch_doc)
+        self._file_bar.tabCloseRequested.connect(self._close_doc)
+        add_btn = _mk_btn("＋ 開檔", "ghost"); add_btn.setFixedHeight(26)
+        add_btn.setToolTip("開啟另一個 JSON（多開）")
+        add_btn.clicked.connect(self.load_file)
+        frl.addWidget(self._file_bar, 1); frl.addWidget(add_btn)
+        dpl.addWidget(file_row)
+        self._doc_stack = QStackedWidget()
+        dpl.addWidget(self._doc_stack, 1)
+        self._stack.addWidget(docs_page)
+        self._docs_page = docs_page
+        self._empty_tabs = QTabWidget()   # harmless fallback when no doc is active
 
         # ── Status strip ──
         status_bar = QWidget()
@@ -3686,7 +3778,7 @@ class App(QMainWindow):
         self._stack.setCurrentWidget(self._welcome)
 
     def _show_editor(self):
-        self._stack.setCurrentWidget(self._tab_widget)
+        self._stack.setCurrentWidget(self._docs_page)
 
     # ── Sync / status ─────────────────────────────────────────────────────────
 
@@ -3715,6 +3807,10 @@ class App(QMainWindow):
         else:
             self.setWindowTitle("JsonEditor")
             self._path_lbl.setText("")
+        # reflect dirty state on the active file tab
+        if 0 <= self._active < len(self._docs) and hasattr(self, "_file_bar"):
+            fname = os.path.basename(self.manager.json_path or "未命名")
+            self._file_bar.setTabText(self._active, fname + (" *" if dirty else ""))
 
     def show_snackbar(self, text: str, duration_ms: int = 3000, color: str = ""):
         self._status_lbl.setText(text)
@@ -3766,25 +3862,33 @@ class App(QMainWindow):
     def _load_recent(self, path):
         if not os.path.exists(path):
             QMessageBox.warning(self, "錯誤", f"找不到檔案：\n{path}")
-            self.manager._recent_files = [p for p in self.manager._recent_files if p != path]
+            rf = self.manager._recent_files
+            rf[:] = [p for p in rf if p != path]   # in place (shared list)
             self.manager.save_config()
             return
         self._load_path(path)
 
     def _load_path(self, path):
+        # already open → just switch to that file tab
+        norm = os.path.normpath(path)
+        for i, d in enumerate(self._docs):
+            if d.manager.json_path and os.path.normpath(d.manager.json_path) == norm:
+                self._file_bar.setCurrentIndex(i)
+                return
+        mgr = JsonDataManager(shared=self._shared)
         self._set_loading(True, f"載入 {os.path.basename(path)}…")
         orig = sys.getswitchinterval()
         sys.setswitchinterval(0.001)
-        worker = _LoadWorker(self.manager, path)
+        worker = _LoadWorker(mgr, path)
         self._active_worker = worker
 
         def _done():
             sys.setswitchinterval(orig)
             self._active_worker = None
             self._set_loading(False)
-            self._refresh_ui()
-            self.manager._full_config["_last_file"] = path
-            self.manager.save_config()
+            self._add_document(mgr)       # new tab widget + file tab, made active
+            mgr._full_config["_last_file"] = path
+            mgr.save_config()
             self._check_config_paths()
 
         def _err(msg):
@@ -3796,6 +3900,70 @@ class App(QMainWindow):
         worker.done.connect(_done)
         worker.error.connect(_err)
         worker.start()
+
+    # ── Multi-document management ───────────────────────────────────────────────
+    def _add_document(self, manager):
+        tabw = QTabWidget()
+        tabw.setObjectName("main-tabs")
+        tabw.setDocumentMode(True)
+        tabw.currentChanged.connect(self._on_tab_changed)
+        tabw.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
+        tabw.tabBar().customContextMenuRequested.connect(self._note_tab_menu)
+        self._docs.append(_Doc(manager, tabw))
+        self._doc_stack.addWidget(tabw)
+        fname = os.path.basename(manager.json_path or "未命名")
+        self._file_bar.blockSignals(True)
+        fi = self._file_bar.addTab(fname)
+        self._file_bar.setTabToolTip(fi, manager.json_path or "")
+        self._file_bar.setCurrentIndex(fi)
+        self._file_bar.blockSignals(False)
+        self._active = len(self._docs) - 1
+        self._doc_stack.setCurrentWidget(tabw)
+        self._refresh_ui()            # build this doc's table/note tabs
+
+    def _switch_doc(self, i):
+        if not (0 <= i < len(self._docs)):
+            return
+        self._active = i
+        self._doc_stack.setCurrentWidget(self._docs[i].tab_widget)
+        self._show_editor()
+        self._ensure_editor(self._tab_widget.currentIndex())
+        self._update_sync()
+
+    def _close_active_doc(self):
+        if self._docs:
+            self._close_doc(self._active)
+
+    def _close_doc(self, i):
+        if not (0 <= i < len(self._docs)):
+            return
+        doc = self._docs[i]
+        if doc.manager.dirty:
+            nm = os.path.basename(doc.manager.json_path or "未命名")
+            if QMessageBox.question(
+                    self, "關閉檔案", f"「{nm}」有未儲存變更，仍要關閉？",
+                    QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+                return
+        self._active = i                    # so _close_all_note_floats targets it
+        self._close_all_note_floats()
+        self._doc_stack.removeWidget(doc.tab_widget)
+        doc.tab_widget.deleteLater()
+        del self._docs[i]
+        self._file_bar.blockSignals(True)
+        self._file_bar.removeTab(i)
+        self._file_bar.blockSignals(False)
+        if not self._docs:
+            self._active = -1
+            self._welcome.refresh(self._boot_mgr)
+            self._show_welcome()
+            self._update_sync()
+            return
+        new_i = min(i, len(self._docs) - 1)
+        self._active = -1                   # force _switch_doc to re-apply
+        self._file_bar.blockSignals(True)
+        self._file_bar.setCurrentIndex(new_i)
+        self._file_bar.blockSignals(False)
+        self._switch_doc(new_i)
 
     # ── Config path validation (offer to re-pick stale external paths) ──────────
     def _store_path(self, p, base):
@@ -3881,10 +4049,16 @@ class App(QMainWindow):
         worker = _SaveWorker(self.manager)
         self._active_worker = worker
 
+        saved_path = self.manager.json_path
+
         def _done():
             sys.setswitchinterval(orig)
             self._active_worker = None
             self._set_loading(False)
+            # the file just saved may be another file's external text table →
+            # drop its cached rows and re-resolve references in every open doc
+            self.manager.invalidate_ref_cache(saved_path)
+            self._refresh_all_ref_displays()
             self.show_snackbar("✓ 已儲存", color=_C["green"])
             self._update_sync()
 
@@ -3897,6 +4071,17 @@ class App(QMainWindow):
         worker.done.connect(_done)
         worker.error.connect(_err)
         worker.start()
+
+    def _refresh_all_ref_displays(self):
+        """Re-resolve text_ref display across every open document (after an
+        external text table was saved and its cache was invalidated)."""
+        for doc in self._docs:
+            for ed in doc.editors.values():
+                if ed is not None:
+                    try:
+                        ed.refresh_ref_display()
+                    except Exception:
+                        pass
 
     # ── Export to Excel ───────────────────────────────────────────────────────
 
@@ -3983,25 +4168,21 @@ class App(QMainWindow):
     # ── UI refresh ────────────────────────────────────────────────────────────
 
     def _refresh_ui(self):
-        _cat_assign.clear()  # Reset category color assignments for new file
-        self._close_all_note_floats()   # drop any floats from the previous file
-        self._tab_widget.blockSignals(True)
-        self._tab_widget.clear()
+        # (category colors accumulate across open files so they stay consistent)
+        self._close_all_note_floats()   # drop any floats from the previous build
+        tabw = self._tab_widget
+        tabw.blockSignals(True)
+        tabw.clear()
         self._editors.clear()
         tables = list(self.manager.tables.keys())
         for tname in tables:
             self._editors[tname] = None
-            self._tab_widget.addTab(QWidget(), tname)
-        self._tab_widget.blockSignals(False)
+            tabw.addTab(QWidget(), tname)
+        tabw.blockSignals(False)
         self._rebuild_note_tabs()
-
+        self._show_editor()
         if tables:
-            self._show_editor()
             QTimer.singleShot(0, lambda: self._ensure_editor(0))
-        else:
-            self._welcome.refresh(self.manager)
-            self._show_welcome()
-
         self._update_sync()
         self.show_snackbar(f"已載入 {len(tables)} 個資料表")
 
@@ -4040,7 +4221,7 @@ class App(QMainWindow):
                            lambda p=path: self._load_recent(p))
         menu.addSeparator()
         menu.addAction("清除記錄", lambda: (
-            setattr(self.manager, "_recent_files", []),
+            self.manager._recent_files.clear(),
             self.manager.save_config(),
             self.show_snackbar("已清除最近記錄"),
         ))
@@ -4910,15 +5091,27 @@ class App(QMainWindow):
     # ── Window close ──────────────────────────────────────────────────────────
 
     def closeEvent(self, event):
-        if self.manager.dirty:
+        dirty = [d for d in self._docs if d.manager.dirty]
+        if dirty:
+            names = "、".join(
+                os.path.basename(d.manager.json_path or "未命名") for d in dirty)
             ans = QMessageBox.question(
-                self, "未儲存變更", "有未儲存的變更，是否儲存？",
+                self, "未儲存變更", f"有未儲存的變更（{names}），是否全部儲存？",
                 QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel
             )
             if ans == QMessageBox.Cancel:
                 event.ignore(); return
             if ans == QMessageBox.Save:
-                self.save_file()
+                for i, d in enumerate(self._docs):
+                    if not d.manager.dirty:
+                        continue
+                    self._active = i            # so _flush_notes targets this doc
+                    self._flush_notes()
+                    try:
+                        d.manager.save_config()
+                        d.manager.save_json()   # synchronous save on shutdown
+                    except Exception:
+                        pass
         event.accept()
 
 

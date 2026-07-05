@@ -9,9 +9,21 @@ warnings.filterwarnings("ignore")
 
 
 class JsonDataManager:
-    def __init__(self, config_path="config.json"):
+    def __init__(self, config_path="config.json", shared=None):
+        # `shared` lets several managers (one per open file, for multi-document
+        # mode) share config, recent-file list and the external-text-ref cache so
+        # editing one file's text table refreshes references in the others.
         self.config_path = config_path
-        self._full_config = self._load_config(config_path)
+        if shared is None:
+            self._full_config = self._load_config(config_path)
+            self._recent_files = self._full_config.get("_recent_files", [])
+            self._ref_cache    = {}   # {norm_abs_path: [list of row dicts]}
+            self._ref_dict     = {}   # {(norm_abs_path, key_col, val_col): {key: val}}
+        else:
+            self._full_config  = shared["full_config"]
+            self._recent_files = shared["recent_files"]
+            self._ref_cache    = shared["ref_cache"]
+            self._ref_dict     = shared["ref_dict"]
         self.config = {}          # current file config
         self.json_path = None
         self.tables = {}          # {table_name: DataFrame}
@@ -20,10 +32,16 @@ class JsonDataManager:
         self.need_config_alert = False
         self.dirty = False
         self.dirty_cells = set()   # {(table_name, row_idx, col_name)}
-        self._recent_files = self._full_config.get("_recent_files", [])
         self._search_index = {}   # {table_name: {token: set of (table_name, row_idx)}}
-        self._ref_cache    = {}   # {norm_abs_path: [list of row dicts]}
-        self._ref_dict     = {}   # {(norm_abs_path, key_col, val_col): {key_str: val_str}}
+
+    def shared_state(self):
+        """Bundle the cross-document shared state to hand to sibling managers."""
+        return {
+            "full_config": self._full_config,
+            "recent_files": self._recent_files,
+            "ref_cache": self._ref_cache,
+            "ref_dict": self._ref_dict,
+        }
 
     # ──────────────────────────────────────────────
     # Config I/O
@@ -55,7 +73,7 @@ class JsonDataManager:
         if norm in self._recent_files:
             self._recent_files.remove(norm)
         self._recent_files.insert(0, norm)
-        self._recent_files = self._recent_files[:10]
+        del self._recent_files[10:]   # trim in place (list is shared across docs)
 
     # ──────────────────────────────────────────────
     # Search index
