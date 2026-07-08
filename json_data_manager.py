@@ -94,8 +94,11 @@ class JsonDataManager:
                     index[token].add((table_name, int(idx)))
         self._search_index[table_name] = index
 
-    def search_index(self, query):
-        """Index-based search, returns list of (table_name, is_sub, row_idx, matched_cols)."""
+    def search_index(self, query, limit=5000):
+        """Index-based search, returns list of (table_name, is_sub, row_idx, matched_cols).
+        Covers master AND sub-tables. Candidates are sorted (table, row) so the
+        result set is deterministic and complete — a big cap avoids silently
+        dropping sub-table hits when a common term matches many master rows."""
         q = query.lower().strip()
         if not q:
             return []
@@ -107,8 +110,7 @@ class JsonDataManager:
                     candidates.update(positions)
 
         results = []
-        limit = 200
-        for table_name, row_idx in candidates:
+        for table_name, row_idx in sorted(candidates):
             if len(results) >= limit:
                 break
             is_sub = table_name in self.sub_tables

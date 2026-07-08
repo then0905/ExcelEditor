@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """JsonEditor Pro — PySide6 · App-quality dark UI (Spec v2)"""
 
-import sys, os, json, re, uuid
+import sys, os, json, re, uuid, traceback, datetime
 import pandas as pd
 
 from PySide6.QtWidgets import (
@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QTextEdit, QTableView, QHeaderView, QAbstractItemView,
     QStackedWidget, QFileDialog, QMenu, QSizePolicy, QFrame,
     QInputDialog, QMessageBox, QStyledItemDelegate, QStyle,
+    QAbstractItemDelegate,
     QDialog, QDialogButtonBox, QFormLayout, QLayout, QCompleter,
     QTableWidget, QTableWidgetItem, QPlainTextEdit,
 )
@@ -826,11 +827,17 @@ def _get_suggestions(df, this_col, context_col, context_value):
 
 
 class _SuggestLineEdit(QLineEdit):
-    """QLineEdit that auto-pops its completer on focus-in."""
+    """QLineEdit that auto-pops its completer once on first focus-in.
+    One-shot so that after the user picks a value the popup won't keep
+    re-opening on the focus bounce (previously it 'wouldn't close')."""
+    _did_autopop = False
+
     def focusInEvent(self, e):
         super().focusInEvent(e)
-        if self.completer():
-            QTimer.singleShot(0, self.completer().complete)
+        c = self.completer()
+        if c and not self._did_autopop:
+            self._did_autopop = True
+            QTimer.singleShot(0, c.complete)
 
 
 class SuggestDelegate(QStyledItemDelegate):
@@ -1611,7 +1618,27 @@ class SubTablePanel(QWidget):
                     df_getter, col, ctx, self._view
                 ))
 
+    def flush_pending_edit(self):
+        """Commit a still-open cell editor into the model before the view is
+        reloaded or the file is saved. The card list is Qt.NoFocus, so clicking
+        another item never focus-outs the editor; the model reset in reload()
+        would then destroy the editor and silently discard the picked value
+        (empty enum values are dropped from the saved JSON entirely)."""
+        if self._view.state() != QAbstractItemView.EditingState:
+            return
+        editor = QApplication.focusWidget()
+        # climb to the widget that is the delegate-registered editor
+        # (a direct child of the view's viewport)
+        vp = self._view.viewport()
+        while editor is not None and editor.parentWidget() is not vp:
+            editor = editor.parentWidget()
+        if editor is None:
+            return
+        self._view.commitData(editor)
+        self._view.closeEditor(editor, QAbstractItemDelegate.NoHint)
+
     def reload(self, df, cols_cfg=None):
+        self.flush_pending_edit()
         self._model.reload(df, cols_cfg)
         if cols_cfg:
             self._refresh_delegates(cols_cfg)
@@ -1901,27 +1928,76 @@ class CompareView(QWidget):
         for p, lbl in zip(self._pks, labels):
             self._chips_flow.addWidget(self._make_chip(p, lbl))
         self._chips_box.setVisible(bool(self._pks))
-        rows = []
+        n = len(idxs)
+        # entry = (label, vals, differ, nav_col, kind)
+        #   kind: "field"=母表欄位 / "sub"=子表欄位 / "hdr"=子表區段 / "subhdr"=第N筆
+        entries = []
         for col in list(df.columns):
             vals = [disp(col, str(df.at[i, col])) for i in idxs]
             differ = len(set(vals)) > 1
             if diff_only and not differ:
                 continue
-            rows.append((col, vals, differ))
-        self._row_cols = [col for col, _v, _d in rows]
+            entries.append((col, vals, differ, col, "field"))
+
+        # ── 子表：把每個項目的子表列逐筆並排比較（第 r 筆 vs 第 r 筆）──
+        mgr = ed.manager
+        for sub_full in [s for s in mgr.sub_tables if s.startswith(ed.table_name + ".")]:
+            sub_df = mgr.sub_tables.get(sub_full)
+            if sub_df is None or sub_df.empty:
+                continue
+            sub_name = sub_full[len(ed.table_name) + 1:]
+            sub_cfg = ed.cfg.get("sub_tables", {}).get(sub_name, {})
+            sub_cols_cfg = sub_cfg.get("columns", {})
+            fk = sub_cfg.get("foreign_key") or pk
+            if fk not in sub_df.columns:
+                continue
+            fkser = sub_df[fk].astype(str)
+            per_item = [list(sub_df.index[fkser == p]) for p in self._pks]  # 各項目的子表列 index
+            maxn = max((len(x) for x in per_item), default=0)
+            if maxn == 0:
+                continue
+            show_cols = [c for c in sub_df.columns if c != fk]
+            sub_disp = lambda c, raw: ed._resolve_textref(c, raw, sub_cols_cfg)
+            block = []
+            for r in range(maxn):
+                row_entries = []
+                for col in show_cols:
+                    vals = [
+                        sub_disp(col, str(sub_df.at[per_item[k][r], col]))
+                        if r < len(per_item[k]) else ""
+                        for k in range(n)
+                    ]
+                    differ = len(set(vals)) > 1
+                    if diff_only and not differ:
+                        continue
+                    row_entries.append((f"    {col}", vals, differ, None, "sub"))
+                if row_entries:
+                    block.append((f"  ● 第 {r + 1} 筆", [""] * n, False, None, "subhdr"))
+                    block.extend(row_entries)
+            if block:
+                entries.append((f"▸ 子表：{sub_name}", [""] * n, False, None, "hdr"))
+                entries.extend(block)
+
+        self._row_cols = [nav for (_l, _v, _d, nav, _k) in entries]
         self._tbl.clear()
         self._tbl.setColumnCount(len(headers))
         self._tbl.setHorizontalHeaderLabels(headers)
-        self._tbl.setRowCount(len(rows))
-        for r, (col, vals, differ) in enumerate(rows):
-            name = QTableWidgetItem(col)
-            if differ:
+        self._tbl.setRowCount(len(entries))
+        for r, (label, vals, differ, _nav, kind) in enumerate(entries):
+            name = QTableWidgetItem(label)
+            if kind == "hdr":
+                name.setForeground(QBrush(QColor(_C["accent"])))
+                f = name.font(); f.setBold(True); name.setFont(f)
+            elif kind == "subhdr":
+                name.setForeground(QBrush(QColor(_C["txt3"])))
+            elif differ:
                 name.setForeground(QBrush(QColor(_C["yellow"])))
             self._tbl.setItem(r, 0, name)
             for ci, vv in enumerate(vals):
                 it = QTableWidgetItem(vv)
-                it.setToolTip(vv)  # 欄寬受限被截斷時，可 hover 看完整內容
-                if differ:
+                if vv:
+                    it.setToolTip(vv)  # 欄寬受限被截斷時，可 hover 看完整內容
+                if differ and kind in ("field", "sub"):
                     it.setBackground(QColor(234, 179, 8, 30))
                 self._tbl.setItem(r, ci + 1, it)
         # 欄位名稱欄依內容決定寬度（設上限避免過寬）；其餘資料欄依目前視窗寬度平均分配，
@@ -2631,6 +2707,13 @@ class TableEditor(QWidget):
             + (f"  ({', '.join(self._sub_tab_order)})" if self._sub_tab_order else ""),
             _C["txt2"],
         )
+
+    def flush_pending_edits(self):
+        """Commit any still-open sub-table cell editor (Ctrl+S doesn't move
+        focus, so a pending combo/line edit would otherwise miss the save)."""
+        for panel in self._sub_panels.values():
+            if panel is not None:
+                panel.flush_pending_edit()
 
     def _refresh_sub_tables(self):
         """Reload each sub-table panel with rows matching the currently selected master pk."""
@@ -4040,6 +4123,11 @@ class App(QMainWindow):
     def save_file(self):
         if not self.manager.json_path:
             QMessageBox.warning(self, "提示", "尚未載入任何 JSON 檔案"); return
+        # a sub-table cell editor may still be open (Ctrl+S / NoFocus card list
+        # don't focus-out) — commit it so the pending value makes the save
+        for ed in self._editors.values():
+            if ed is not None:
+                ed.flush_pending_edits()
         # notes live in config → flush widget state and persist alongside the DB
         self._flush_notes()
         self.manager.save_config()
@@ -5115,12 +5203,57 @@ class App(QMainWindow):
         event.accept()
 
 
-# ── Entry ─────────────────────────────────────────────────────────────────────
+# ── Crash / error logging ─────────────────────────────────────────────────────
+
+def _log_path():
+    """log.txt next to the executable (packaged) or the script (dev)."""
+    try:
+        if getattr(sys, "frozen", False) or "__compiled__" in globals():
+            base = os.path.dirname(sys.executable)
+        else:
+            base = os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        base = os.getcwd()
+    return os.path.join(base, "log.txt")
+
+
+def _write_log(header, text):
+    try:
+        with open(_log_path(), "a", encoding="utf-8") as f:
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"\n===== {ts} | {header} =====\n{text}\n")
+    except Exception:
+        pass
+
+
+def _excepthook(etype, value, tb):
+    _write_log("未捕捉的例外 (Unhandled exception)",
+               "".join(traceback.format_exception(etype, value, tb)))
+    try:
+        sys.__excepthook__(etype, value, tb)
+    except Exception:
+        pass
+
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    app.setStyleSheet(APP_QSS)
-    window = App()
-    window.show()
-    sys.exit(app.exec())
+    # faulthandler 抓硬性崩潰(segfault)，excepthook 抓 Python 例外，都寫進 log.txt
+    try:
+        import faulthandler
+        _flog = open(_log_path(), "a", encoding="utf-8", buffering=1)
+        faulthandler.enable(_flog)
+    except Exception:
+        pass
+    sys.excepthook = _excepthook
+
+    try:
+        app = QApplication(sys.argv)
+        app.setStyle("Fusion")
+        app.setStyleSheet(APP_QSS)
+        window = App()
+        window.show()
+        sys.exit(app.exec())
+    except SystemExit:
+        raise
+    except BaseException:
+        _write_log("啟動 / 主迴圈崩潰", traceback.format_exc())
+        raise
