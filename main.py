@@ -207,6 +207,60 @@ QTextEdit {{
     selection-background-color: {_C['accent']};
 }}
 QTextEdit:focus {{ border-color: {_C['accent']}; }}
+QPlainTextEdit {{
+    background: {_C['input']};
+    border: 1px solid {_C['border']};
+    border-radius: 7px;
+    padding: 6px 10px;
+    color: {_C['txt']};
+    selection-background-color: {_C['accent']};
+}}
+QPlainTextEdit:focus {{ border-color: {_C['accent']}; }}
+QSpinBox {{
+    background: {_C['input']};
+    border: 1px solid {_C['border']};
+    border-radius: 7px;
+    padding: 4px 6px;
+    color: {_C['txt']};
+    selection-background-color: {_C['accent']};
+}}
+QSpinBox:focus {{ border-color: {_C['accent']}; }}
+QSpinBox::up-button, QSpinBox::down-button {{
+    background: transparent;
+    border: none;
+    width: 16px;
+}}
+QSpinBox::up-arrow {{
+    image: none;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-bottom: 5px solid {_C['txt2']};
+}}
+QSpinBox::down-arrow {{
+    image: none;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid {_C['txt2']};
+}}
+QRadioButton {{ color: {_C['txt']}; background: transparent; spacing: 6px; }}
+QRadioButton::indicator {{
+    width: 14px; height: 14px;
+    border-radius: 8px;
+    border: 1px solid {_C['border']};
+    background: {_C['input']};
+}}
+QRadioButton::indicator:hover {{ border-color: {_C['borderH']}; }}
+QRadioButton::indicator:checked {{
+    border: 4px solid {_C['accent']};
+    background: #FFFFFF;
+}}
+QComboBox QLineEdit {{
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    padding: 0 2px;
+    color: {_C['txt']};
+}}
 QTextEdit#code-view {{
     background: {_C['code']};
     border: 1px solid {_C['border']};
@@ -2189,6 +2243,8 @@ class TableEditor(QWidget):
 
         for text, role, icon, tip, slot in [
             ("新增", "success", "circle-plus", "",   self.add_master_item),
+            ("範本", "",        "clipboard-plus",
+             "從範本新增（含子表列）；在項目上按右鍵可「設為範本」", self._template_menu),
             ("複製", "",        "copy",        "",   self.copy_master_item),
             ("",     "ghost",   "arrow-up",    "上移", lambda: self.move_master_item(-1)),
             ("",     "ghost",   "arrow-down",  "下移", lambda: self.move_master_item(1)),
@@ -2546,10 +2602,14 @@ class TableEditor(QWidget):
         def _disp(col, raw):
             return self._resolve_textref(col, raw, cols_cfg)
 
+        tpl_pks = self._template_pks()
+
         for df_idx, row in sub_df.iterrows():
             pk_raw   = str(row[self.pk_key])
             sub_raw  = str(row[sub_col]) if sub_col else ""
             pk_disp  = _disp(self.pk_key, pk_raw)
+            if pk_raw in tpl_pks:
+                pk_disp = f"⭐ {pk_disp}"
             sub_disp = _disp(sub_col, sub_raw) if sub_col else ""
 
             if query and query not in pk_raw.lower() and query not in pk_disp.lower() \
@@ -3075,11 +3135,137 @@ class TableEditor(QWidget):
         menu = QMenu(self)
         menu.addAction("複製", self.copy_master_item)
         menu.addAction("刪除", self.delete_master_item)
+        df_idx = item.data(Qt.UserRole)
+        if df_idx in self.df.index and self.pk_key in self.df.columns:
+            pk_val = str(self.df.at[df_idx, self.pk_key])
+            menu.addSeparator()
+            tpl = next((t for t in self._templates()
+                        if str(t.get("pk")) == pk_val), None)
+            if tpl is None:
+                menu.addAction("⭐ 設為範本…", lambda: self.set_template(df_idx))
+            else:
+                menu.addAction(f"☆ 移除範本（{tpl.get('name', pk_val)}）",
+                               lambda: self.remove_template(pk_val))
         sel = len(self._card_list.selectedItems())
         if sel >= 1:
             menu.addSeparator()
             menu.addAction(f"加入比較（{sel} 項）", self.add_to_compare)
         menu.exec(self._card_list.mapToGlobal(pos))
+
+    # ── Templates（範本列：具名原型，從範本新增＝深拷貝母列＋子表列） ──────────
+
+    def _templates(self):
+        """Mutable template list stored in this table's config:
+        [{"name": 顯示名, "pk": 範本列的主鍵值}, …]"""
+        tpls = self.cfg.get("templates")
+        if not isinstance(tpls, list):
+            tpls = []
+            self.cfg["templates"] = tpls
+        return tpls
+
+    def _template_pks(self):
+        return {str(t.get("pk")) for t in self._templates()}
+
+    def set_template(self, df_idx):
+        if df_idx not in self.df.index:
+            return
+        pk_val = str(self.df.at[df_idx, self.pk_key])
+        name, ok = QInputDialog.getText(
+            self, "設為範本", "範本名稱：", text=pk_val)
+        if not ok or not name.strip():
+            return
+        self._templates().append({"name": name.strip(), "pk": pk_val})
+        self.manager.save_config()
+        self._load_item_list()
+        self.status_message.emit(f"⭐ 已設為範本：{name.strip()}", _C["green"])
+
+    def remove_template(self, pk_val):
+        tpls = self._templates()
+        tpls[:] = [t for t in tpls if str(t.get("pk")) != str(pk_val)]
+        self.manager.save_config()
+        self._load_item_list()
+        self.status_message.emit("已移除範本", _C["yellow"])
+
+    def _template_menu(self):
+        menu = QMenu(self)
+        tpls = self._templates()
+        for t in tpls:
+            exists = str(t.get("pk")) in self.df[self.pk_key].astype(str).values \
+                if self.pk_key in self.df.columns else False
+            act = menu.addAction(f"⭐ {t.get('name', t.get('pk'))}")
+            if exists:
+                act.triggered.connect(lambda _=False, tt=t: self.add_from_template(tt))
+            else:
+                act.setText(act.text() + "（來源已不存在）")
+                act.setEnabled(False)
+        if not tpls:
+            hint = menu.addAction("（尚無範本 — 在項目上按右鍵「設為範本」）")
+            hint.setEnabled(False)
+        menu.exec(QCursor.pos())
+
+    def add_from_template(self, tpl):
+        src = self.df[self.df[self.pk_key].astype(str) == str(tpl.get("pk"))]
+        if src.empty:
+            QMessageBox.warning(self, "提示", "範本來源列已不存在（ID 可能被改掉了）")
+            return
+        new_id, ok = QInputDialog.getText(
+            self, "從範本新增",
+            f"範本：{tpl.get('name')}\n新的 {self.pk_key}:")
+        if not ok or not new_id.strip():
+            return
+        new_id = new_id.strip()
+        if new_id in self.df[self.pk_key].astype(str).values:
+            QMessageBox.warning(self, "錯誤", "此 ID 已存在"); return
+        self._create_from_template(tpl, new_id)
+
+    def _create_from_template(self, tpl, new_id):
+        """深拷貝範本母列＋其所有子表列（FK 改成 new_id），並選中新項目。"""
+        src = self.df[self.df[self.pk_key].astype(str) == str(tpl.get("pk"))]
+        if src.empty:
+            return
+        src_idx = src.index[0]
+        new_row = self.df.loc[src_idx].copy()
+        new_row[self.pk_key] = new_id
+        cls_val = new_row[self.cls_key] if self.cls_key in self.df.columns else None
+
+        # 插在範本同分類的最後一列後面（跟「新增項目」同邏輯）
+        if cls_val is not None:
+            cls_rows = self.df[self.df[self.cls_key] == cls_val]
+            insert_after = cls_rows.index.max() + 1 if not cls_rows.empty else len(self.df)
+        else:
+            insert_after = len(self.df)
+        top, bot = self.df.iloc[:insert_after], self.df.iloc[insert_after:]
+        self.df = pd.concat([top, pd.DataFrame([new_row]), bot], ignore_index=True)
+        self.manager.tables[self.table_name] = self.df
+
+        # 子表列跟著深拷貝（FK 換成新 ID）
+        copied_subs = 0
+        prefix = self.table_name + "."
+        for full in list(self.manager.sub_tables):
+            if not full.startswith(prefix):
+                continue
+            sub_name = full[len(prefix):]
+            sub_df = self.manager.sub_tables[full]
+            fk = (self.cfg.get("sub_tables", {}).get(sub_name, {})
+                  .get("foreign_key") or self.pk_key)
+            if fk not in sub_df.columns:
+                continue
+            rows = sub_df[sub_df[fk].astype(str) == str(tpl.get("pk"))]
+            if rows.empty:
+                continue
+            copies = rows.copy()
+            copies[fk] = new_id
+            self.manager.sub_tables[full] = pd.concat(
+                [sub_df, copies], ignore_index=True)
+            copied_subs += len(copies)
+
+        self.manager.dirty = True
+        new_df_idx = self.df[self.df[self.pk_key].astype(str) == str(new_id)].index[0]
+        self._reload_all(select_cls=cls_val if cls_val is not None else self.current_cls_val,
+                         select_idx=new_df_idx)
+        self.status_message.emit(
+            f"⭐ 已從範本「{tpl.get('name')}」建立 {new_id}"
+            + (f"（含 {copied_subs} 列子表）" if copied_subs else ""), _C["green"])
 
     # ── Refresh ───────────────────────────────────────────────────────────────
 
@@ -4134,6 +4320,7 @@ class ValidationRulesDialog(QDialog):
     def _clear_conds(self, lo):
         for w in self._cond_rows(lo):
             lo.removeWidget(w)
+            w.hide()          # removeWidget 後仍是可見子元件，先藏再刪避免殘影
             w.deleteLater()
 
     def _add_cond(self, lo, cond):
@@ -4142,7 +4329,8 @@ class ValidationRulesDialog(QDialog):
         row.set_field_choices(self._field_choices(scope), self._sub_names())
         row._load(cond or {})
         row._kind_changed()
-        row.removed.connect(lambda w, l=lo: (l.removeWidget(w), w.deleteLater()))
+        row.removed.connect(
+            lambda w, l=lo: (l.removeWidget(w), w.hide(), w.deleteLater()))
         lo.addWidget(row)
         return row
 
