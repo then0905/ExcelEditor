@@ -3,8 +3,9 @@
 ## 專案概述
 - **PySide6 (Qt)** 製作的暗色主題遊戲資料編輯器；後端編輯的是 **JSON** 檔（早期的 CTk/tk + Excel 版本已淘汰）。
 - 關鍵檔案：
-  - `main.py` — 全部 UI（App 視窗、TableEditor、欄位編輯器、子表 model/view、配置視窗、打包入口）。
+  - `main.py` — 全部 UI（App 視窗、TableEditor、欄位編輯器、子表 model/view、配置視窗、驗證規則視窗、打包入口）。
   - `json_data_manager.py` — 資料層 `JsonDataManager`（載入/儲存 JSON、欄位/子表增刪改、健檢）。
+  - `validation.py` — 資料驗證規則引擎（無 Qt 依賴；規則模型、AST 白名單表達式、增量重驗）。
   - `data_manager.py` — 舊的 Excel/openpyxl 資料層（目前主程式未使用，保留參考）。
   - `config.json` — 以「JSON 檔的正規化絕對路徑」為 key 的設定檔（每個資料檔一份設定）。
   - `assets/tabler-icons.ttf` — 內建的 Tabler 圖示字型（工具列圖示用，須隨打包帶上）。
@@ -33,6 +34,23 @@
 ```
 欄位 `type`：`string / int / float / bool / enum / array / text_ref`。
 `note` 會在欄位標題 / 子表分頁標題 hover 時顯示；子表的 `note` 在「配置設定」視窗每張子表底下編輯。
+
+### 資料驗證規則（validations）
+- 每張母表 config 下的 `validations` 陣列（規則結構見 `validation.normalize_rule` 與
+  `docs/superpowers/specs/2026-07-12-validation-rules-design.md`）。
+- 語意：`when` 成立而 `then` 不成立 → 違規；`when` 留空 = 每列都檢查 `then`。
+  `scope: ""`=母表、`"子表名"`=子表；子表規則可用 `master.欄位`，母表規則可下子表聚合條件
+  （builder 的 `{"agg": …}` 或 expr 的 `any_sub()/count_sub()`）。
+- 引擎掛在 `manager.validator`（`ValidationEngine`）：`load_json` 尾端 `reload()` 全量驗證、
+  `update_cell` 觸發 `on_cell_edited` 增量重驗（改 PK/FK 會整表重驗）；列增刪/搬移後 UI 端呼叫
+  `validate_table()`（見 `_reload_all` / `_refresh_sub_tables(revalidate=True)`）。
+- 上色：子表格背景（規則色 alpha 120，優先於 dirty 黃）、母表欄位編輯器邊框＋標籤、
+  項目卡片右上小點（紅=error/黃=warn）、子表分頁標題轉紅＋tooltip 計數。
+- 存檔閘門：`save_file` 先 `validate_all()`；error 擋存檔、warn 可「仍要儲存」，
+  清單點擊經 `navigate_to` 跳到違規儲存格。關閉程式的批次儲存**不**過閘門。
+- 表達式安全：`SafeExpr` 只允許比較/布林/四則/白名單函式，`ast` 驗證後自行遞迴求值，
+  絕不走 eval/exec；新增白名單函式要同時改 `_ALLOWED_FUNC_NAMES` 與 `_RowCtx.call`。
+- 測試：`tests/test_validation.py`（引擎、免 Qt）、`tests/test_validation_ui.py`（offscreen UI）。
 
 ---
 

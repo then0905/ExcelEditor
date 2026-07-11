@@ -5,6 +5,8 @@ import gc
 import re
 import warnings
 
+from validation import ValidationEngine
+
 warnings.filterwarnings("ignore")
 
 
@@ -33,6 +35,7 @@ class JsonDataManager:
         self.dirty = False
         self.dirty_cells = set()   # {(table_name, row_idx, col_name)}
         self._search_index = {}   # {table_name: {token: set of (table_name, row_idx)}}
+        self.validator = ValidationEngine(self)   # 資料驗證規則引擎
 
     def shared_state(self):
         """Bundle the cross-document shared state to hand to sibling managers."""
@@ -382,6 +385,7 @@ class JsonDataManager:
         self._add_recent_file(file_path)
         self.dirty = False
         self.dirty_cells.clear()
+        self.validator.reload()   # compile rules + full validation (worker thread)
 
     @staticmethod
     def _migrate_text_ref(tcfg):
@@ -670,6 +674,7 @@ class JsonDataManager:
             target_df.at[row_idx, col_name] = value
             self.dirty = True
             self.dirty_cells.add((table_name, row_idx, col_name))
+            self.validator.on_cell_edited(table_name, row_idx, col_name)
 
     # ──────────────────────────────────────────────
     # Column management
@@ -779,6 +784,7 @@ class JsonDataManager:
                        .setdefault("columns", {}))
                 cfg[col_name] = {"type": col_type}
         self.dirty = True
+        self.validator.validate_table(table_name.split(".", 1)[0])
 
     def delete_column(self, table_name, col_name):
         """Delete a column from a table."""
@@ -799,6 +805,7 @@ class JsonDataManager:
                        .get("columns", {}))
                 cfg.pop(col_name, None)
         self.dirty = True
+        self.validator.validate_table(table_name.split(".", 1)[0])
 
     def rename_column(self, table_name, old_name, new_name):
         """Rename a column."""
@@ -823,6 +830,7 @@ class JsonDataManager:
                 if old_name in cfg:
                     cfg[new_name] = cfg.pop(old_name)
         self.dirty = True
+        self.validator.validate_table(table_name.split(".", 1)[0])
 
     # ──────────────────────────────────────────────
     # Utility

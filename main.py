@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QAbstractItemDelegate,
     QDialog, QDialogButtonBox, QFormLayout, QLayout, QCompleter,
     QTableWidget, QTableWidgetItem, QPlainTextEdit,
+    QColorDialog, QSpinBox, QRadioButton, QButtonGroup, QToolButton,
 )
 from PySide6.QtCore import (
     Qt, Signal, QAbstractTableModel, QModelIndex,
@@ -26,6 +27,10 @@ from PySide6.QtGui import (
 )
 
 from json_data_manager import JsonDataManager
+from validation import (new_rule as _v_new_rule, normalize_rule as _v_norm,
+                        OPS as _V_OPS, OP_LABELS as _V_OP_LABELS,
+                        COUNT_OP_LABELS as _V_COUNT_OPS,
+                        DEFAULT_COLOR as _V_DEFAULT_COLOR)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -578,6 +583,7 @@ class ItemCardDelegate(QStyledItemDelegate):
     R_PK  = Qt.UserRole + 1   # primary key string
     R_SUB = Qt.UserRole + 2   # subtitle string
     R_CAT = Qt.UserRole + 3   # category value (for color)
+    R_VIO = Qt.UserRole + 4   # validation severity: "error" / "warn" / None
 
     def sizeHint(self, option, index):
         return QSize(option.rect.width(), self.CARD_H + self.PAD_V * 2)
@@ -661,6 +667,14 @@ class ItemCardDelegate(QStyledItemDelegate):
             Qt.AlignCenter, "›"
         )
 
+        # Validation dot (top-right): red = error, yellow = warn
+        vio = index.data(self.R_VIO)
+        if vio:
+            dot_c = QColor(_C["red"] if vio == "error" else _C["yellow"])
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(dot_c))
+            painter.drawEllipse(QRectF(card.right() - 16, card.top() + 8, 7, 7))
+
         painter.restore()
 
 
@@ -678,6 +692,7 @@ class SubTableModel(QAbstractTableModel):
         self._cols_cfg     = cols_cfg or {}
         self._manager      = manager
         self._sheet        = sheet_full_name
+        self._validation_cb = None   # editor hook: master-record visuals refresh
 
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self._df)
@@ -702,9 +717,21 @@ class SubTableModel(QAbstractTableModel):
                 v = v.lower() in ("true", "1", "yes")
             return Qt.Checked if v else Qt.Unchecked
         if role == Qt.BackgroundRole:
+            vcol = self._manager.validator.cell_color(self._sheet, row_idx, col)
+            if vcol:
+                qc = QColor(vcol)
+                qc.setAlpha(120)          # tint keeps text readable on dark rows
+                return QBrush(qc)
             if (self._sheet, row_idx, col) in self._manager.dirty_cells:
                 return QBrush(_DIRTY_BG)
             return QBrush(_ROW_EVEN if r % 2 == 0 else _ROW_ODD)
+        if role == Qt.ToolTipRole:
+            vrules = self._manager.validator.cell_rules(self._sheet, row_idx, col)
+            if vrules:
+                return "\n".join(
+                    f"⚠ [{'錯誤' if ru['severity'] == 'error' else '警告'}] {ru['name']}"
+                    for ru in vrules)
+            return None
         if role == Qt.ForegroundRole:
             return QBrush(QColor(_C["txt"]))
         return None
@@ -725,7 +752,11 @@ class SubTableModel(QAbstractTableModel):
         if full is not None and row_idx in full.index and col in full.columns \
                 and row_idx in self._df.index:
             self._df.at[row_idx, col] = full.at[row_idx, col]
-        self.dataChanged.emit(index, index)
+        # validation can (un)mark OTHER cells of this row → repaint the whole row
+        self.dataChanged.emit(self.index(r, 0),
+                              self.index(r, self.columnCount() - 1))
+        if self._validation_cb is not None:
+            self._validation_cb()
         return True
 
     def flags(self, index):
@@ -1167,6 +1198,7 @@ class FieldEditorWidget(QWidget):
         self._widgets       = {}
         self._col_types     = {}
         self._lbl_widgets   = {}   # col → QLabel (the col name label)
+        self._note_tips     = {}   # col → configured note (tooltip restore)
         self._bool_updaters = {}   # col → update_style(checked: bool)
         self._img_preview_label:  "QLabel | None" = None  # table-level image preview
         self._img_path_segments:  list = []  # [{"type":"col","col":"X"} | {"type":"lit","value":"Y"}]
@@ -1205,6 +1237,7 @@ class FieldEditorWidget(QWidget):
         self._widgets.clear()
         self._col_types.clear()
         self._lbl_widgets.clear()
+        self._note_tips.clear()
         self._bool_updaters.clear()
         self._img_preview_label  = None  # cleared by layout wipe above
         self._img_path_segments  = []
@@ -1289,6 +1322,7 @@ class FieldEditorWidget(QWidget):
             )
             self._lbl_widgets[col] = lbl
             _note = col_conf.get("note", "")
+            self._note_tips[col] = _note
             if _note:
                 lbl.setToolTip(_note)
                 lbl_row.setToolTip(_note)
@@ -1478,6 +1512,57 @@ class FieldEditorWidget(QWidget):
 
     # ── Load row ──────────────────────────────────────────────────────────────
 
+    def _style_field(self, col, w, is_dirty):
+        """Apply violation (rule colour) > dirty (yellow) > normal styling to a
+        field widget + its name label."""
+        lbl = self._lbl_widgets.get(col)
+        vrules = []
+        if self._manager is not None and self._row_idx is not None:
+            vrules = self._manager.validator.cell_rules(
+                self._table_name, self._row_idx, col)
+        if vrules:
+            qc = QColor(vrules[0]["color"])
+            rgb = f"{qc.red()},{qc.green()},{qc.blue()}"
+            w.setStyleSheet(
+                f"border-color: rgba({rgb},0.85); background: rgba({rgb},0.12);")
+            tip = "\n".join(
+                f"⚠ [{'錯誤' if ru['severity'] == 'error' else '警告'}] {ru['name']}"
+                for ru in vrules)
+            w.setToolTip(tip)
+            if lbl:
+                lbl.setStyleSheet(
+                    f"color: {vrules[0]['color']}; font-size: 11px; "
+                    f"font-weight: 700; background: transparent;")
+                lbl.setToolTip(tip)
+            return
+        w.setToolTip("")
+        if is_dirty:
+            w.setStyleSheet(
+                "border-color: rgba(234,179,8,0.55); background: rgba(234,179,8,0.07);"
+            )
+            if lbl:
+                lbl.setStyleSheet(
+                    f"color: {_C['yellow']}; font-size: 11px; font-weight: 500; background: transparent;"
+                )
+        else:
+            w.setStyleSheet("")
+            if lbl:
+                lbl.setStyleSheet(
+                    f"color: {_C['txt2']}; font-size: 11px; font-weight: 500; background: transparent;"
+                )
+        if lbl:
+            lbl.setToolTip(self._note_tips.get(col, ""))
+
+    def refresh_validation(self):
+        """Re-style every field of the current row after validation changed
+        (without reloading values — safe to call mid-edit)."""
+        if not self._built or self._row_idx is None:
+            return
+        dirty = self._manager.dirty_cells if self._manager else set()
+        for col, w in self._widgets.items():
+            self._style_field(col, w,
+                              (self._table_name, self._row_idx, col) in dirty)
+
     def load_row(self, row_data, row_idx):
         if not self._built:
             return
@@ -1493,22 +1578,7 @@ class FieldEditorWidget(QWidget):
                 col_type = self._col_types[col]
                 is_dirty = (self._table_name, row_idx, col) in dirty
 
-                # Dirty styling
-                lbl = self._lbl_widgets.get(col)
-                if is_dirty:
-                    w.setStyleSheet(
-                        "border-color: rgba(234,179,8,0.55); background: rgba(234,179,8,0.07);"
-                    )
-                    if lbl:
-                        lbl.setStyleSheet(
-                            f"color: {_C['yellow']}; font-size: 11px; font-weight: 500; background: transparent;"
-                        )
-                else:
-                    w.setStyleSheet("")
-                    if lbl:
-                        lbl.setStyleSheet(
-                            f"color: {_C['txt2']}; font-size: 11px; font-weight: 500; background: transparent;"
-                        )
+                self._style_field(col, w, is_dirty)
 
                 # Value
                 if col_type == "bool":
@@ -1617,6 +1687,10 @@ class SubTablePanel(QWidget):
                 self._view.setItemDelegateForColumn(c, SuggestDelegate(
                     df_getter, col, ctx, self._view
                 ))
+
+    def set_validation_cb(self, cb):
+        """Editor hook invoked after each cell edit (validation visuals)."""
+        self._model._validation_cb = cb
 
     def flush_pending_edit(self):
         """Commit a still-open cell editor into the model before the view is
@@ -2489,6 +2563,9 @@ class TableEditor(QWidget):
             item.setData(ItemCardDelegate.R_PK,  pk_disp)
             item.setData(ItemCardDelegate.R_SUB, sub_disp if not all_mode else f"{cat_val} · {sub_disp}")
             item.setData(ItemCardDelegate.R_CAT, cat_val)
+            item.setData(ItemCardDelegate.R_VIO,
+                         self.manager.validator.record_violation_severity(
+                             self.table_name, df_idx))
             self._card_list.addItem(item)
             if df_idx == self.current_master_idx:
                 self._card_list.setCurrentItem(item)
@@ -2657,6 +2734,7 @@ class TableEditor(QWidget):
         # keep the live comparison reference in sync with edits
         if hasattr(self, "_compare_view"):
             self._compare_view.refresh()
+        self._refresh_validation_visuals()
 
     # ── Sub-tables ────────────────────────────────────────────────────────────
 
@@ -2678,6 +2756,7 @@ class TableEditor(QWidget):
             panel.copy_requested.connect(self.copy_sub_rows)
             panel.paste_requested.connect(self.paste_sub_rows)
             panel.compare_requested.connect(self.compare_sub_effect)
+            panel.set_validation_cb(self._refresh_validation_visuals)
             self._sub_panels[tab_name] = panel
             idx = self._sub_tabs.addTab(panel, tab_name)
             note = sub_cfg.get("note", "")
@@ -2715,8 +2794,11 @@ class TableEditor(QWidget):
             if panel is not None:
                 panel.flush_pending_edit()
 
-    def _refresh_sub_tables(self):
+    def _refresh_sub_tables(self, revalidate=False):
         """Reload each sub-table panel with rows matching the currently selected master pk."""
+        if revalidate:
+            # sub-row add/delete/move/copy resets sub indexes → rebuild violations
+            self.manager.validator.validate_table(self.table_name)
         if self.current_master_pk is None:
             return
         prefix = self.table_name + "."
@@ -2740,6 +2822,49 @@ class TableEditor(QWidget):
                     continue
                 filtered = sub_df[sub_df[fk_key].astype(str) == str(self.current_master_pk)]
             panel.reload(filtered, cols_cfg)
+        self._update_sub_tab_vio_colors()
+
+    # ── Validation visuals ─────────────────────────────────────────────────────
+
+    def _refresh_validation_visuals(self):
+        """Refresh every validation visual for the current record: field
+        styles, the item card's dot, sub-tab colors and sub-view repaints.
+        Called after cell edits and after rules change."""
+        if self._field_panel is not None:
+            self._field_panel.refresh_validation()
+        it = self._card_list.currentItem()
+        if it is not None:
+            df_idx = it.data(Qt.UserRole)
+            it.setData(ItemCardDelegate.R_VIO,
+                       self.manager.validator.record_violation_severity(
+                           self.table_name, df_idx))
+        self._update_sub_tab_vio_colors()
+        for panel in self._sub_panels.values():
+            if panel is not None:
+                panel._view.viewport().update()
+
+    def _update_sub_tab_vio_colors(self):
+        """Colour sub-tab titles red when the current record has violating rows
+        in that sub table (count shown in the tooltip alongside the note)."""
+        validator = self.manager.validator
+        bar = self._sub_tabs.tabBar()
+        prefix = self.table_name + "."
+        for i in range(self._sub_tabs.count()):
+            tab_name = self._sub_tabs.tabText(i)
+            panel = self._sub_panels.get(tab_name)
+            if panel is None:
+                continue
+            full = prefix + tab_name
+            cnt = sum(1 for ri in panel._model.df.index
+                      if validator.row_has_violation(full, ri))
+            note = self.cfg.get("sub_tables", {}).get(tab_name, {}).get("note", "")
+            if cnt:
+                bar.setTabTextColor(i, QColor(_C["red"]))
+                self._sub_tabs.setTabToolTip(
+                    i, f"⚠ {cnt} 列驗證未通過" + (f"\n{note}" if note else ""))
+            else:
+                bar.setTabTextColor(i, QColor())   # invalid → default colour
+                self._sub_tabs.setTabToolTip(i, note)
 
     def _on_sub_delete(self, sheet_full, df_idx):
         sub_df = self.manager.sub_tables.get(sheet_full)
@@ -2748,7 +2873,8 @@ class TableEditor(QWidget):
         sub_df.reset_index(drop=True, inplace=True)
         self.manager.sub_tables[sheet_full] = sub_df
         self.manager.dirty = True
-        self._refresh_sub_tables()
+        self._refresh_sub_tables(revalidate=True)
+        self._refresh_validation_visuals()
         self.status_message.emit("已刪除子表列", _C["yellow"])
 
     def _current_sub_panel(self) -> SubTablePanel | None:
@@ -2773,7 +2899,8 @@ class TableEditor(QWidget):
         top, bot = sub_df.iloc[:insert_at], sub_df.iloc[insert_at:]
         self.manager.sub_tables[full] = pd.concat([top, pd.DataFrame([new_row]), bot], ignore_index=True)
         self.manager.dirty = True
-        self._refresh_sub_tables()
+        self._refresh_sub_tables(revalidate=True)
+        self._refresh_validation_visuals()
 
     def delete_sub_item(self):
         panel = self._current_sub_panel()
@@ -2807,7 +2934,7 @@ class TableEditor(QWidget):
         after  = [i for i in others if i > max(siblings)]
         self.manager.sub_tables[full] = sub_df.loc[before + siblings + after].reset_index(drop=True)
         self.manager.dirty = True
-        self._refresh_sub_tables()
+        self._refresh_sub_tables(revalidate=True)
 
     def copy_sub_item(self):
         panel = self._current_sub_panel()
@@ -2821,7 +2948,8 @@ class TableEditor(QWidget):
         new_row = sub_df.loc[df_idx].copy()
         self.manager.sub_tables[full] = pd.concat([sub_df, pd.DataFrame([new_row])], ignore_index=True)
         self.manager.dirty = True
-        self._refresh_sub_tables()
+        self._refresh_sub_tables(revalidate=True)
+        self._refresh_validation_visuals()
 
     # ── Cross-item row copy / paste ─────────────────────────────────────────────
     def copy_sub_rows(self):
@@ -2874,7 +3002,8 @@ class TableEditor(QWidget):
         self.manager.sub_tables[full] = pd.concat(
             [top, pd.DataFrame(new_rows), bot], ignore_index=True)
         self.manager.dirty = True
-        self._refresh_sub_tables()
+        self._refresh_sub_tables(revalidate=True)
+        self._refresh_validation_visuals()
         note = "" if buf["sub"] == tab_name else f"（來源子表: {buf['sub']}，只貼同名欄位）"
         self.status_message.emit(f"已貼上 {len(new_rows)} 列{note}", _C["green"])
 
@@ -2955,6 +3084,9 @@ class TableEditor(QWidget):
     # ── Refresh ───────────────────────────────────────────────────────────────
 
     def _reload_all(self, select_cls=None, select_idx=None):
+        # master mutations (add/copy/delete/paste/column ops) reset row indexes
+        # → the validator's violation map must be rebuilt for this table
+        self.manager.validator.validate_table(self.table_name)
         self.df = self.manager.tables[self.table_name]
         if select_cls is not None:  self.current_cls_val    = select_cls
         if select_idx is not None:  self.current_master_idx = select_idx
@@ -3637,6 +3769,549 @@ class GlobalSearchDialog(QDialog):
             self._app.navigate_to(tn, is_sub, ridx, col)
 
 
+# ── Validation rules editor ───────────────────────────────────────────────────
+
+class _VCondRow(QWidget):
+    """One editable condition row: 欄位｜運算子｜值(｜值2)，或母表 scope 的
+    「子表聚合」變體（子表｜欄位｜運算子｜值｜列數比較）。"""
+    removed = Signal(object)
+
+    def __init__(self, dlg, cond=None, allow_agg=False, parent=None):
+        super().__init__(parent)
+        self._dlg = dlg                     # ValidationRulesDialog (欄位清單來源)
+        self._allow_agg = allow_agg
+        lo = QHBoxLayout(self)
+        lo.setContentsMargins(0, 0, 0, 0)
+        lo.setSpacing(6)
+
+        self.kind = QComboBox()
+        self.kind.addItem("欄位")
+        if allow_agg:
+            self.kind.addItem("子表聚合")
+        self.kind.currentIndexChanged.connect(self._kind_changed)
+        lo.addWidget(self.kind)
+        if not allow_agg:
+            self.kind.hide()
+
+        # ── field variant ──
+        self.field = QComboBox(); self.field.setEditable(True)
+        self.field.setMinimumWidth(150)
+        self.op = QComboBox()
+        for o in _V_OPS:
+            self.op.addItem(_V_OP_LABELS[o], o)
+        self.op.currentIndexChanged.connect(self._op_changed)
+        self.value  = QLineEdit(); self.value.setMinimumWidth(110)
+        self.value2 = QLineEdit(); self.value2.setFixedWidth(70)
+        self.value2.setPlaceholderText("上限")
+        lo.addWidget(self.field); lo.addWidget(self.op)
+        lo.addWidget(self.value, 1); lo.addWidget(self.value2)
+
+        # ── agg variant ──
+        self.agg_sub = QComboBox(); self.agg_sub.setMinimumWidth(110)
+        self.agg_field = QComboBox(); self.agg_field.setEditable(True)
+        self.agg_field.setMinimumWidth(120)
+        self.agg_op = QComboBox()
+        for o in _V_OPS:
+            if o not in ("between",):
+                self.agg_op.addItem(_V_OP_LABELS[o], o)
+        self.agg_val = QLineEdit(); self.agg_val.setMinimumWidth(80)
+        self.agg_cnt_lbl = QLabel("的列數")
+        self.agg_cnt_lbl.setStyleSheet(f"color:{_C['txt2']}; background:transparent;")
+        self.agg_cnt_op = QComboBox()
+        for k, v in _V_COUNT_OPS.items():
+            self.agg_cnt_op.addItem(v, k)
+        self.agg_cnt = QSpinBox(); self.agg_cnt.setRange(0, 9999); self.agg_cnt.setValue(1)
+        self.agg_sub.currentIndexChanged.connect(self._agg_sub_changed)
+        for w in (self.agg_sub, self.agg_field, self.agg_op, self.agg_val,
+                  self.agg_cnt_lbl, self.agg_cnt_op, self.agg_cnt):
+            lo.addWidget(w)
+
+        rm = _mk_btn("", "danger", icon="trash")
+        rm.setFixedSize(26, 26)
+        rm.setToolTip("刪除此條件")
+        rm.clicked.connect(lambda: self.removed.emit(self))
+        lo.addWidget(rm)
+
+        self._load(cond or {})
+        self._kind_changed()
+
+    # ── UI state ──
+    def _kind_changed(self, *_):
+        is_agg = self._allow_agg and self.kind.currentIndex() == 1
+        for w in (self.field, self.op, self.value, self.value2):
+            w.setVisible(not is_agg)
+        for w in (self.agg_sub, self.agg_field, self.agg_op, self.agg_val,
+                  self.agg_cnt_lbl, self.agg_cnt_op, self.agg_cnt):
+            w.setVisible(is_agg)
+        if not is_agg:
+            self._op_changed()
+
+    def _op_changed(self, *_):
+        op = self.op.currentData()
+        self.value.setVisible(op not in ("empty", "not_empty"))
+        self.value2.setVisible(op == "between")
+
+    def _agg_sub_changed(self, *_):
+        cur = self.agg_field.currentText()
+        self.agg_field.clear()
+        self.agg_field.addItem("")          # 空 = 數全部列
+        self.agg_field.addItems(self._dlg.sub_columns(self.agg_sub.currentText()))
+        self.agg_field.setCurrentText(cur)
+
+    def set_field_choices(self, fields, subs):
+        cur = self.field.currentText()
+        self.field.clear(); self.field.addItems(fields)
+        self.field.setCurrentText(cur)
+        cur_sub = self.agg_sub.currentText()
+        self.agg_sub.clear(); self.agg_sub.addItems(subs)
+        if cur_sub:
+            self.agg_sub.setCurrentText(cur_sub)
+        self._agg_sub_changed()
+
+    # ── cond dict ↔ form ──
+    def _load(self, cond):
+        agg = cond.get("agg")
+        if agg and self._allow_agg:
+            self.kind.setCurrentIndex(1)
+            self.agg_sub.setCurrentText(str(agg.get("sub", "")))
+            self.agg_field.setCurrentText(str(agg.get("field", "")))
+            i = self.agg_op.findData(agg.get("op", "eq"))
+            self.agg_op.setCurrentIndex(max(0, i))
+            self.agg_val.setText(str(agg.get("value", "")))
+            i = self.agg_cnt_op.findData(agg.get("count_op", "ge"))
+            self.agg_cnt_op.setCurrentIndex(max(0, i))
+            try:
+                self.agg_cnt.setValue(int(float(agg.get("count", 1))))
+            except (ValueError, TypeError):
+                self.agg_cnt.setValue(1)
+        else:
+            self.field.setCurrentText(str(cond.get("field", "")))
+            i = self.op.findData(cond.get("op", "eq"))
+            self.op.setCurrentIndex(max(0, i))
+            self.value.setText(str(cond.get("value", "")))
+            self.value2.setText(str(cond.get("value2", "")))
+
+    def to_cond(self):
+        if self._allow_agg and self.kind.currentIndex() == 1:
+            return {"agg": {
+                "sub": self.agg_sub.currentText(),
+                "field": self.agg_field.currentText().strip(),
+                "op": self.agg_op.currentData(),
+                "value": self.agg_val.text(),
+                "count_op": self.agg_cnt_op.currentData(),
+                "count": self.agg_cnt.value(),
+            }}
+        c = {"field": self.field.currentText().strip(),
+             "op": self.op.currentData(),
+             "value": self.value.text()}
+        if c["op"] == "between":
+            c["value2"] = self.value2.text()
+        return c
+
+
+class ValidationRulesDialog(QDialog):
+    """自訂資料驗證規則編輯器（左：規則清單／右：規則內容）。
+    編輯的是 config[table]["validations"] 的複本，按「套用」才寫回。"""
+
+    def __init__(self, parent, manager, table_name):
+        super().__init__(parent)
+        self.manager = manager
+        self.table_name = table_name
+        self.setWindowTitle(f"驗證規則 — {table_name}")
+        self.setStyleSheet(APP_QSS)
+        self.resize(980, 640)
+
+        src = manager.config.get(table_name, {}).get("validations", [])
+        self.rules = [_v_norm(json.loads(json.dumps(r))) for r in src
+                      if isinstance(r, dict)]
+        self._cur = None          # index into self.rules currently in the form
+        self._loading = False
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
+        body = QHBoxLayout(); body.setContentsMargins(0, 0, 0, 0); body.setSpacing(0)
+
+        # ── left: rule list ──
+        left = QWidget(); left.setFixedWidth(250)
+        left.setStyleSheet(f"background:{_C['sidebar']}; border-right:1px solid {_C['border']};")
+        llo = QVBoxLayout(left); llo.setContentsMargins(10, 10, 10, 10); llo.setSpacing(8)
+        self._list = QListWidget()
+        self._list.setStyleSheet(
+            f"QListWidget{{background:{_C['panel']}; border:1px solid {_C['border']};"
+            f"border-radius:6px;}} QListWidget::item{{padding:7px 8px; border-radius:4px;}}"
+            f"QListWidget::item:selected{{background:{_C['card']};}}")
+        self._list.currentRowChanged.connect(self._on_select)
+        llo.addWidget(self._list, 1)
+        brow = QHBoxLayout(); brow.setSpacing(6)
+        b_add = _mk_btn("新增", "success", icon="plus");  b_add.clicked.connect(self._add_rule)
+        b_cp  = _mk_btn("", "ghost", icon="copy"); b_cp.setFixedWidth(30)
+        b_cp.setToolTip("複製選中規則"); b_cp.clicked.connect(self._copy_rule)
+        b_del = _mk_btn("", "danger", icon="trash"); b_del.setFixedWidth(30)
+        b_del.setToolTip("刪除選中規則"); b_del.clicked.connect(self._del_rule)
+        for b in (b_add, b_cp, b_del):
+            b.setFixedHeight(30); brow.addWidget(b)
+        llo.addLayout(brow)
+        body.addWidget(left)
+
+        # ── right: rule form ──
+        right = QWidget(); right.setStyleSheet(f"background:{_C['panel']};")
+        rscroll = QScrollArea(); rscroll.setWidgetResizable(True)
+        rscroll.setStyleSheet("background:transparent; border:none;")
+        rscroll.setWidget(right)
+        rlo = QVBoxLayout(right); rlo.setContentsMargins(16, 14, 16, 14); rlo.setSpacing(10)
+
+        def _cap(text):
+            lb = QLabel(text)
+            lb.setStyleSheet(f"color:{_C['txt3']}; font-size:10px; font-weight:600;"
+                             f"letter-spacing:1px; background:transparent;")
+            return lb
+
+        # 名稱 / 啟用
+        row1 = QHBoxLayout(); row1.setSpacing(8)
+        self.f_name = QLineEdit(); self.f_name.setPlaceholderText("規則名稱")
+        self.f_enabled = QCheckBox("啟用")
+        self.f_enabled.setStyleSheet(f"color:{_C['txt']}; background:transparent;")
+        row1.addWidget(self.f_name, 1); row1.addWidget(self.f_enabled)
+        rlo.addLayout(row1)
+
+        # scope / 嚴重度 / 顏色
+        row2 = QHBoxLayout(); row2.setSpacing(8)
+        row2.addWidget(_cap("作用範圍"))
+        self.f_scope = QComboBox(); self.f_scope.setMinimumWidth(160)
+        self.f_scope.addItem(f"母表（{table_name}）", "")
+        for sub in self._sub_names():
+            self.f_scope.addItem(f"子表 [{sub}]", sub)
+        self.f_scope.currentIndexChanged.connect(self._scope_changed)
+        row2.addWidget(self.f_scope)
+        row2.addSpacing(10)
+        row2.addWidget(_cap("嚴重度"))
+        self.f_sev = QComboBox()
+        self.f_sev.addItem("錯誤（擋存檔）", "error")
+        self.f_sev.addItem("警告（僅提醒）", "warn")
+        row2.addWidget(self.f_sev)
+        row2.addSpacing(10)
+        row2.addWidget(_cap("顏色"))
+        self.f_color = QPushButton(); self.f_color.setFixedSize(46, 26)
+        self.f_color.setToolTip("違規儲存格的標記顏色")
+        self.f_color.clicked.connect(self._pick_color)
+        self._color_val = _V_DEFAULT_COLOR
+        row2.addWidget(self.f_color)
+        row2.addStretch(1)
+        rlo.addLayout(row2)
+
+        # 模式切換
+        mode_row = QHBoxLayout(); mode_row.setSpacing(10)
+        self.f_mode_builder = QRadioButton("一般（條件組合）")
+        self.f_mode_expr    = QRadioButton("進階（表達式）")
+        for rb in (self.f_mode_builder, self.f_mode_expr):
+            rb.setStyleSheet(f"color:{_C['txt']}; background:transparent;")
+            mode_row.addWidget(rb)
+        mode_row.addStretch(1)
+        self._mode_grp = QButtonGroup(self)
+        self._mode_grp.addButton(self.f_mode_builder)
+        self._mode_grp.addButton(self.f_mode_expr)
+        self.f_mode_builder.toggled.connect(self._mode_changed)
+        rlo.addLayout(mode_row)
+
+        self._stack = QStackedWidget()
+        rlo.addWidget(self._stack, 1)
+
+        # ── builder page ──
+        bpage = QWidget(); bpage.setStyleSheet("background:transparent;")
+        blo = QVBoxLayout(bpage); blo.setContentsMargins(0, 0, 0, 0); blo.setSpacing(8)
+        when_hdr = QHBoxLayout()
+        when_hdr.addWidget(_cap("當（條件成立時檢查）"))
+        self.f_logic = QComboBox()
+        self.f_logic.addItem("全部成立 (AND)", "and")
+        self.f_logic.addItem("任一成立 (OR)", "or")
+        when_hdr.addWidget(self.f_logic)
+        b_wadd = _mk_btn("＋ 條件", "ghost"); b_wadd.setFixedHeight(24)
+        b_wadd.clicked.connect(lambda: self._add_cond(self._when_lo, {}))
+        when_hdr.addWidget(b_wadd); when_hdr.addStretch(1)
+        blo.addLayout(when_hdr)
+        hint_w = QLabel("（留空 = 每一列都檢查「則」）")
+        hint_w.setStyleSheet(f"color:{_C['txt3']}; font-size:11px; background:transparent;")
+        blo.addWidget(hint_w)
+        self._when_box = QWidget(); self._when_box.setStyleSheet("background:transparent;")
+        self._when_lo = QVBoxLayout(self._when_box)
+        self._when_lo.setContentsMargins(0, 0, 0, 0); self._when_lo.setSpacing(4)
+        blo.addWidget(self._when_box)
+
+        then_hdr = QHBoxLayout()
+        then_hdr.addWidget(_cap("則（必須全部成立，否則違規）"))
+        b_tadd = _mk_btn("＋ 要求", "ghost"); b_tadd.setFixedHeight(24)
+        b_tadd.clicked.connect(lambda: self._add_cond(self._then_lo, {}))
+        then_hdr.addWidget(b_tadd); then_hdr.addStretch(1)
+        blo.addLayout(then_hdr)
+        self._then_box = QWidget(); self._then_box.setStyleSheet("background:transparent;")
+        self._then_lo = QVBoxLayout(self._then_box)
+        self._then_lo.setContentsMargins(0, 0, 0, 0); self._then_lo.setSpacing(4)
+        blo.addWidget(self._then_box)
+        blo.addStretch(1)
+        self._stack.addWidget(bpage)
+
+        # ── expr page ──
+        epage = QWidget(); epage.setStyleSheet("background:transparent;")
+        elo = QVBoxLayout(epage); elo.setContentsMargins(0, 0, 0, 0); elo.setSpacing(6)
+        elo.addWidget(_cap("表達式（回傳 True＝通過，False＝違規）"))
+        self.f_expr = QPlainTextEdit()
+        self.f_expr.setPlaceholderText(
+            'SkillComponent != "ContinueBuff" or not empty(EffectDurationTime)')
+        self.f_expr.setMaximumHeight(96)
+        elo.addWidget(self.f_expr)
+        help_lbl = QLabel(
+            "可用：本列欄位直接寫欄名｜master.欄位（子表規則讀母表）｜"
+            "empty(x)、num(x)、match(regex, x)、len/str/int/float/abs/min/max/round｜"
+            "any_sub(\"子表\", \"條件式\")、count_sub(\"子表\", \"條件式\")（母表規則）｜"
+            "and / or / not、比較與四則運算")
+        help_lbl.setWordWrap(True)
+        help_lbl.setStyleSheet(f"color:{_C['txt3']}; font-size:11px; background:transparent;")
+        elo.addWidget(help_lbl)
+        elo.addStretch(1)
+        self._stack.addWidget(epage)
+
+        # 標記欄位
+        mark_row = QHBoxLayout(); mark_row.setSpacing(8)
+        mark_row.addWidget(_cap("標記欄位"))
+        self.f_mark = QLineEdit()
+        self.f_mark.setPlaceholderText("逗號分隔；留空＝自動（用「則」的欄位）")
+        mark_row.addWidget(self.f_mark, 1)
+        rlo.addLayout(mark_row)
+
+        # 測試列
+        test_row = QHBoxLayout(); test_row.setSpacing(8)
+        b_test = _mk_btn("▶ 測試規則", "primary"); b_test.setFixedHeight(28)
+        b_test.clicked.connect(self._test_rule)
+        self._test_lbl = QLabel("")
+        self._test_lbl.setStyleSheet(f"color:{_C['txt2']}; font-size:12px; background:transparent;")
+        self._test_lbl.setWordWrap(True)
+        test_row.addWidget(b_test); test_row.addWidget(self._test_lbl, 1)
+        rlo.addLayout(test_row)
+
+        body.addWidget(rscroll, 1)
+        outer.addLayout(body, 1)
+
+        # ── bottom bar ──
+        bb = QWidget(); bb.setStyleSheet(
+            f"background:{_C['sidebar']}; border-top:1px solid {_C['border']};")
+        bl = QHBoxLayout(bb); bl.setContentsMargins(16, 10, 16, 10)
+        bl.addStretch(1)
+        b_cancel = _mk_btn("取消"); b_cancel.setFixedHeight(32)
+        b_cancel.clicked.connect(self.reject)
+        b_ok = _mk_btn("套用", "primary"); b_ok.setFixedHeight(32)
+        b_ok.clicked.connect(self._apply)
+        bl.addWidget(b_cancel); bl.addWidget(b_ok)
+        outer.addWidget(bb)
+
+        self._right = right
+        self._reload_list(select=0 if self.rules else -1)
+        right.setEnabled(bool(self.rules))
+
+    # ── helpers ──
+    def _sub_names(self):
+        prefix = self.table_name + "."
+        return [k[len(prefix):] for k in self.manager.sub_tables
+                if k.startswith(prefix)]
+
+    def sub_columns(self, sub):
+        df = self.manager.sub_tables.get(f"{self.table_name}.{sub}")
+        return [] if df is None else [str(c) for c in df.columns]
+
+    def _master_columns(self):
+        df = self.manager.tables.get(self.table_name)
+        return [] if df is None else [str(c) for c in df.columns]
+
+    def _field_choices(self, scope):
+        if scope:
+            return (self.sub_columns(scope)
+                    + [f"master.{c}" for c in self._master_columns()])
+        return self._master_columns()
+
+    def _cond_rows(self, lo):
+        return [lo.itemAt(i).widget() for i in range(lo.count())
+                if isinstance(lo.itemAt(i).widget(), _VCondRow)]
+
+    def _clear_conds(self, lo):
+        for w in self._cond_rows(lo):
+            lo.removeWidget(w)
+            w.deleteLater()
+
+    def _add_cond(self, lo, cond):
+        scope = self.f_scope.currentData()
+        row = _VCondRow(self, cond, allow_agg=(scope == ""))
+        row.set_field_choices(self._field_choices(scope), self._sub_names())
+        row._load(cond or {})
+        row._kind_changed()
+        row.removed.connect(lambda w, l=lo: (l.removeWidget(w), w.deleteLater()))
+        lo.addWidget(row)
+        return row
+
+    # ── list handling ──
+    def _rule_item_text(self, r):
+        sev = "🔴" if r["severity"] == "error" else "🟡"
+        off = "" if r.get("enabled") else "（停用）"
+        sc  = f"[{r['scope']}] " if r.get("scope") else ""
+        return f"{sev} {sc}{r['name']}{off}"
+
+    def _reload_list(self, select=None):
+        cur = self._list.currentRow() if select is None else select
+        self._list.blockSignals(True)
+        self._list.clear()
+        for r in self.rules:
+            it = QListWidgetItem(self._rule_item_text(r))
+            pm = QPixmap(12, 12); pm.fill(QColor(r.get("color", _V_DEFAULT_COLOR)))
+            it.setIcon(QIcon(pm))
+            self._list.addItem(it)
+        self._list.blockSignals(False)
+        if 0 <= cur < len(self.rules):
+            self._list.setCurrentRow(cur)     # triggers _on_select
+        else:
+            self._cur = None
+
+    def _on_select(self, row):
+        if self._loading:
+            return
+        self._save_form()                     # persist previous rule's form
+        if 0 <= row < len(self.rules):
+            self._cur = row
+            self._load_form(self.rules[row])
+            self._right.setEnabled(True)
+        else:
+            self._cur = None
+            self._right.setEnabled(False)
+
+    def _add_rule(self):
+        self._save_form()
+        r = _v_new_rule()
+        self.rules.append(r)
+        self._cur = None                      # avoid re-saving old form over it
+        self._reload_list(select=len(self.rules) - 1)
+
+    def _copy_rule(self):
+        i = self._list.currentRow()
+        if not (0 <= i < len(self.rules)):
+            return
+        self._save_form()
+        r = json.loads(json.dumps(self.rules[i]))
+        r["id"] = uuid.uuid4().hex[:8]
+        r["name"] += "（複製）"
+        self.rules.insert(i + 1, r)
+        self._cur = None
+        self._reload_list(select=i + 1)
+
+    def _del_rule(self):
+        i = self._list.currentRow()
+        if not (0 <= i < len(self.rules)):
+            return
+        del self.rules[i]
+        self._cur = None
+        self._reload_list(select=min(i, len(self.rules) - 1))
+        if not self.rules:
+            self._right.setEnabled(False)
+
+    # ── form ↔ rule ──
+    def _load_form(self, r):
+        self._loading = True
+        try:
+            self.f_name.setText(r["name"])
+            self.f_enabled.setChecked(bool(r.get("enabled", True)))
+            i = self.f_scope.findData(r.get("scope", ""))
+            self.f_scope.setCurrentIndex(max(0, i))
+            i = self.f_sev.findData(r.get("severity", "error"))
+            self.f_sev.setCurrentIndex(max(0, i))
+            self._set_color(r.get("color", _V_DEFAULT_COLOR))
+            i = self.f_logic.findData(r.get("when", {}).get("logic", "and"))
+            self.f_logic.setCurrentIndex(max(0, i))
+            self._clear_conds(self._when_lo)
+            self._clear_conds(self._then_lo)
+            for c in r.get("when", {}).get("conds", []):
+                self._add_cond(self._when_lo, c)
+            for c in r.get("then", []):
+                self._add_cond(self._then_lo, c)
+            self.f_expr.setPlainText(r.get("expr", ""))
+            self.f_mark.setText(", ".join(r.get("mark", [])))
+            if r.get("mode") == "expr":
+                self.f_mode_expr.setChecked(True)
+            else:
+                self.f_mode_builder.setChecked(True)
+            self._mode_changed()
+            self._test_lbl.setText("")
+        finally:
+            self._loading = False
+
+    def _save_form(self):
+        if self._cur is None or not (0 <= self._cur < len(self.rules)):
+            return
+        self.rules[self._cur] = self._form_rule(self.rules[self._cur])
+        it = self._list.item(self._cur)
+        if it is not None:
+            it.setText(self._rule_item_text(self.rules[self._cur]))
+            pm = QPixmap(12, 12); pm.fill(QColor(self._color_val))
+            it.setIcon(QIcon(pm))
+
+    def _form_rule(self, base):
+        r = dict(base)
+        r["name"] = self.f_name.text().strip() or "未命名規則"
+        r["enabled"] = self.f_enabled.isChecked()
+        r["scope"] = self.f_scope.currentData() or ""
+        r["severity"] = self.f_sev.currentData()
+        r["color"] = self._color_val
+        r["mode"] = "expr" if self.f_mode_expr.isChecked() else "builder"
+        r["when"] = {"logic": self.f_logic.currentData(),
+                     "conds": [w.to_cond() for w in self._cond_rows(self._when_lo)]}
+        r["then"] = [w.to_cond() for w in self._cond_rows(self._then_lo)]
+        r["expr"] = self.f_expr.toPlainText().strip()
+        r["mark"] = [t.strip() for t in self.f_mark.text().split(",") if t.strip()]
+        return r
+
+    def _scope_changed(self, *_):
+        if self._loading:
+            return
+        scope = self.f_scope.currentData()
+        # scope 變更 → 條件列的欄位選項全部換掉（agg 只在母表可用）
+        for lo in (self._when_lo, self._then_lo):
+            conds = [w.to_cond() for w in self._cond_rows(lo)]
+            self._clear_conds(lo)
+            for c in conds:
+                if c.get("agg") and scope:
+                    continue                  # 子表 scope 不支援聚合條件
+                self._add_cond(lo, c)
+
+    def _mode_changed(self, *_):
+        self._stack.setCurrentIndex(1 if self.f_mode_expr.isChecked() else 0)
+
+    def _set_color(self, color):
+        self._color_val = color
+        self.f_color.setStyleSheet(
+            f"background:{color}; border:1px solid {_C['border']}; border-radius:5px;")
+
+    def _pick_color(self):
+        c = QColorDialog.getColor(QColor(self._color_val), self, "選擇標記顏色")
+        if c.isValid():
+            self._set_color(c.name())
+
+    def _test_rule(self):
+        if self._cur is None:
+            return
+        rule = self._form_rule(self.rules[self._cur])
+        cnt, samples, err = self.manager.validator.test_rule(self.table_name, rule)
+        if err:
+            self._test_lbl.setText(f'<span style="color:{_C["red"]}">✗ {err}</span>')
+            return
+        if cnt == 0:
+            self._test_lbl.setText(
+                f'<span style="color:{_C["green"]}">✓ 目前資料全部通過</span>')
+        else:
+            ex = "、".join(samples[:6]) + ("…" if cnt > 6 else "")
+            self._test_lbl.setText(
+                f'<span style="color:{_C["yellow"]}">⚠ 目前資料有 {cnt} 列違規'
+                f'（{ex}）</span>')
+
+    def _apply(self):
+        self._save_form()
+        self.accept()
+
+
 # ── App ───────────────────────────────────────────────────────────────────────
 
 class _Doc:
@@ -3789,6 +4464,7 @@ class App(QMainWindow):
             ("🔍", self._show_search,      "全域搜尋（Ctrl+F）"),
             ("📝", self._note_menu,        "筆記：新增／重新開啟已關閉"),
             ("🩺", self.open_health_check, "資料健檢"),
+            ("✅", self.open_validation_rules, "驗證規則（自訂資料驗證）"),
             ("⚙",  self.open_config,       "配置設定"),
             ("🕓", self._show_recent_menu, "最近開啟"),
         ]:
@@ -4128,6 +4804,18 @@ class App(QMainWindow):
         for ed in self._editors.values():
             if ed is not None:
                 ed.flush_pending_edits()
+        # ── 資料驗證閘門：先全量重驗，錯誤擋存檔、警告可放行 ──
+        self.manager.validator.validate_all()
+        v_items = self.manager.validator.summary()
+        if v_items:
+            errs = sum(1 for i in v_items if i["severity"] == "error")
+            warns = len(v_items) - errs
+            proceed = self._show_validation_gate(v_items, errs, warns)
+            for ed in self._editors.values():        # gate 重驗後刷新標示
+                if ed is not None:
+                    ed._refresh_validation_visuals()
+            if not proceed:
+                return
         # notes live in config → flush widget state and persist alongside the DB
         self._flush_notes()
         self.manager.save_config()
@@ -4627,6 +5315,99 @@ class App(QMainWindow):
             return
         issues = self.manager.health_check(tname)
         self._show_health_dialog(tname, issues)
+
+    # ── Validation rules ───────────────────────────────────────────────────────
+
+    def open_validation_rules(self):
+        idx = self._tab_widget.currentIndex()
+        if idx < 0:
+            self.show_snackbar("尚未載入任何 JSON 檔案"); return
+        tname = self._tab_widget.tabText(idx)
+        if tname not in self.manager.tables:
+            return
+        dlg = ValidationRulesDialog(self, self.manager, tname)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self.manager.config.setdefault(tname, {})["validations"] = dlg.rules
+        self.manager.save_config()
+        self.manager.validator.reload()
+        if self.manager.validator.last_errors:
+            names = "、".join(n for n, _ in self.manager.validator.last_errors)
+            QMessageBox.warning(self, "表達式錯誤",
+                                f"以下規則的表達式無法解析（將不會生效）：\n{names}")
+        ed = self._editors.get(tname)
+        if ed is not None:
+            ed._load_item_list()
+            ed._refresh_validation_visuals()
+            if ed._field_panel is not None:
+                ed._field_panel.refresh_validation()
+        self.show_snackbar("✓ 驗證規則已套用", color=_C["green"])
+
+    def _show_validation_gate(self, items, errs, warns):
+        """存檔前的驗證結果對話框。回傳 True = 照存（僅警告時可選）。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("資料驗證未通過")
+        dlg.setMinimumWidth(560)
+        dlg.resize(680, 480)
+        dlg.setStyleSheet(APP_QSS)
+        outer = QVBoxLayout(dlg)
+        outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
+
+        hdr = QLabel(
+            f"發現 <span style='color:{_C['red']}'>{errs} 個錯誤</span>、"
+            f"<span style='color:{_C['yellow']}'>{warns} 個警告</span>"
+            + ("&nbsp;&nbsp;——&nbsp;錯誤必須修正後才能儲存" if errs else ""))
+        hdr.setStyleSheet(
+            f"color:{_C['txt']}; font-size:13px; font-weight:600; "
+            f"background:{_C['sidebar']}; padding:12px 16px; "
+            f"border-bottom:1px solid {_C['border']};")
+        outer.addWidget(hdr)
+
+        lst = QListWidget()
+        lst.setStyleSheet(
+            f"QListWidget{{background:{_C['panel']}; border:none;}}"
+            f"QListWidget::item{{padding:8px 12px; border-bottom:1px solid {_C['border']};}}"
+            f"QListWidget::item:hover{{background:{_C['card']};}}")
+        for it in items:
+            sev_dot = "🔴" if it["severity"] == "error" else "🟡"
+            where = f"{it['sheet']}" + (f"（{it['pk_val']}）" if it["pk_val"] else "")
+            li = QListWidgetItem(
+                f"{sev_dot} {it['rule']['name']}    {where} → {', '.join(it['cols'])}")
+            li.setToolTip("點擊跳到該儲存格")
+            li.setData(Qt.UserRole, it)
+            lst.addItem(li)
+
+        def _jump(li):
+            it = li.data(Qt.UserRole)
+            if not it:
+                return
+            dlg.reject()
+            col = it["cols"][0] if it["cols"] else None
+            self.navigate_to(it["sheet"], it["is_sub"], it["row_idx"], col)
+
+        lst.itemClicked.connect(_jump)
+        outer.addWidget(lst, 1)
+
+        bb = QWidget(); bb.setStyleSheet(
+            f"background:{_C['sidebar']}; border-top:1px solid {_C['border']};")
+        bl = QHBoxLayout(bb); bl.setContentsMargins(16, 10, 16, 10)
+        bl.addStretch(1)
+        result = {"save": False}
+        if not errs:
+            b_save = _mk_btn("仍要儲存", "danger"); b_save.setFixedHeight(32)
+
+            def _force():
+                result["save"] = True
+                dlg.accept()
+
+            b_save.clicked.connect(_force)
+            bl.addWidget(b_save)
+        b_cancel = _mk_btn("取消（回去修正）", "primary"); b_cancel.setFixedHeight(32)
+        b_cancel.clicked.connect(dlg.reject)
+        bl.addWidget(b_cancel)
+        outer.addWidget(bb)
+        dlg.exec()
+        return result["save"]
 
     def _show_health_dialog(self, table_name, issues):
         dlg = QDialog(self)
@@ -5171,6 +5952,7 @@ class App(QMainWindow):
 
         self.manager.config[table_name] = cfg
         self.manager.save_config()
+        self.manager.validator.reload()   # 欄位型別/子表設定變了 → 規則重編譯重驗
         editor = self._editors.get(table_name)
         if editor:
             editor.reload_after_config()
