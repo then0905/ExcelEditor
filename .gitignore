@@ -1,2 +1,25 @@
+# build 產物
 dist/
 nuitka_dist/
+build/
+main.build/
+__pycache__/
+*.pyc
+nuitka-crash-report.xml
+
+# 虛擬環境
+.venv/
+JEB_env/
+
+# IDE
+.idea/
+.vscode/
+
+# 使用者本機設定（含絕對路徑，首次啟動會自動建立）
+config.json
+config_test*.json
+
+# 執行/編輯過程產物
+*.bak
+*.tmp
+log.txt

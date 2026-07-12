@@ -1,6 +1,51 @@
-# Excel編輯器
+# JsonEditor（遊戲資料 JSON 編輯器）
 
 ![示意圖](https://github.com/user-attachments/assets/8ef0ca77-3b8e-4ff3-8693-67ab0120cafa)
+
+> 目前版本直接編輯 **JSON** 資料檔（母表＋子表兩層結構），早期的 Excel 版本已淘汰；
+> 下方使用說明中與 Excel 相關的段落為舊版文件，待更新。
+
+## 快速開始（使用原始碼）
+
+```bash
+git clone https://github.com/then0905/JsonEditor.git
+cd JsonEditor
+
+# 建立虛擬環境並安裝依賴（Python 3.11+）
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+
+# 執行
+.venv\Scripts\python main.py
+```
+
+- 開啟後用「開檔」載入任一遊戲資料 `.json`（頂層為物件陣列，或 {表名: 陣列}）。
+- 每個 JSON 檔的欄位型別、驗證規則、欄位綁定等設定存於自動建立的 `config.json`（不入版控）。
+
+### 跑測試
+
+```bash
+set QT_QPA_PLATFORM=offscreen
+.venv\Scripts\python tests\test_validation.py
+.venv\Scripts\python tests\test_field_binding.py
+# 其餘 tests/*.py 同理
+```
+
+### 打包成執行檔
+
+雙擊 `JsonEditor.bat`（Nuitka standalone，含部署步驟，詳見 `打包與發布.md`）。
+路徑含非 ASCII 字元時必須保留 bat 內的 `--experimental=force-dependencies-pefile` 參數。
+
+### 主要功能
+
+- 母表／子表兩層編輯、enum 下拉、bool、陣列 chips 編輯（含建議值快速選填）
+- 資料驗證規則（類 Excel 資料驗證：條件式規則＋違規上色＋存檔攔截）
+- 欄位綁定（依驅動欄位值條件式顯示欄位）
+- 範本列（從範本深拷貝母列＋子表列）、資料健檢、跨檔文字參照、全域搜尋、比較視窗、筆記、多開
+
+開發規範與資料模型細節見 `CLAUDE.md`。
+
+---
 
 ##  前言
 
