@@ -962,6 +962,21 @@ def _get_array_suggestions(df, this_col, context_col, context_value, limit=60):
     return sorted(out)[:limit]
 
 
+def _suggest_chip_btn(tok, on_click):
+    """建議值的可點擊小按鈕（陣列彈窗與母表欄位編輯器共用）。"""
+    b = QPushButton(f"＋ {tok}")
+    b.setAutoDefault(False); b.setDefault(False)
+    b.setCursor(Qt.PointingHandCursor)
+    b.setStyleSheet(
+        f"QPushButton {{ background:{_C['card']}; color:{_C['txtAcc']}; "
+        f"border:1px solid {_C['border']}; border-radius:9px; "
+        f"padding:2px 8px; font-size:12px; }}"
+        f"QPushButton:hover {{ background:{_C['cardH']}; "
+        f"border-color:{_C['borderH']}; }}")
+    b.clicked.connect(lambda _=False, t=tok: on_click(t))
+    return b
+
+
 class _SuggestLineEdit(QLineEdit):
     """QLineEdit that auto-pops its completer once on first focus-in.
     One-shot so that after the user picks a value the popup won't keep
@@ -1284,17 +1299,7 @@ class ArrayEditDialog(QDialog):
                 f"border-radius:6px;")
             sflow = FlowLayout(sug_box, spacing=4)
             for tok in suggestions:
-                b = QPushButton(f"＋ {tok}")
-                b.setAutoDefault(False); b.setDefault(False)
-                b.setCursor(Qt.PointingHandCursor)
-                b.setStyleSheet(
-                    f"QPushButton {{ background:{_C['card']}; color:{_C['txtAcc']}; "
-                    f"border:1px solid {_C['border']}; border-radius:9px; "
-                    f"padding:2px 8px; font-size:12px; }}"
-                    f"QPushButton:hover {{ background:{_C['cardH']}; "
-                    f"border-color:{_C['borderH']}; }}")
-                b.clicked.connect(lambda _=False, t=tok: self._chips.add_token(t))
-                sflow.addWidget(b)
+                sflow.addWidget(_suggest_chip_btn(tok, self._chips.add_token))
             sscroll = QScrollArea()
             sscroll.setWidgetResizable(True)
             sscroll.setMaximumHeight(120)
@@ -1370,6 +1375,8 @@ class FieldEditorWidget(QWidget):
         self._img_ext:            str  = ""  # file extension appended to assembled path e.g. ".png"
         self._text_ref_cfg  = {}   # col → {"json_path","key_col","val_col"} (per-column text_ref)
         self._ref_labels    = {}   # col → QLabel (resolved lookup text for "text_ref" type)
+        self._array_sug     = {}   # array col → {box, flow, cap, ctx, chips}（建議值區）
+        self._array_sug_ctx = {}   # array col → 上次渲染的 context 值（避免重複重建）
         self._row_idx     = None
         self._table_name  = None
         self._manager     = None
@@ -1410,6 +1417,8 @@ class FieldEditorWidget(QWidget):
         self._img_ext            = ""
         self._text_ref_cfg = {}
         self._ref_labels.clear()
+        self._array_sug.clear()
+        self._array_sug_ctx.clear()
         self._table_name = table_name
         self._manager    = manager
         cols_cfg  = cfg.get("columns", {})
@@ -1548,6 +1557,37 @@ class FieldEditorWidget(QWidget):
                 w.changed.connect(
                     lambda c=col, _w=w: self.field_changed.emit(c, _w.value())
                 )
+                sug_ctx = col_conf.get("suggest_from", "")
+                if sug_ctx:
+                    # 建議值快速選填區（依當前列的 context 值於 load_row 時填入）
+                    cap = QLabel("")
+                    cap.setStyleSheet(
+                        f"color:{_C['txt3']}; font-size:11px; background:transparent;")
+                    sug_box = QWidget()
+                    sug_box.setStyleSheet(
+                        f"background:{_C['code']}; border:1px solid {_C['border']}; "
+                        f"border-radius:6px;")
+                    sflow = FlowLayout(sug_box, spacing=4)
+                    sscroll = QScrollArea()
+                    sscroll.setWidgetResizable(True)
+                    sscroll.setMaximumHeight(88)
+                    sscroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                    sscroll.setStyleSheet(
+                        "QScrollArea{border:none; background:transparent;}")
+                    sscroll.setWidget(sug_box)
+                    glo.addWidget(w)
+                    glo.addWidget(cap)
+                    glo.addWidget(sscroll)
+                    self._widgets[col] = w
+                    self._array_sug[col] = {"box": sug_box, "flow": sflow,
+                                            "cap": cap, "scroll": sscroll,
+                                            "ctx": sug_ctx, "chips": w}
+                    sep = QFrame(); sep.setFixedHeight(1)
+                    sep.setStyleSheet(f"background: {_C['border']}; border: none;")
+                    self._form_lo.addWidget(grp)
+                    self._form_lo.addWidget(sep)
+                    self._grp_widgets[col] = (grp, sep)
+                    continue
 
             elif col_type == "text_ref":
                 # Editable string (same as string type) — value IS the lookup key
@@ -1740,6 +1780,37 @@ class FieldEditorWidget(QWidget):
             show = rel is None or col in rel
             grp.setVisible(show)
             sep.setVisible(show)
+
+    def refresh_array_suggestions(self):
+        """重建有建議來源的陣列欄位建議值區（context 值沒變就跳過）。"""
+        if not self._built or self._row_idx is None or self._manager is None:
+            return
+        df = self._manager.tables.get(self._table_name)
+        if df is None or self._row_idx not in df.index:
+            return
+        for col, sug in self._array_sug.items():
+            ctx_col = sug["ctx"]
+            ctx_val = str(df.at[self._row_idx, ctx_col]) \
+                if ctx_col in df.columns else ""
+            if self._array_sug_ctx.get(col) == ctx_val:
+                continue
+            self._array_sug_ctx[col] = ctx_val
+            flow = sug["flow"]
+            while flow.count():
+                it = flow.takeAt(0)
+                w = it.widget()
+                if w is not None:
+                    w.hide()
+                    w.deleteLater()
+            toks = _get_array_suggestions(df, col, ctx_col, ctx_val)
+            for tok in toks:
+                flow.addWidget(_suggest_chip_btn(tok, sug["chips"].add_token))
+            sug["cap"].setText(
+                f"建議值（點一下加入）　來源：{ctx_col}＝{ctx_val} 的既有資料"
+                if toks else "")
+            sug["scroll"].setVisible(bool(toks))
+            sug["cap"].setVisible(bool(toks))
+            sug["box"].updateGeometry()
 
     def load_row(self, row_data, row_idx):
         if not self._built:
@@ -2873,6 +2944,7 @@ class TableEditor(QWidget):
 
         self._field_panel.load_row(row_data, df_idx)
         self._field_panel.refresh_binding()
+        self._field_panel.refresh_array_suggestions()
         self._update_json(row_data)
         self._refresh_sub_tables()
 
@@ -3035,6 +3107,7 @@ class TableEditor(QWidget):
         if self._field_panel is not None:
             self._field_panel.refresh_validation()
             self._field_panel.refresh_binding()
+            self._field_panel.refresh_array_suggestions()   # context 欄改了會換建議
         it = self._card_list.currentItem()
         if it is not None:
             df_idx = it.data(Qt.UserRole)

@@ -18,12 +18,14 @@ import main as M
 from json_data_manager import JsonDataManager
 
 SKILLS = [
-    {"SkillID": "S1", "Name": "火球",
+    {"SkillID": "S1", "Name": "火球", "Type": "Active", "Tags": ["fire", "aoe"],
      "Operation": [
          {"SkillComponent": "Damage", "InfluenceStatus": ["ATK", "DEF"]},
          {"SkillComponent": "Damage", "InfluenceStatus": ["ATK", "SPD"]},
      ]},
-    {"SkillID": "S2", "Name": "護盾",
+    {"SkillID": "S2", "Name": "灼燒", "Type": "Active", "Tags": ["burn"],
+     "Operation": []},
+    {"SkillID": "S3", "Name": "護盾", "Type": "Passive", "Tags": ["shield"],
      "Operation": [
          {"SkillComponent": "PassiveBuff", "InfluenceStatus": ["HP"]},
      ]},
@@ -39,6 +41,8 @@ def make_manager():
     mgr.load_json(jpath)
     sub_cols = mgr.config["SkillData"]["sub_tables"]["Operation"]["columns"]
     sub_cols["InfluenceStatus"] = {"type": "array", "suggest_from": "SkillComponent"}
+    mgr.config["SkillData"]["columns"]["Tags"] = {"type": "array",
+                                                  "suggest_from": "Type"}
     return mgr
 
 
@@ -85,9 +89,41 @@ def test_delegate_wiring():
     print("  PASS  test_delegate_wiring")
 
 
+def test_master_field_editor_suggestions():
+    mgr = make_manager()
+    df = mgr.tables["SkillData"]
+    panel = M.FieldEditorWidget()
+    panel.build_for(df, mgr.config["SkillData"], "SkillData", mgr)
+    assert "Tags" in panel._array_sug
+    # S1（Active）→ 建議＝所有 Active 列的 Tags token
+    m1 = df.index[0]
+    panel.load_row(df.loc[m1], m1)
+    panel.refresh_array_suggestions()
+    sug = panel._array_sug["Tags"]
+    texts = set()
+    for i in range(sug["flow"].count()):
+        texts.add(sug["flow"].itemAt(i).widget().text())
+    assert texts == {"＋ aoe", "＋ burn", "＋ fire"}, texts
+    assert "Type＝Active" in sug["cap"].text()
+    # 點建議 → 加入 chips
+    for i in range(sug["flow"].count()):
+        b = sug["flow"].itemAt(i).widget()
+        if b.text() == "＋ burn":
+            b.click()
+    assert "burn" in panel._widgets["Tags"].value()
+    # 換到 Passive 列 → 建議跟著換
+    m3 = df.index[2]
+    panel.load_row(df.loc[m3], m3)
+    panel.refresh_array_suggestions()
+    texts = {sug["flow"].itemAt(i).widget().text()
+             for i in range(sug["flow"].count())}
+    assert texts == {"＋ shield"}, texts
+    print("  PASS  test_master_field_editor_suggestions")
+
+
 if __name__ == "__main__":
     tests = (test_get_array_suggestions, test_dialog_suggestion_block,
-             test_delegate_wiring)
+             test_delegate_wiring, test_master_field_editor_suggestions)
     failed = 0
     for fn in tests:
         try:
