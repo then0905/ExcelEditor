@@ -23,6 +23,8 @@ SKILLS = [
      "Operation": [
          {"SkillComponent": "Damage", "EffectValue": 10,
           "InfluenceStatus": "", "EffectDurationTime": ""},
+         {"SkillComponent": "Heal", "EffectValue": 5,
+          "InfluenceStatus": "", "EffectDurationTime": ""},
      ]},
     {"SkillID": "S2", "Name": "護盾", "Type": "Passive",
      "Operation": [
@@ -122,15 +124,17 @@ def test_binding_tab_roundtrip():
     mgr = make_manager()
     dlg = M.ValidationRulesDialog(None, mgr, "SkillData")
     tab = dlg._binding_tab
-    # 切到 Operation scope → 載入現有綁定：一值一卡
+    # 切到 Operation scope → 已設定值＋資料值自動各一卡
     i = tab.f_scope.findData("Operation")
     tab.f_scope.setCurrentIndex(i)
     assert tab.f_driver.currentData() == "SkillComponent"
-    assert set(tab._cards) == {"Damage", "PassiveBuff"}
-    assert tab._cards["Damage"]["EffectValue"].isChecked()
-    assert not tab._cards["PassiveBuff"]["EffectValue"].isChecked()
+    assert set(tab._cards) == {"Damage", "PassiveBuff", "Heal"}   # Heal 自動帶出
+    assert tab._cards["Damage"]["configured"]
+    assert not tab._cards["Heal"]["configured"]                   # 未設定
+    assert tab._cards["Damage"]["boxes"]["EffectValue"].isChecked()
+    assert not tab._cards["PassiveBuff"]["boxes"]["EffectValue"].isChecked()
     # 改勾選：把 EffectValue 也綁到 PassiveBuff
-    tab._cards["PassiveBuff"]["EffectValue"].setChecked(True)
+    tab._cards["PassiveBuff"]["boxes"]["EffectValue"].setChecked(True)
     out = dlg.bindings()
     assert "EffectValue" in out["Operation"]["groups"]["PassiveBuff"]
     assert out["Operation"]["driver"] == "SkillComponent"
@@ -139,33 +143,30 @@ def test_binding_tab_roundtrip():
     print("  PASS  test_binding_tab_roundtrip")
 
 
-def test_binding_tab_new_value_and_unbind():
+def test_binding_tab_auto_values_and_unbind():
     mgr = make_manager()
     dlg = M.ValidationRulesDialog(None, mgr, "SkillData")
     tab = dlg._binding_tab
     tab.f_scope.setCurrentIndex(tab.f_scope.findData("Operation"))
-    # 新增值卡片（繞過選單直接呼叫）
-    tab._add_value("Heal")
-    assert "Heal" in tab._cards
+    # 未設定的卡片不寫入 groups（該值不隱藏任何欄位）
     out = dlg.bindings()
-    assert out["Operation"]["groups"]["Heal"] == []      # 新卡片預設全不勾
-    # 移除卡片 → 該值恢復「不隱藏任何欄位」
-    tab._del_value("Heal")
-    assert "Heal" not in tab._cards
-    assert "Heal" not in dlg.bindings()["Operation"]["groups"]
-    # 資料中出現但沒建卡的值不會被自動寫進 groups（不誤藏）
-    assert set(dlg.bindings()["Operation"]["groups"]) == {"Damage", "PassiveBuff"}
+    assert set(out["Operation"]["groups"]) == {"Damage", "PassiveBuff"}
+    # 在 Heal 卡片打勾 → 自動轉為已設定 → 寫入
+    tab._cards["Heal"]["boxes"]["EffectValue"].setChecked(True)
+    assert tab._cards["Heal"]["configured"]
+    out = dlg.bindings()
+    assert out["Operation"]["groups"]["Heal"] == ["EffectValue"]
     # 驅動欄位改成（不綁定）→ 該表綁定移除
     tab.f_driver.setCurrentIndex(0)
     out = dlg.bindings()
     assert "Operation" not in out
-    print("  PASS  test_binding_tab_new_value_and_unbind")
+    print("  PASS  test_binding_tab_auto_values_and_unbind")
 
 
 if __name__ == "__main__":
     tests = (test_model_lock_and_grey, test_panel_column_hiding,
              test_field_editor_hides_blocks, test_binding_tab_roundtrip,
-             test_binding_tab_new_value_and_unbind)
+             test_binding_tab_auto_values_and_unbind)
     failed = 0
     for fn in tests:
         try:

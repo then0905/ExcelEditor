@@ -4211,9 +4211,9 @@ class _BindingTab(QWidget):
         top.addStretch(1)
         lo.addLayout(top)
 
-        hint = QLabel("每個值一張卡片，勾選＝那個值的時候要顯示的欄位。"
-                      "沒被任何卡片勾到的欄位＝共用欄位（永遠顯示）；ID/FK 與切換欄位本身也永遠顯示。"
-                      "沒建卡片的值不會隱藏任何欄位。")
+        hint = QLabel("每個值一張卡片（自動從欄位設定與資料帶出），勾選＝那個值的時候要顯示的欄位。"
+                      "「未設定」的卡片不隱藏任何欄位；沒被任何卡片勾到的欄位＝共用欄位（永遠顯示）；"
+                      "ID/FK 與切換欄位本身也永遠顯示。")
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color:{_C['txt3']}; font-size:11px; background:transparent;")
         lo.addWidget(hint)
@@ -4312,12 +4312,13 @@ class _BindingTab(QWidget):
 
     def _rebuild_cards(self, keep_checks):
         """一個 driver 值一張卡片：「當 <欄位>＝<值> 時，顯示勾選的欄位」。
-        只替已設定的值建卡（沒卡片的值＝不隱藏任何欄位）。"""
+        值自動來自欄位設定(enum options)與資料；未設定的卡片＝不隱藏任何欄位，
+        一打勾即轉為已設定，「還原為未設定」可反悔。"""
         self._clear_cards()
         driver = self.f_driver.currentData() or ""
         if not driver:
             ph = QLabel("↑ 先選「② 依哪個欄位的值切換」（例如 SkillComponent），"
-                        "這裡就會出現每個值的設定卡片。")
+                        "這裡就會自動列出每個值的設定卡片。")
             ph.setStyleSheet(f"color:{_C['txt3']}; font-size:12px; background:transparent;")
             ph.setWordWrap(True)
             self._cards_lo.addWidget(ph)
@@ -4326,16 +4327,21 @@ class _BindingTab(QWidget):
         b = self._edits.get(self._cur_scope) or {}
         groups = b.get("groups", {}) if (keep_checks and
                                          b.get("driver") == driver) else {}
-        for val, fields in groups.items():
-            self._add_card(val, set(fields if isinstance(fields, list) else []))
-        b_add = _mk_btn("＋ 新增值的卡片…", "ghost")
-        b_add.setFixedHeight(30)
-        b_add.setToolTip("替某個值（如 Damage）建立顯示欄位設定")
-        b_add.clicked.connect(self._add_value_menu)
-        self._cards_lo.addWidget(b_add)
+        values = list(groups.keys())                       # 已設定的先列
+        for v in self._data_values(self._cur_scope, driver):
+            if v not in values:
+                values.append(v)                           # 資料/enum 自動帶出
+        for val in values:
+            fields = groups.get(val)
+            self._add_card(val, configured=isinstance(fields, list),
+                           checked=set(fields or []))
+        if not values:
+            ph = QLabel("這個欄位目前沒有任何值（資料與 enum 選項都是空的）。")
+            ph.setStyleSheet(f"color:{_C['txt3']}; font-size:12px; background:transparent;")
+            self._cards_lo.addWidget(ph)
         self._cards_lo.addStretch(1)
 
-    def _add_card(self, value, checked):
+    def _add_card(self, value, configured, checked):
         driver = self.f_driver.currentData() or ""
         card = QWidget()
         card.setObjectName("bindCard")
@@ -4348,15 +4354,17 @@ class _BindingTab(QWidget):
         t = QLabel(f"當 <b style='color:{_C['txtAcc']}'>{driver}</b> ＝ "
                    f"<b style='color:{_C['txtAcc']}'>{value}</b> 時，顯示：")
         t.setStyleSheet(f"color:{_C['txt']}; font-size:12px; background:transparent; border:none;")
-        hdr.addWidget(t); hdr.addStretch(1)
+        hdr.addWidget(t)
+        status = QLabel()
+        status.setStyleSheet(f"color:{_C['txt3']}; font-size:11px; background:transparent; border:none;")
+        hdr.addWidget(status)
+        hdr.addStretch(1)
         b_all = _mk_btn("全選", "ghost"); b_none = _mk_btn("全不選", "ghost")
-        for btn in (b_all, b_none):
+        b_reset = _mk_btn("還原為未設定", "ghost")
+        for btn in (b_all, b_none, b_reset):
             btn.setFixedHeight(22)
-        b_del = _mk_btn("", "danger", icon="trash")
-        b_del.setFixedSize(24, 24)
-        b_del.setToolTip("移除這張卡片（該值恢復成「不隱藏任何欄位」）")
-        b_del.clicked.connect(lambda _=False, val=value: self._del_value(val))
-        hdr.addWidget(b_all); hdr.addWidget(b_none); hdr.addWidget(b_del)
+        b_reset.setToolTip("清掉這張卡片的設定，此值恢復成「顯示全部欄位」")
+        hdr.addWidget(b_all); hdr.addWidget(b_none); hdr.addWidget(b_reset)
         v.addLayout(hdr)
 
         grid = QGridLayout(); grid.setHorizontalSpacing(14); grid.setVerticalSpacing(4)
@@ -4368,43 +4376,44 @@ class _BindingTab(QWidget):
             grid.addWidget(cb, i // 4, i % 4)
             boxes[f] = cb
         v.addLayout(grid)
-        b_all.clicked.connect(lambda _=False, bs=boxes: [cb.setChecked(True) for cb in bs.values()])
-        b_none.clicked.connect(lambda _=False, bs=boxes: [cb.setChecked(False) for cb in bs.values()])
 
+        entry = {"boxes": boxes, "configured": configured, "status": status}
+        self._cards[value] = entry
+
+        def _upd_status():
+            status.setText("" if entry["configured"] else "（未設定：顯示全部欄位）")
+            b_reset.setVisible(entry["configured"])
+
+        def _mark_configured(*_a):
+            if not self._loading and not entry["configured"]:
+                entry["configured"] = True
+                _upd_status()
+
+        for cb in boxes.values():
+            cb.stateChanged.connect(_mark_configured)
+
+        def _set_all(state):
+            entry["configured"] = True
+            for cb in boxes.values():
+                cb.setChecked(state)
+            _upd_status()
+
+        b_all.clicked.connect(lambda _=False: _set_all(True))
+        b_none.clicked.connect(lambda _=False: _set_all(False))
+
+        def _reset():
+            self._loading = True
+            try:
+                for cb in boxes.values():
+                    cb.setChecked(False)
+            finally:
+                self._loading = False
+            entry["configured"] = False
+            _upd_status()
+
+        b_reset.clicked.connect(lambda _=False: _reset())
+        _upd_status()
         self._cards_lo.addWidget(card)   # 只在 _rebuild_cards 內呼叫，依序排列
-        self._cards[value] = boxes
-
-    def _add_value_menu(self):
-        menu = QMenu(self)
-        cands = [v for v in self._data_values(self._cur_scope,
-                                              self.f_driver.currentData() or "")
-                 if v not in self._cards]
-        for v in cands:
-            menu.addAction(v, lambda val=v: self._add_value(val))
-        if cands:
-            menu.addSeparator()
-        menu.addAction("自訂輸入…", self._add_value_custom)
-        menu.exec(QCursor.pos())
-
-    def _add_value_custom(self):
-        v, ok = QInputDialog.getText(self, "新增值",
-                                     f"{self.f_driver.currentData()} 的值：")
-        if ok and v.strip():
-            self._add_value(v.strip())
-
-    def _add_value(self, value):
-        if value in self._cards:
-            return
-        self._save_scope(self._cur_scope)          # 保住目前勾選
-        self._edits.setdefault(self._cur_scope, {}).setdefault("groups", {})[value] = []
-        self._edits[self._cur_scope].setdefault("driver",
-                                                self.f_driver.currentData() or "")
-        self._rebuild_cards(keep_checks=True)
-
-    def _del_value(self, value):
-        self._save_scope(self._cur_scope)
-        (self._edits.get(self._cur_scope) or {}).get("groups", {}).pop(value, None)
-        self._rebuild_cards(keep_checks=True)
 
     # ── 工作複本 ↔ UI ──
     def _save_scope(self, scope):
@@ -4415,8 +4424,10 @@ class _BindingTab(QWidget):
             self._edits.pop(scope, None)
             return
         groups = {}
-        for val, boxes in self._cards.items():
-            groups[val] = [f for f, cb in boxes.items() if cb.isChecked()]
+        for val, entry in self._cards.items():
+            if entry["configured"]:   # 未設定的卡片不寫入（＝該值不隱藏任何欄位）
+                groups[val] = [f for f, cb in entry["boxes"].items()
+                               if cb.isChecked()]
         self._edits[scope] = {"enabled": self.f_enabled.isChecked(),
                               "driver": driver, "groups": groups}
 
