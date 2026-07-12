@@ -122,20 +122,15 @@ def test_binding_tab_roundtrip():
     mgr = make_manager()
     dlg = M.ValidationRulesDialog(None, mgr, "SkillData")
     tab = dlg._binding_tab
-    # 切到 Operation scope → 載入現有綁定
+    # 切到 Operation scope → 載入現有綁定：一值一卡
     i = tab.f_scope.findData("Operation")
     tab.f_scope.setCurrentIndex(i)
     assert tab.f_driver.currentData() == "SkillComponent"
-    assert "Damage" in tab._values and "PassiveBuff" in tab._values
-    r_eff = tab._fields.index("EffectValue")
-    c_dmg = tab._values.index("Damage")
-    assert tab._matrix.item(r_eff, c_dmg).checkState() == Qt.Checked
-    # 共用欄位標示：EffectValue 有勾 → 綁定；未勾列 → 共用
-    sc = len(tab._values)
-    assert tab._matrix.item(r_eff, sc).text() == "綁定"
+    assert set(tab._cards) == {"Damage", "PassiveBuff"}
+    assert tab._cards["Damage"]["EffectValue"].isChecked()
+    assert not tab._cards["PassiveBuff"]["EffectValue"].isChecked()
     # 改勾選：把 EffectValue 也綁到 PassiveBuff
-    c_buf = tab._values.index("PassiveBuff")
-    tab._matrix.item(r_eff, c_buf).setCheckState(Qt.Checked)
+    tab._cards["PassiveBuff"]["EffectValue"].setChecked(True)
     out = dlg.bindings()
     assert "EffectValue" in out["Operation"]["groups"]["PassiveBuff"]
     assert out["Operation"]["driver"] == "SkillComponent"
@@ -149,11 +144,17 @@ def test_binding_tab_new_value_and_unbind():
     dlg = M.ValidationRulesDialog(None, mgr, "SkillData")
     tab = dlg._binding_tab
     tab.f_scope.setCurrentIndex(tab.f_scope.findData("Operation"))
-    # 手動加值（繞過 QInputDialog 直接操作工作複本）
-    tab._save_scope("Operation")
-    tab._edits["Operation"]["groups"]["Heal"] = []
-    tab._load_scope("Operation")
-    assert "Heal" in tab._values
+    # 新增值卡片（繞過選單直接呼叫）
+    tab._add_value("Heal")
+    assert "Heal" in tab._cards
+    out = dlg.bindings()
+    assert out["Operation"]["groups"]["Heal"] == []      # 新卡片預設全不勾
+    # 移除卡片 → 該值恢復「不隱藏任何欄位」
+    tab._del_value("Heal")
+    assert "Heal" not in tab._cards
+    assert "Heal" not in dlg.bindings()["Operation"]["groups"]
+    # 資料中出現但沒建卡的值不會被自動寫進 groups（不誤藏）
+    assert set(dlg.bindings()["Operation"]["groups"]) == {"Damage", "PassiveBuff"}
     # 驅動欄位改成（不綁定）→ 該表綁定移除
     tab.f_driver.setCurrentIndex(0)
     out = dlg.bindings()
