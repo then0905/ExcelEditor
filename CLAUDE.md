@@ -52,6 +52,16 @@
   絕不走 eval/exec；新增白名單函式要同時改 `_ALLOWED_FUNC_NAMES` 與 `_RowCtx.call`。
 - 測試：`tests/test_validation.py`（引擎、免 Qt）、`tests/test_validation_ui.py`（offscreen UI）。
 
+### 欄位綁定（field_bindings）
+- 每母表 config 下 `field_bindings:{scope:{enabled,driver,groups:{值:[欄位]}}}`（scope ""=母表）；
+  引擎在 `field_binding.py`（`manager.binding`，無 Qt）。設定 UI 在驗證視窗第二分頁（勾選矩陣）。
+- 語意：沒被任何 group 提到的欄位＝共用（永遠顯示）；driver/FK/PK 永遠顯示；
+  資料值沒設定 group → 該列全顯示。**只控制顯示/鎖定，值一律不動**（使用者決策 B）。
+- 呈現：母表表單隱藏欄位區塊；子表「聯集隱欄」（目前這筆母資料所有列的相關欄位聯集，
+  `SubTablePanel.apply_column_binding`）＋不相關格灰化鎖定（model flags/data）。
+- 驗證整合：違規標記跳過不相關格（`_validate_rule_row` 過濾），全不相關則整筆不記。
+- 測試：`tests/test_field_binding.py`、`tests/test_field_binding_ui.py`。
+
 ---
 
 ## UI 結構

@@ -782,12 +782,17 @@ class SubTableModel(QAbstractTableModel):
 
         if role in (Qt.DisplayRole, Qt.EditRole):
             return None if col_type == "bool" else (str(val) if val is not None else "")
+        irrelevant = not self._manager.binding.is_relevant(self._sheet, row_idx, col)
         if role == Qt.CheckStateRole and col_type == "bool":
+            if irrelevant:
+                return None               # 不相關的 bool 格不畫 checkbox
             v = val
             if isinstance(v, str):
                 v = v.lower() in ("true", "1", "yes")
             return Qt.Checked if v else Qt.Unchecked
         if role == Qt.BackgroundRole:
+            if irrelevant:
+                return QBrush(QColor(_C["code"]))   # 更暗＝與此列無關
             vcol = self._manager.validator.cell_color(self._sheet, row_idx, col)
             if vcol:
                 qc = QColor(vcol)
@@ -797,6 +802,12 @@ class SubTableModel(QAbstractTableModel):
                 return QBrush(_DIRTY_BG)
             return QBrush(_ROW_EVEN if r % 2 == 0 else _ROW_ODD)
         if role == Qt.ToolTipRole:
+            if irrelevant:
+                drv = self._manager.binding.driver_of(*self._scope_pair())
+                dval = ""
+                if drv and drv in self._df.columns:
+                    dval = str(self._df.at[row_idx, drv])
+                return f"與 {dval or '此列'} 無關的欄位（保留舊值，不可編輯）"
             vrules = self._manager.validator.cell_rules(self._sheet, row_idx, col)
             if vrules:
                 return "\n".join(
@@ -804,8 +815,14 @@ class SubTableModel(QAbstractTableModel):
                     for ru in vrules)
             return None
         if role == Qt.ForegroundRole:
-            return QBrush(QColor(_C["txt"]))
+            return QBrush(QColor(_C["txt3"] if irrelevant else _C["txt"]))
         return None
+
+    def _scope_pair(self):
+        if "." in self._sheet:
+            m, s = self._sheet.split(".", 1)
+            return m, s
+        return self._sheet, ""
 
     def setData(self, index, value, role=Qt.EditRole):
         if not index.isValid():
@@ -836,6 +853,9 @@ class SubTableModel(QAbstractTableModel):
         col      = self._df.columns[index.column()]
         col_type = self._cols_cfg.get(col, {}).get("type", "string")
         base     = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+        row_idx  = self._df.index[index.row()]
+        if not self._manager.binding.is_relevant(self._sheet, row_idx, col):
+            return base   # 欄位綁定判定與此列無關 → 鎖定不可編輯
         return base | (Qt.ItemIsUserCheckable if col_type == "bool" else Qt.ItemIsEditable)
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
@@ -1271,6 +1291,7 @@ class FieldEditorWidget(QWidget):
         self._col_types     = {}
         self._lbl_widgets   = {}   # col → QLabel (the col name label)
         self._note_tips     = {}   # col → configured note (tooltip restore)
+        self._grp_widgets   = {}   # col → (group widget, separator) — 綁定顯示/隱藏用
         self._bool_updaters = {}   # col → update_style(checked: bool)
         self._img_preview_label:  "QLabel | None" = None  # table-level image preview
         self._img_path_segments:  list = []  # [{"type":"col","col":"X"} | {"type":"lit","value":"Y"}]
@@ -1310,6 +1331,7 @@ class FieldEditorWidget(QWidget):
         self._col_types.clear()
         self._lbl_widgets.clear()
         self._note_tips.clear()
+        self._grp_widgets.clear()
         self._bool_updaters.clear()
         self._img_preview_label  = None  # cleared by layout wipe above
         self._img_path_segments  = []
@@ -1484,6 +1506,7 @@ class FieldEditorWidget(QWidget):
                 sep.setStyleSheet(f"background: {_C['border']}; border: none;")
                 self._form_lo.addWidget(grp)   # must parent grp or GC kills the child widgets
                 self._form_lo.addWidget(sep)
+                self._grp_widgets[col] = (grp, sep)
                 continue
 
             else:
@@ -1503,6 +1526,7 @@ class FieldEditorWidget(QWidget):
             sep.setStyleSheet(f"background: {_C['border']}; border: none;")
             self._form_lo.addWidget(grp)
             self._form_lo.addWidget(sep)
+            self._grp_widgets[col] = (grp, sep)
 
         self._form_lo.addStretch(1)
         self._built = True
@@ -1634,6 +1658,17 @@ class FieldEditorWidget(QWidget):
         for col, w in self._widgets.items():
             self._style_field(col, w,
                               (self._table_name, self._row_idx, col) in dirty)
+
+    def refresh_binding(self):
+        """依欄位綁定顯示/隱藏欄位區塊（母表表單）。值不動，只收合畫面。"""
+        if not self._built or self._row_idx is None or self._manager is None:
+            return
+        rel = self._manager.binding.relevant_fields(
+            self._table_name, "", self._row_idx)
+        for col, (grp, sep) in self._grp_widgets.items():
+            show = rel is None or col in rel
+            grp.setVisible(show)
+            sep.setVisible(show)
 
     def load_row(self, row_data, row_idx):
         if not self._built:
@@ -1788,8 +1823,21 @@ class SubTablePanel(QWidget):
         self._model.reload(df, cols_cfg)
         if cols_cfg:
             self._refresh_delegates(cols_cfg)
+        self.apply_column_binding()
         if not df.empty:
             self._view.resizeColumnsToContents()
+
+    def apply_column_binding(self):
+        """依欄位綁定隱藏「目前顯示的列都用不到」的欄位（聯集）。"""
+        df = self._model.df
+        if "." in self._sheet:
+            master, scope = self._sheet.split(".", 1)
+        else:
+            master, scope = self._sheet, ""
+        visible = self._manager.binding.visible_columns(
+            master, scope, list(df.index))
+        for c, col in enumerate(df.columns):
+            self._view.setColumnHidden(c, visible is not None and col not in visible)
 
     def select_by_df_index(self, df_idx, col=None):
         """Select the row whose underlying DataFrame index == df_idx and scroll
@@ -2749,6 +2797,7 @@ class TableEditor(QWidget):
             self._field_panel.build_for(self.df, self.cfg, self.table_name, self.manager)
 
         self._field_panel.load_row(row_data, df_idx)
+        self._field_panel.refresh_binding()
         self._update_json(row_data)
         self._refresh_sub_tables()
 
@@ -2905,11 +2954,12 @@ class TableEditor(QWidget):
     # ── Validation visuals ─────────────────────────────────────────────────────
 
     def _refresh_validation_visuals(self):
-        """Refresh every validation visual for the current record: field
-        styles, the item card's dot, sub-tab colors and sub-view repaints.
-        Called after cell edits and after rules change."""
+        """Refresh every validation/binding visual for the current record:
+        field styles+visibility, the item card's dot, sub-tab colors, sub-view
+        column hiding & repaints. Called after cell edits and rules change."""
         if self._field_panel is not None:
             self._field_panel.refresh_validation()
+            self._field_panel.refresh_binding()
         it = self._card_list.currentItem()
         if it is not None:
             df_idx = it.data(Qt.UserRole)
@@ -2919,6 +2969,7 @@ class TableEditor(QWidget):
         self._update_sub_tab_vio_colors()
         for panel in self._sub_panels.values():
             if panel is not None:
+                panel.apply_column_binding()
                 panel._view.viewport().update()
 
     def _update_sub_tab_vio_colors(self):
@@ -4113,6 +4164,236 @@ class _VCondRow(QWidget):
         return c
 
 
+class _BindingTab(QWidget):
+    """欄位綁定編輯器（驗證視窗第二分頁）：每表一條綁定＝驅動欄位＋
+    「driver值 × 欄位」勾選矩陣。編輯工作複本，按「套用」才由對話框寫回。"""
+
+    def __init__(self, manager, table_name, parent=None):
+        super().__init__(parent)
+        self.manager = manager
+        self.table_name = table_name
+        src = manager.config.get(table_name, {}).get("field_bindings", {})
+        self._edits = json.loads(json.dumps(src)) if isinstance(src, dict) else {}
+        self._cur_scope = None
+        self._loading = False
+        self._fields = []      # matrix 列（欄位名）
+        self._values = []      # matrix 欄（driver 值）
+
+        lo = QVBoxLayout(self)
+        lo.setContentsMargins(14, 12, 14, 12)
+        lo.setSpacing(8)
+
+        top = QHBoxLayout(); top.setSpacing(8)
+        cap = QLabel("表")
+        cap.setStyleSheet(f"color:{_C['txt3']}; font-size:11px; background:transparent;")
+        top.addWidget(cap)
+        self.f_scope = _NoscrollCombo()
+        self.f_scope.addItem(f"母表（{table_name}）", "")
+        prefix = table_name + "."
+        for k in manager.sub_tables:
+            if k.startswith(prefix):
+                sub = k[len(prefix):]
+                self.f_scope.addItem(f"子表 [{sub}]", sub)
+        self.f_scope.currentIndexChanged.connect(self._on_scope_changed)
+        top.addWidget(self.f_scope)
+        self.f_enabled = QCheckBox("啟用")
+        self.f_enabled.setStyleSheet(f"color:{_C['txt']}; background:transparent;")
+        top.addWidget(self.f_enabled)
+        cap2 = QLabel("驅動欄位")
+        cap2.setStyleSheet(f"color:{_C['txt3']}; font-size:11px; background:transparent;")
+        top.addSpacing(8); top.addWidget(cap2)
+        self.f_driver = _NoscrollCombo(); self.f_driver.setMinimumWidth(150)
+        self.f_driver.currentIndexChanged.connect(self._on_driver_changed)
+        top.addWidget(self.f_driver)
+        b_addv = _mk_btn("＋值", "ghost"); b_addv.setFixedHeight(26)
+        b_addv.setToolTip("新增一個驅動欄位的值（欄）")
+        b_addv.clicked.connect(self._add_value)
+        b_delv = _mk_btn("－值", "ghost"); b_delv.setFixedHeight(26)
+        b_delv.setToolTip("移除目前選中的值欄")
+        b_delv.clicked.connect(self._del_value)
+        top.addWidget(b_addv); top.addWidget(b_delv)
+        top.addStretch(1)
+        lo.addLayout(top)
+
+        hint = QLabel("勾選＝該值時此欄位相關（會顯示）。整列都不勾＝共用欄位，任何值都顯示。"
+                      "驅動欄位、FK/主鍵永遠顯示；資料中出現但這裡沒設定的值不會隱藏任何欄位。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color:{_C['txt3']}; font-size:11px; background:transparent;")
+        lo.addWidget(hint)
+
+        self._matrix = QTableWidget()
+        self._matrix.verticalHeader().setDefaultSectionSize(26)
+        self._matrix.horizontalHeader().setDefaultSectionSize(110)
+        self._matrix.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._matrix.itemChanged.connect(self._on_item_changed)
+        lo.addWidget(self._matrix, 1)
+
+        self._load_scope(self.f_scope.currentData())
+
+    # ── helpers ──
+    def _scope_columns(self, scope):
+        if scope:
+            df = self.manager.sub_tables.get(f"{self.table_name}.{scope}")
+        else:
+            df = self.manager.tables.get(self.table_name)
+        return [] if df is None else [str(c) for c in df.columns]
+
+    def _protected_cols(self, scope):
+        cfg = self.manager.config.get(self.table_name, {})
+        keep = {cfg.get("primary_key", "")}
+        if scope:
+            keep.add(cfg.get("sub_tables", {}).get(scope, {})
+                     .get("foreign_key") or cfg.get("primary_key", ""))
+        return keep
+
+    def _data_values(self, scope, driver):
+        """driver 欄的候選值：config enum options ∪ 資料中的非空值（上限 40）。"""
+        vals = []
+        cfg = self.manager.config.get(self.table_name, {})
+        if scope:
+            col_cfg = (cfg.get("sub_tables", {}).get(scope, {})
+                       .get("columns", {}).get(driver, {}))
+            df = self.manager.sub_tables.get(f"{self.table_name}.{scope}")
+        else:
+            col_cfg = cfg.get("columns", {}).get(driver, {})
+            df = self.manager.tables.get(self.table_name)
+        for o in (col_cfg.get("options") or []):
+            if str(o).strip() and str(o) not in vals:
+                vals.append(str(o))
+        if df is not None and driver in df.columns:
+            for v in sorted(set(df[driver].astype(str).str.strip())):
+                if v and v not in vals:
+                    vals.append(v)
+        return vals[:40]
+
+    # ── scope / driver 切換 ──
+    def _on_scope_changed(self, *_):
+        if self._loading:
+            return
+        self._save_scope(self._cur_scope)
+        self._load_scope(self.f_scope.currentData())
+
+    def _on_driver_changed(self, *_):
+        if self._loading:
+            return
+        self._rebuild_matrix(keep_checks=False)
+
+    def _load_scope(self, scope):
+        self._loading = True
+        try:
+            self._cur_scope = scope
+            b = self._edits.get(scope) or {}
+            self.f_enabled.setChecked(bool(b.get("enabled", True)) if b else False)
+            self.f_driver.clear()
+            self.f_driver.addItem("（不綁定）", "")
+            for c in self._scope_columns(scope):
+                if c not in self._protected_cols(scope):
+                    self.f_driver.addItem(c, c)
+            i = self.f_driver.findData(b.get("driver", ""))
+            self.f_driver.setCurrentIndex(max(0, i))
+        finally:
+            self._loading = False
+        self._rebuild_matrix(keep_checks=True)
+
+    def _rebuild_matrix(self, keep_checks):
+        self._loading = True
+        try:
+            scope = self._cur_scope
+            driver = self.f_driver.currentData() or ""
+            self._matrix.clear()
+            self._fields, self._values = [], []
+            if not driver:
+                self._matrix.setRowCount(0)
+                self._matrix.setColumnCount(0)
+                return
+            b = self._edits.get(scope) or {}
+            groups = b.get("groups", {}) if (keep_checks and
+                                             b.get("driver") == driver) else {}
+            skip = self._protected_cols(scope) | {driver}
+            self._fields = [c for c in self._scope_columns(scope) if c not in skip]
+            self._values = list(groups.keys())
+            for v in self._data_values(scope, driver):
+                if v not in self._values:
+                    self._values.append(v)
+            self._matrix.setRowCount(len(self._fields))
+            self._matrix.setColumnCount(len(self._values) + 1)
+            self._matrix.setHorizontalHeaderLabels(self._values + ["狀態"])
+            self._matrix.setVerticalHeaderLabels(self._fields)
+            for r, field in enumerate(self._fields):
+                for c, val in enumerate(self._values):
+                    it = QTableWidgetItem()
+                    it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+                    checked = isinstance(groups.get(val), list) and field in groups[val]
+                    it.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+                    self._matrix.setItem(r, c, it)
+                st = QTableWidgetItem("")
+                st.setFlags(Qt.ItemIsEnabled)
+                self._matrix.setItem(r, len(self._values), st)
+            self._refresh_status_col()
+        finally:
+            self._loading = False
+
+    def _refresh_status_col(self):
+        sc = len(self._values)
+        for r in range(len(self._fields)):
+            any_checked = any(
+                self._matrix.item(r, c) is not None
+                and self._matrix.item(r, c).checkState() == Qt.Checked
+                for c in range(len(self._values)))
+            st = self._matrix.item(r, sc)
+            if st is not None:
+                st.setText("綁定" if any_checked else "共用（永遠顯示）")
+                st.setForeground(QBrush(QColor(
+                    _C["txtAcc"] if any_checked else _C["txt3"])))
+
+    def _on_item_changed(self, _it):
+        if not self._loading:
+            self._refresh_status_col()
+
+    def _add_value(self):
+        if not (self.f_driver.currentData() or ""):
+            QMessageBox.information(self, "提示", "先選驅動欄位"); return
+        v, ok = QInputDialog.getText(self, "新增值", "驅動欄位的值：")
+        if not ok or not v.strip():
+            return
+        v = v.strip()
+        if v in self._values:
+            return
+        self._save_scope(self._cur_scope)          # 保住目前勾選
+        self._edits.setdefault(self._cur_scope, {}).setdefault("groups", {})[v] = []
+        self._load_scope(self._cur_scope)
+
+    def _del_value(self):
+        c = self._matrix.currentColumn()
+        if not (0 <= c < len(self._values)):
+            QMessageBox.information(self, "提示", "先點選要移除的值欄"); return
+        val = self._values[c]
+        self._save_scope(self._cur_scope)
+        (self._edits.get(self._cur_scope) or {}).get("groups", {}).pop(val, None)
+        self._load_scope(self._cur_scope)
+
+    # ── 工作複本 ↔ UI ──
+    def _save_scope(self, scope):
+        if scope is None:
+            return
+        driver = self.f_driver.currentData() or ""
+        if not driver:
+            self._edits.pop(scope, None)
+            return
+        groups = {}
+        for c, val in enumerate(self._values):
+            groups[val] = [self._fields[r] for r in range(len(self._fields))
+                           if self._matrix.item(r, c) is not None
+                           and self._matrix.item(r, c).checkState() == Qt.Checked]
+        self._edits[scope] = {"enabled": self.f_enabled.isChecked(),
+                              "driver": driver, "groups": groups}
+
+    def result(self):
+        """套用時呼叫：回傳 {scope: binding}（空 dict = 全部無綁定）。"""
+        self._save_scope(self._cur_scope)
+        return {k: v for k, v in self._edits.items() if v.get("driver")}
+
+
 class ValidationRulesDialog(QDialog):
     """自訂資料驗證規則編輯器（左：規則清單／右：規則內容）。
     編輯的是 config[table]["validations"] 的複本，按「套用」才寫回。"""
@@ -4121,7 +4402,7 @@ class ValidationRulesDialog(QDialog):
         super().__init__(parent)
         self.manager = manager
         self.table_name = table_name
-        self.setWindowTitle(f"驗證規則 — {table_name}")
+        self.setWindowTitle(f"驗證規則與欄位綁定 — {table_name}")
         self.setStyleSheet(APP_QSS)
         self.resize(980, 640)
 
@@ -4133,7 +4414,9 @@ class ValidationRulesDialog(QDialog):
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
-        body = QHBoxLayout(); body.setContentsMargins(0, 0, 0, 0); body.setSpacing(0)
+        rules_page = QWidget(); rules_page.setStyleSheet("background:transparent;")
+        body = QHBoxLayout(rules_page)
+        body.setContentsMargins(0, 0, 0, 0); body.setSpacing(0)
 
         # ── left: rule list ──
         left = QWidget(); left.setFixedWidth(250)
@@ -4293,7 +4576,13 @@ class ValidationRulesDialog(QDialog):
         rlo.addLayout(test_row)
 
         body.addWidget(rscroll, 1)
-        outer.addLayout(body, 1)
+
+        tabs = QTabWidget()
+        tabs.setDocumentMode(True)
+        tabs.addTab(rules_page, "驗證規則")
+        self._binding_tab = _BindingTab(manager, table_name)
+        tabs.addTab(self._binding_tab, "欄位綁定")
+        outer.addWidget(tabs, 1)
 
         # ── bottom bar ──
         bb = QWidget(); bb.setStyleSheet(
@@ -4512,6 +4801,9 @@ class ValidationRulesDialog(QDialog):
             self._test_lbl.setText(
                 f'<span style="color:{_C["yellow"]}">⚠ 目前資料有 {cnt} 列違規'
                 f'（{ex}）</span>')
+
+    def bindings(self):
+        return self._binding_tab.result()
 
     def _apply(self):
         self._save_form()
@@ -5534,9 +5826,15 @@ class App(QMainWindow):
         dlg = ValidationRulesDialog(self, self.manager, tname)
         if dlg.exec() != QDialog.Accepted:
             return
-        self.manager.config.setdefault(tname, {})["validations"] = dlg.rules
+        tcfg = self.manager.config.setdefault(tname, {})
+        tcfg["validations"] = dlg.rules
+        fb = dlg.bindings()
+        if fb:
+            tcfg["field_bindings"] = fb
+        else:
+            tcfg.pop("field_bindings", None)
         self.manager.save_config()
-        self.manager.validator.reload()
+        self.manager.validator.reload()   # 違規標記會依新綁定過濾，需重驗
         if self.manager.validator.last_errors:
             names = "、".join(n for n, _ in self.manager.validator.last_errors)
             QMessageBox.warning(self, "表達式錯誤",
@@ -5544,10 +5842,9 @@ class App(QMainWindow):
         ed = self._editors.get(tname)
         if ed is not None:
             ed._load_item_list()
-            ed._refresh_validation_visuals()
-            if ed._field_panel is not None:
-                ed._field_panel.refresh_validation()
-        self.show_snackbar("✓ 驗證規則已套用", color=_C["green"])
+            ed._refresh_sub_tables()          # 重套子表隱欄
+            ed._refresh_validation_visuals()  # 母表欄位顯隱＋標記
+        self.show_snackbar("✓ 驗證規則／欄位綁定已套用", color=_C["green"])
 
     def _show_validation_gate(self, items, errs, warns):
         """存檔前的驗證結果對話框。回傳 True = 照存（僅警告時可選）。"""

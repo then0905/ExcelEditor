@@ -704,9 +704,17 @@ class ValidationEngine:
         if self._rule_violates(rule, ctx):
             sheet = self._rule_sheet(master, rule)
             df = self._sheet_df(sheet)
-            if df is not None:
-                self._add_violation(sheet, row_idx,
-                                    self._mark_cols(rule, df), rule["id"])
+            if df is None:
+                return
+            cols = self._mark_cols(rule, df)
+            # 欄位綁定判定「與此列無關」的欄位不標記——不強迫使用者
+            # 補一個被隱藏/鎖定的欄位；全部無關則整筆違規不記
+            binding = getattr(self.manager, "binding", None)
+            if binding is not None:
+                cols = [c for c in cols
+                        if binding.is_relevant(sheet, row_idx, c)]
+            if cols:
+                self._add_violation(sheet, row_idx, cols, rule["id"])
 
     # ── full / per-table / per-row validation ─────────────────────────────────
 

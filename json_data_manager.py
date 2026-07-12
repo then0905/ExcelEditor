@@ -6,6 +6,7 @@ import re
 import warnings
 
 from validation import ValidationEngine
+from field_binding import FieldBindingEngine
 
 warnings.filterwarnings("ignore")
 
@@ -36,6 +37,7 @@ class JsonDataManager:
         self.dirty_cells = set()   # {(table_name, row_idx, col_name)}
         self._search_index = {}   # {table_name: {token: set of (table_name, row_idx)}}
         self.validator = ValidationEngine(self)   # 資料驗證規則引擎
+        self.binding = FieldBindingEngine(self)   # 欄位綁定（條件式顯示）
 
     def shared_state(self):
         """Bundle the cross-document shared state to hand to sibling managers."""
