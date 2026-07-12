@@ -5326,6 +5326,10 @@ class App(QMainWindow):
             self._add_document(mgr)       # new tab widget + file tab, made active
             mgr._full_config["_last_file"] = path
             mgr.save_config()
+            if mgr.adopted_config_from:
+                self.show_snackbar(
+                    "✓ 檔案路徑與配置記錄不同，已自動沿用同名檔案的既有配置",
+                    color=_C["green"])
             self._check_config_paths()
 
         def _err(msg):

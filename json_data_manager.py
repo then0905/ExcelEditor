@@ -38,6 +38,7 @@ class JsonDataManager:
         self._search_index = {}   # {table_name: {token: set of (table_name, row_idx)}}
         self.validator = ValidationEngine(self)   # 資料驗證規則引擎
         self.binding = FieldBindingEngine(self)   # 欄位綁定（條件式顯示）
+        self.adopted_config_from = None           # 見 load_json 的路徑沿用
 
     def shared_state(self):
         """Bundle the cross-document shared state to hand to sibling managers."""
@@ -60,6 +61,23 @@ class JsonDataManager:
                 return json.load(f)
         except Exception:
             return {}
+
+    def _find_config_by_basename(self, file_key):
+        """找檔名相同、路徑不同的既有 config entry（換電腦/搬資料夾情境）。
+        多個同名 → 最近開啟過的優先，否則挑設定最豐富的。"""
+        base = os.path.basename(file_key).lower()
+        cands = [k for k, v in self._full_config.items()
+                 if isinstance(v, dict) and not k.startswith("_")
+                 and k != file_key and os.path.basename(k).lower() == base]
+        if not cands:
+            return None
+        if len(cands) == 1:
+            return cands[0]
+        cand_set = set(cands)
+        for rp in self._recent_files:
+            if os.path.normpath(rp) in cand_set:
+                return os.path.normpath(rp)
+        return max(cands, key=lambda k: len(self._full_config[k]))
 
     def save_config(self):
         self._full_config["_recent_files"] = self._recent_files
@@ -196,12 +214,21 @@ class JsonDataManager:
         """
         self.json_path = file_path
         self.need_config_alert = False
+        self.adopted_config_from = None   # 換電腦/搬路徑時沿用的舊 config key
         self.tables = {}
         self.sub_tables = {}
         self._sub_fk_is_data = {}
         self._search_index = {}
 
         file_key = os.path.normpath(file_path)
+        if file_key not in self._full_config:
+            # config 以絕對路徑為 key——檔案搬了位置（或換了電腦）會對不上。
+            # 用檔名找既有配置沿用（複製，不動舊 entry），否則整份設定會「消失」。
+            src = self._find_config_by_basename(file_key)
+            if src is not None:
+                self._full_config[file_key] = json.loads(
+                    json.dumps(self._full_config[src]))
+                self.adopted_config_from = src
         if file_key not in self._full_config:
             self._full_config[file_key] = {}
         self.config = self._full_config[file_key]
@@ -381,7 +408,7 @@ class JsonDataManager:
             if self._migrate_text_ref(self.config[table_name]):
                 self.need_config_alert = True
 
-        if self.need_config_alert:
+        if self.need_config_alert or self.adopted_config_from:
             self.save_config()
 
         self._add_recent_file(file_path)
