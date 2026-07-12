@@ -949,6 +949,19 @@ def _get_suggestions(df, this_col, context_col, context_value):
     return sorted(out)
 
 
+def _get_array_suggestions(df, this_col, context_col, context_value, limit=60):
+    """Array 欄位的建議「元素」：把既有資料的逗號字串拆成單一 token 去重，
+    有 context_col（建議來源）時只看同 context 值的列。"""
+    seen, out = set(), []
+    for cell in _get_suggestions(df, this_col, context_col, context_value):
+        for tok in str(cell).split(","):
+            tok = tok.strip()
+            if tok and tok not in seen:
+                seen.add(tok)
+                out.append(tok)
+    return sorted(out)[:limit]
+
+
 class _SuggestLineEdit(QLineEdit):
     """QLineEdit that auto-pops its completer once on first focus-in.
     One-shot so that after the user picks a value the popup won't keep
@@ -1235,19 +1248,61 @@ class ChipsEdit(QWidget):
     def _copy_all(self):
         QApplication.clipboard().setText(self.value())
 
+    def add_token(self, text):
+        """外部快速加入一個元素（建議值點擊用）。"""
+        text = str(text).strip()
+        if text == "":
+            return
+        self._add_chip(text)
+        self._chip_box.updateGeometry()
+        self.changed.emit()
+
 
 class ArrayEditDialog(QDialog):
-    """Popup chips editor for array cells in sub-tables."""
+    """Popup chips editor for array cells in sub-tables.
+    有建議來源（suggest_from）時多一塊建議值區，點一下即加入。"""
 
-    def __init__(self, comma_str, parent=None):
+    def __init__(self, comma_str, parent=None, suggestions=None, source_note=""):
         super().__init__(parent)
         self.setWindowTitle("編輯陣列")
-        self.setMinimumWidth(380)
+        self.setMinimumWidth(500 if suggestions else 380)
         self.setStyleSheet(APP_QSS)
         lo = QVBoxLayout(self)
         self._chips = ChipsEdit(chip_area_height=150)
         self._chips.set_value(comma_str)
         lo.addWidget(self._chips)
+
+        if suggestions:
+            cap = QLabel("建議值（點一下加入）" + (f"　{source_note}" if source_note else ""))
+            cap.setStyleSheet(
+                f"color:{_C['txt3']}; font-size:11px; background:transparent; "
+                f"padding-top:4px;")
+            lo.addWidget(cap)
+            sug_box = QWidget()
+            sug_box.setStyleSheet(
+                f"background:{_C['panel']}; border:1px solid {_C['border']}; "
+                f"border-radius:6px;")
+            sflow = FlowLayout(sug_box, spacing=4)
+            for tok in suggestions:
+                b = QPushButton(f"＋ {tok}")
+                b.setAutoDefault(False); b.setDefault(False)
+                b.setCursor(Qt.PointingHandCursor)
+                b.setStyleSheet(
+                    f"QPushButton {{ background:{_C['card']}; color:{_C['txtAcc']}; "
+                    f"border:1px solid {_C['border']}; border-radius:9px; "
+                    f"padding:2px 8px; font-size:12px; }}"
+                    f"QPushButton:hover {{ background:{_C['cardH']}; "
+                    f"border-color:{_C['borderH']}; }}")
+                b.clicked.connect(lambda _=False, t=tok: self._chips.add_token(t))
+                sflow.addWidget(b)
+            sscroll = QScrollArea()
+            sscroll.setWidgetResizable(True)
+            sscroll.setMaximumHeight(120)
+            sscroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            sscroll.setStyleSheet("QScrollArea{border:none; background:transparent;}")
+            sscroll.setWidget(sug_box)
+            lo.addWidget(sscroll)
+
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
@@ -1269,11 +1324,27 @@ class ArrayEditDialog(QDialog):
 
 
 class ArrayDelegate(QStyledItemDelegate):
-    """Sub-table array cell — double-click opens the chips editor dialog."""
+    """Sub-table array cell — double-click opens the chips editor dialog.
+    欄位設有建議來源（suggest_from）時，彈窗附建議值快速選填區。"""
+
+    def __init__(self, parent=None, df_provider=None, this_col="", context_col=""):
+        super().__init__(parent)
+        self._df_provider = df_provider
+        self._this_col    = this_col
+        self._context_col = context_col
 
     def createEditor(self, parent, option, index):
         cur = index.data(Qt.DisplayRole) or ""
-        dlg = ArrayEditDialog(cur, parent)
+        suggestions, note = [], ""
+        if self._df_provider is not None and self._this_col and self._context_col:
+            try:
+                ctx_val = str(index.model()._df.iloc[index.row()][self._context_col])
+            except Exception:
+                ctx_val = ""
+            suggestions = _get_array_suggestions(
+                self._df_provider(), self._this_col, self._context_col, ctx_val)
+            note = f"來源：{self._context_col}＝{ctx_val} 的既有資料"
+        dlg = ArrayEditDialog(cur, parent, suggestions=suggestions, source_note=note)
         if dlg.exec() == QDialog.Accepted:
             index.model().setData(index, dlg.value(), Qt.EditRole)
         return None
@@ -1786,7 +1857,11 @@ class SubTablePanel(QWidget):
                 opts = col_conf.get("options") or [""]
                 self._view.setItemDelegateForColumn(c, EnumDelegate(opts, self._view))
             elif col_type == "array":
-                self._view.setItemDelegateForColumn(c, ArrayDelegate(self._view))
+                df_getter = (lambda sheet=self._sheet:
+                             self._manager.sub_tables.get(sheet))
+                self._view.setItemDelegateForColumn(c, ArrayDelegate(
+                    self._view, df_provider=df_getter, this_col=col,
+                    context_col=col_conf.get("suggest_from", "")))
             elif col_conf.get("suggest_from"):
                 ctx = col_conf["suggest_from"]
                 df_getter = (lambda sheet=self._sheet:
