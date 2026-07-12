@@ -120,21 +120,28 @@ def test_field_editor_hides_blocks():
     print("  PASS  test_field_editor_hides_blocks")
 
 
+def _card(tab, value):
+    return next(e for e in tab._cards
+                if e["value_cb"].currentText() == value)
+
+
 def test_binding_tab_roundtrip():
     mgr = make_manager()
     dlg = M.ValidationRulesDialog(None, mgr, "SkillData")
     tab = dlg._binding_tab
-    # 切到 Operation scope → 已設定值＋資料值自動各一卡
+    # 切到 Operation scope → 只有 config 設定過的值有卡片（不自動鋪滿）
     i = tab.f_scope.findData("Operation")
     tab.f_scope.setCurrentIndex(i)
     assert tab.f_driver.currentData() == "SkillComponent"
-    assert set(tab._cards) == {"Damage", "PassiveBuff", "Heal"}   # Heal 自動帶出
-    assert tab._cards["Damage"]["configured"]
-    assert not tab._cards["Heal"]["configured"]                   # 未設定
-    assert tab._cards["Damage"]["boxes"]["EffectValue"].isChecked()
-    assert not tab._cards["PassiveBuff"]["boxes"]["EffectValue"].isChecked()
+    vals = {e["value_cb"].currentText() for e in tab._cards}
+    assert vals == {"Damage", "PassiveBuff"}          # Heal 在資料裡但沒設定→無卡
+    assert _card(tab, "Damage")["boxes"]["EffectValue"].isChecked()
+    assert not _card(tab, "PassiveBuff")["boxes"]["EffectValue"].isChecked()
+    # 值下拉候選：現有資料的值優先列出
+    cands = tab._value_candidates("SkillComponent")
+    assert set(cands) >= {"Damage", "Heal", "PassiveBuff"}
     # 改勾選：把 EffectValue 也綁到 PassiveBuff
-    tab._cards["PassiveBuff"]["boxes"]["EffectValue"].setChecked(True)
+    _card(tab, "PassiveBuff")["boxes"]["EffectValue"].setChecked(True)
     out = dlg.bindings()
     assert "EffectValue" in out["Operation"]["groups"]["PassiveBuff"]
     assert out["Operation"]["driver"] == "SkillComponent"
@@ -143,30 +150,37 @@ def test_binding_tab_roundtrip():
     print("  PASS  test_binding_tab_roundtrip")
 
 
-def test_binding_tab_auto_values_and_unbind():
+def test_binding_tab_add_remove_card_and_unbind():
     mgr = make_manager()
     dlg = M.ValidationRulesDialog(None, mgr, "SkillData")
     tab = dlg._binding_tab
     tab.f_scope.setCurrentIndex(tab.f_scope.findData("Operation"))
-    # 未設定的卡片不寫入 groups（該值不隱藏任何欄位）
+    # ＋新增卡片 → 空卡片，沒選值前不寫入
+    tab._add_card("", set())
+    assert len(tab._cards) == 3
     out = dlg.bindings()
     assert set(out["Operation"]["groups"]) == {"Damage", "PassiveBuff"}
-    # 在 Heal 卡片打勾 → 自動轉為已設定 → 寫入
-    tab._cards["Heal"]["boxes"]["EffectValue"].setChecked(True)
-    assert tab._cards["Heal"]["configured"]
+    # 選值＋打勾 → 寫入
+    new = tab._cards[-1]
+    new["value_cb"].setCurrentText("Heal")
+    new["boxes"]["EffectValue"].setChecked(True)
     out = dlg.bindings()
     assert out["Operation"]["groups"]["Heal"] == ["EffectValue"]
+    # 移除卡片（模擬 🗑）→ 該值恢復不隱藏
+    tab._cards.remove(new)
+    out = dlg.bindings()
+    assert "Heal" not in out["Operation"]["groups"]
     # 驅動欄位改成（不綁定）→ 該表綁定移除
     tab.f_driver.setCurrentIndex(0)
     out = dlg.bindings()
     assert "Operation" not in out
-    print("  PASS  test_binding_tab_auto_values_and_unbind")
+    print("  PASS  test_binding_tab_add_remove_card_and_unbind")
 
 
 if __name__ == "__main__":
     tests = (test_model_lock_and_grey, test_panel_column_hiding,
              test_field_editor_hides_blocks, test_binding_tab_roundtrip,
-             test_binding_tab_auto_values_and_unbind)
+             test_binding_tab_add_remove_card_and_unbind)
     failed = 0
     for fn in tests:
         try:
