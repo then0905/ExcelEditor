@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QFormLayout, QLayout, QCompleter,
     QTableWidget, QTableWidgetItem, QPlainTextEdit,
     QColorDialog, QSpinBox, QRadioButton, QButtonGroup, QToolButton,
+    QListView,
 )
 from PySide6.QtCore import (
     Qt, Signal, QAbstractTableModel, QModelIndex,
@@ -586,35 +587,51 @@ def _update_img_thumb(path_str: str, label: "QLabel", base_dir: "str | None") ->
 
 # ── Non-scroll ComboBox (used in config dialog) ───────────────────────────────
 
+# Dropdown-popup stylesheet applied DIRECTLY to the popup views: app-level QSS
+# does not reliably cascade into floating popups on Windows (native white list
+# with light text = unreadable), so every combo must get this explicitly.
+_POPUP_QSS = (
+    f"QListView {{"
+    f"  background-color: {_C['card']};"
+    f"  color: {_C['txt']};"
+    f"  border: 1px solid {_C['borderH']};"
+    f"  outline: none;"
+    f"}}"
+    f"QListView::item {{"
+    f"  color: {_C['txt']};"
+    f"  background-color: transparent;"
+    f"  padding: 4px 10px;"
+    f"  min-height: 22px;"
+    f"}}"
+    f"QListView::item:hover {{"
+    f"  background-color: {_C['cardH']};"
+    f"  color: {_C['txt']};"
+    f"}}"
+    f"QListView::item:selected {{"
+    f"  background-color: {_C['accent']};"
+    f"  color: #FFFFFF;"
+    f"}}"
+)
+
+
 class _NoscrollCombo(QComboBox):
     """ComboBox that ignores scroll wheel unless the user explicitly clicked into it."""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.setFocusPolicy(Qt.StrongFocus)   # only gain focus via click/tab, NOT wheel
-        # Force dropdown popup colours directly on the internal QListView;
-        # app-level QSS does not always cascade into the floating popup on Windows.
-        self.view().setStyleSheet(
-            f"QListView {{"
-            f"  background-color: {_C['card']};"
-            f"  color: {_C['txt']};"
-            f"  border: 1px solid {_C['borderH']};"
-            f"  outline: none;"
-            f"}}"
-            f"QListView::item {{"
-            f"  color: {_C['txt']};"
-            f"  background-color: transparent;"
-            f"  padding: 4px 10px;"
-            f"  min-height: 22px;"
-            f"}}"
-            f"QListView::item:hover {{"
-            f"  background-color: {_C['cardH']};"
-            f"  color: {_C['txt']};"
-            f"}}"
-            f"QListView::item:selected {{"
-            f"  background-color: {_C['accent']};"
-            f"  color: #FFFFFF;"
-            f"}}"
-        )
+        self.view().setStyleSheet(_POPUP_QSS)
+
+    def setEditable(self, editable):
+        super().setEditable(editable)
+        if editable:
+            # editable combos pop a SEPARATE completer list (top-level, native
+            # white) — its view is lazily created, so hand it a pre-styled one
+            # or typing shows white-on-white suggestions
+            comp = self.completer()
+            if comp is not None:
+                lv = QListView(self)
+                lv.setStyleSheet(_POPUP_QSS)
+                comp.setPopup(lv)
 
     def wheelEvent(self, e):
         if self.hasFocus():
@@ -876,6 +893,7 @@ class EnumDelegate(QStyledItemDelegate):
         cb = QComboBox(parent)
         cb.addItem("")              # 允許清空 / 不選 enum 值
         cb.addItems(self._options)
+        cb.view().setStyleSheet(_POPUP_QSS)   # Windows popup 不吃全域 QSS
         return cb
 
     def setEditorData(self, editor, index):
@@ -3970,7 +3988,7 @@ class _VCondRow(QWidget):
         lo.setContentsMargins(0, 0, 0, 0)
         lo.setSpacing(6)
 
-        self.kind = QComboBox()
+        self.kind = _NoscrollCombo()
         self.kind.addItem("欄位")
         if allow_agg:
             self.kind.addItem("子表聚合")
@@ -3980,9 +3998,9 @@ class _VCondRow(QWidget):
             self.kind.hide()
 
         # ── field variant ──
-        self.field = QComboBox(); self.field.setEditable(True)
+        self.field = _NoscrollCombo(); self.field.setEditable(True)
         self.field.setMinimumWidth(150)
-        self.op = QComboBox()
+        self.op = _NoscrollCombo()
         for o in _V_OPS:
             self.op.addItem(_V_OP_LABELS[o], o)
         self.op.currentIndexChanged.connect(self._op_changed)
@@ -3993,17 +4011,17 @@ class _VCondRow(QWidget):
         lo.addWidget(self.value, 1); lo.addWidget(self.value2)
 
         # ── agg variant ──
-        self.agg_sub = QComboBox(); self.agg_sub.setMinimumWidth(110)
-        self.agg_field = QComboBox(); self.agg_field.setEditable(True)
+        self.agg_sub = _NoscrollCombo(); self.agg_sub.setMinimumWidth(110)
+        self.agg_field = _NoscrollCombo(); self.agg_field.setEditable(True)
         self.agg_field.setMinimumWidth(120)
-        self.agg_op = QComboBox()
+        self.agg_op = _NoscrollCombo()
         for o in _V_OPS:
             if o not in ("between",):
                 self.agg_op.addItem(_V_OP_LABELS[o], o)
         self.agg_val = QLineEdit(); self.agg_val.setMinimumWidth(80)
         self.agg_cnt_lbl = QLabel("的列數")
         self.agg_cnt_lbl.setStyleSheet(f"color:{_C['txt2']}; background:transparent;")
-        self.agg_cnt_op = QComboBox()
+        self.agg_cnt_op = _NoscrollCombo()
         for k, v in _V_COUNT_OPS.items():
             self.agg_cnt_op.addItem(v, k)
         self.agg_cnt = QSpinBox(); self.agg_cnt.setRange(0, 9999); self.agg_cnt.setValue(1)
@@ -4163,7 +4181,7 @@ class ValidationRulesDialog(QDialog):
         # scope / 嚴重度 / 顏色
         row2 = QHBoxLayout(); row2.setSpacing(8)
         row2.addWidget(_cap("作用範圍"))
-        self.f_scope = QComboBox(); self.f_scope.setMinimumWidth(160)
+        self.f_scope = _NoscrollCombo(); self.f_scope.setMinimumWidth(160)
         self.f_scope.addItem(f"母表（{table_name}）", "")
         for sub in self._sub_names():
             self.f_scope.addItem(f"子表 [{sub}]", sub)
@@ -4171,7 +4189,7 @@ class ValidationRulesDialog(QDialog):
         row2.addWidget(self.f_scope)
         row2.addSpacing(10)
         row2.addWidget(_cap("嚴重度"))
-        self.f_sev = QComboBox()
+        self.f_sev = _NoscrollCombo()
         self.f_sev.addItem("錯誤（擋存檔）", "error")
         self.f_sev.addItem("警告（僅提醒）", "warn")
         row2.addWidget(self.f_sev)
@@ -4207,7 +4225,7 @@ class ValidationRulesDialog(QDialog):
         blo = QVBoxLayout(bpage); blo.setContentsMargins(0, 0, 0, 0); blo.setSpacing(8)
         when_hdr = QHBoxLayout()
         when_hdr.addWidget(_cap("當（條件成立時檢查）"))
-        self.f_logic = QComboBox()
+        self.f_logic = _NoscrollCombo()
         self.f_logic.addItem("全部成立 (AND)", "and")
         self.f_logic.addItem("任一成立 (OR)", "or")
         when_hdr.addWidget(self.f_logic)
