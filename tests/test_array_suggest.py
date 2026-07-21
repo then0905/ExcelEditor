@@ -84,7 +84,7 @@ def test_delegate_wiring():
     c = list(sdf.columns).index("InfluenceStatus")
     d = panel._view.itemDelegateForColumn(c)
     assert isinstance(d, M.ArrayDelegate)
-    assert d._this_col == "InfluenceStatus" and d._context_col == "SkillComponent"
+    assert d._this_col == "InfluenceStatus" and d._context_cols == ["SkillComponent"]
     assert d._df_provider() is mgr.sub_tables["SkillData.Operation"]
     print("  PASS  test_delegate_wiring")
 
@@ -156,10 +156,59 @@ def test_master_column_suggestions():
     print("  PASS  test_master_column_suggestions")
 
 
+def test_suggest_sources_normalize():
+    assert M._suggest_sources({"suggest_from": "A"}) == ["A"]
+    assert M._suggest_sources({"suggest_from": ["A", "B"]}) == ["A", "B"]
+    assert M._suggest_sources({"suggest_from": ["A", "", "A", "B"]}) == ["A", "B"]
+    assert M._suggest_sources({"suggest_from": ""}) == []
+    assert M._suggest_sources({}) == []
+    print("  PASS  test_suggest_sources_normalize")
+
+
+def test_multi_source_and_filter():
+    import pandas as pd
+    df = pd.DataFrame([
+        {"Comp": "Damage", "Elem": "Fire", "Status": "ATK"},
+        {"Comp": "Damage", "Elem": "Fire", "Status": "HIT"},
+        {"Comp": "Damage", "Elem": "Ice",  "Status": "SPD"},
+        {"Comp": "Buff",   "Elem": "Fire", "Status": "DEF"},
+    ])
+    # 單來源 Comp=Damage → ATK/HIT/SPD
+    m1, _ = M._context_mask(None, "", df, ["Comp"], df, 0)
+    assert set(M._get_suggestions(df, "Status", None, None, mask=m1)) == {"ATK", "HIT", "SPD"}
+    # 雙來源 Comp=Damage AND Elem=Fire → 只剩 ATK/HIT（更精準）
+    m2, label = M._context_mask(None, "", df, ["Comp", "Elem"], df, 0)
+    assert set(M._get_suggestions(df, "Status", None, None, mask=m2)) == {"ATK", "HIT"}
+    assert "Comp＝Damage" in label and "Elem＝Fire" in label
+    # 空來源 → 無遮罩
+    assert M._context_mask(None, "", df, [], df, 0) == (None, "")
+    print("  PASS  test_multi_source_and_filter")
+
+
+def test_master_field_editor_multi_source():
+    mgr = make_manager()
+    df = mgr.tables["SkillData"]
+    # Tags 建議來源改成雙欄 [Type, Name]（存陣列）
+    mgr.config["SkillData"]["columns"]["Tags"]["suggest_from"] = ["Type", "Name"]
+    panel = M.FieldEditorWidget()
+    panel.build_for(df, mgr.config["SkillData"], "SkillData", mgr)
+    assert panel._array_sug["Tags"]["ctx"] == ["Type", "Name"]
+    m1 = df.index[0]                          # S1: Type=Active, Name=火球
+    panel.load_row(df.loc[m1], m1)
+    panel.refresh_array_suggestions()
+    sug = panel._array_sug["Tags"]
+    texts = {sug["flow"].itemAt(i).widget().text()
+             for i in range(sug["flow"].count())}
+    # 只有 S1 同時 Type=Active 且 Name=火球 → 只建議 S1 自己的 tag
+    assert texts == {"＋ aoe", "＋ fire"}, texts
+    print("  PASS  test_master_field_editor_multi_source")
+
+
 if __name__ == "__main__":
     tests = (test_get_array_suggestions, test_dialog_suggestion_block,
              test_delegate_wiring, test_master_field_editor_suggestions,
-             test_master_column_suggestions)
+             test_master_column_suggestions, test_suggest_sources_normalize,
+             test_multi_source_and_filter, test_master_field_editor_multi_source)
     failed = 0
     for fn in tests:
         try:

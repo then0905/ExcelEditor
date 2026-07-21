@@ -640,6 +640,61 @@ class _NoscrollCombo(QComboBox):
             e.ignore()
 
 
+class _SuggestSourcesEditor(QWidget):
+    """配置視窗的「建議來源」多選編輯器：一個來源一列（下拉＋移除），
+    可自由「＋ 新增來源」。options 為 [(label, data), …]，data 為 None 代表
+    分隔線；value() 回傳已選的來源欄位清單（去空白/去重，順序保留）。"""
+
+    def __init__(self, options, current, parent=None):
+        super().__init__(parent)
+        self._options = options
+        self._rows = []            # [(row_widget, combo)]
+        lo = QVBoxLayout(self)
+        lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(4)
+        self._rows_host = QWidget(); self._rows_host.setStyleSheet("background:transparent;")
+        self._rows_lo = QVBoxLayout(self._rows_host)
+        self._rows_lo.setContentsMargins(0, 0, 0, 0); self._rows_lo.setSpacing(4)
+        lo.addWidget(self._rows_host)
+        add = _mk_btn("＋ 新增來源", "ghost"); add.setFixedHeight(24)
+        add.setToolTip("多個來源＝只建議「每個來源欄位都與這列相同」的既有值")
+        add.clicked.connect(lambda: self._add_row(""))
+        lo.addWidget(add, 0, Qt.AlignLeft)
+        for c in (current or []):
+            self._add_row(c)
+
+    def _add_row(self, data):
+        row = QWidget(); row.setStyleSheet("background:transparent;")
+        h = QHBoxLayout(row); h.setContentsMargins(0, 0, 0, 0); h.setSpacing(4)
+        combo = _NoscrollCombo(); combo.setMinimumWidth(150)
+        for label, d in self._options:
+            if d is None:
+                combo.insertSeparator(combo.count())
+            else:
+                combo.addItem(label, d)
+        ix = combo.findData(data)
+        combo.setCurrentIndex(max(ix, 0))
+        rm = _mk_btn("", "danger", icon="trash"); rm.setFixedSize(22, 22)
+        rm.setToolTip("移除此來源")
+        entry = (row, combo)
+        rm.clicked.connect(lambda _=False, e=entry: self._remove(e))
+        h.addWidget(combo); h.addWidget(rm); h.addStretch(1)
+        self._rows.append(entry)
+        self._rows_lo.addWidget(row)
+
+    def _remove(self, entry):
+        if entry in self._rows:
+            self._rows.remove(entry)
+        entry[0].hide(); entry[0].deleteLater()
+
+    def value(self):
+        out, seen = [], set()
+        for _row, combo in self._rows:
+            d = combo.currentData()
+            if d and d not in seen:
+                seen.add(d); out.append(d)
+        return out
+
+
 # ── ItemCardDelegate ──────────────────────────────────────────────────────────
 
 class ItemCardDelegate(QStyledItemDelegate):
@@ -971,19 +1026,59 @@ def _resolve_row_context(manager, sheet, df, context_col, row_df, row):
         return "", None
 
 
-def _get_suggestions(df, this_col, context_col, context_value, context_series=None):
+def _suggest_sources(col_cfg):
+    """建議來源正規化：舊格式是單一字串，新格式是字串陣列。
+    一律回傳去空白/去重後的來源欄位名清單（順序保留）。"""
+    if not isinstance(col_cfg, dict):
+        return []
+    sf = col_cfg.get("suggest_from", "")
+    raw = sf if isinstance(sf, list) else [sf]
+    out, seen = [], set()
+    for s in raw:
+        s = str(s).strip()
+        if s and s not in seen:
+            seen.add(s); out.append(s)
+    return out
+
+
+def _context_mask(manager, sheet, df, context_cols, row_df, row_pos):
+    """多個建議來源以 AND 組合成一個布林遮罩：只留「每個來源欄位都跟目前
+    這列相同」的列。回傳 (mask 或 None, 說明字串)。context_cols 為空或無法
+    解析時回 (None, "")。支援 master.<col>（子表 join 回母表欄）。"""
+    if df is None or not context_cols:
+        return None, ""
+    mask, labels = None, []
+    for ccol in context_cols:
+        ctx_val, ctx_series = _resolve_row_context(
+            manager, sheet, df, ccol, row_df, row_pos)
+        if ctx_series is not None:
+            col_mask = ctx_series.astype(str) == str(ctx_val)
+        elif ccol in df.columns:
+            col_mask = df[ccol].astype(str) == str(ctx_val)
+        else:
+            continue
+        mask = col_mask if mask is None else (mask & col_mask)
+        labels.append(f"{ccol}＝{ctx_val}")
+    return mask, "、".join(labels)
+
+
+def _get_suggestions(df, this_col, context_col, context_value, context_series=None,
+                     mask=None):
     """Sorted, deduped previously-used values of `this_col` from `df`,
        filtered by `df[context_col] == context_value` when context_col is set.
-       `context_series` (per-row values aligned to df) overrides context_col —
-       used when the filter comes from a master column (see _master_ctx)."""
+       `context_series` (per-row values aligned to df) overrides context_col.
+       `mask` (a precomputed boolean Series) overrides everything — used when
+       multiple suggest sources are AND-combined (see _context_mask)."""
     if df is None or this_col not in df.columns:
         return []
-    if context_series is not None:
-        mask = context_series.astype(str) == str(context_value)
+    if mask is not None:
         vals = df.loc[mask, this_col]
+    elif context_series is not None:
+        m = context_series.astype(str) == str(context_value)
+        vals = df.loc[m, this_col]
     elif context_col and context_col in df.columns:
-        mask = df[context_col].astype(str) == str(context_value)
-        vals = df.loc[mask, this_col]
+        m = df[context_col].astype(str) == str(context_value)
+        vals = df.loc[m, this_col]
     else:
         vals = df[this_col]
     seen, out = set(), []
@@ -995,12 +1090,12 @@ def _get_suggestions(df, this_col, context_col, context_value, context_series=No
 
 
 def _get_array_suggestions(df, this_col, context_col, context_value, limit=60,
-                           context_series=None):
+                           context_series=None, mask=None):
     """Array 欄位的建議「元素」：把既有資料的逗號字串拆成單一 token 去重，
-    有 context_col（建議來源）時只看同 context 值的列。"""
+    有建議來源時只看符合 context（單欄或多欄 AND 遮罩）的列。"""
     seen, out = set(), []
     for cell in _get_suggestions(df, this_col, context_col, context_value,
-                                 context_series=context_series):
+                                 context_series=context_series, mask=mask):
         for tok in str(cell).split(","):
             tok = tok.strip()
             if tok and tok not in seen:
@@ -1041,22 +1136,20 @@ class _SuggestLineEdit(QLineEdit):
 class SuggestDelegate(QStyledItemDelegate):
     """Sub-table cell editor: line edit + popup of previously-used values,
        filtered by a sibling 'context' column on the same row."""
-    def __init__(self, df_provider, this_col, context_col, parent=None,
+    def __init__(self, df_provider, this_col, context_cols, parent=None,
                  manager=None, sheet=""):
         super().__init__(parent)
         self._df_provider  = df_provider
         self._this_col     = this_col
-        self._context_col  = context_col
+        self._context_cols = context_cols or []   # 多個建議來源（AND）
         self._manager      = manager
         self._sheet        = sheet
 
     def createEditor(self, parent, option, index):
         df = self._df_provider()
-        ctx_val, ctx_series = _resolve_row_context(
-            self._manager, self._sheet, df, self._context_col,
-            index.model()._df, index.row())
-        items = _get_suggestions(df, self._this_col, self._context_col, ctx_val,
-                                 context_series=ctx_series)
+        mask, _ = _context_mask(self._manager, self._sheet, df,
+                                self._context_cols, index.model()._df, index.row())
+        items = _get_suggestions(df, self._this_col, None, None, mask=mask)
         editor = _SuggestLineEdit(parent)
         m = QStringListModel(items, editor)
         compl = QCompleter(m, editor)
@@ -1381,27 +1474,27 @@ class ArrayDelegate(QStyledItemDelegate):
     """Sub-table array cell — double-click opens the chips editor dialog.
     欄位設有建議來源（suggest_from）時，彈窗附建議值快速選填區。"""
 
-    def __init__(self, parent=None, df_provider=None, this_col="", context_col="",
+    def __init__(self, parent=None, df_provider=None, this_col="", context_cols=None,
                  manager=None, sheet=""):
         super().__init__(parent)
         self._df_provider = df_provider
         self._this_col    = this_col
-        self._context_col = context_col
+        self._context_cols = context_cols or []
         self._manager     = manager
         self._sheet       = sheet
 
     def createEditor(self, parent, option, index):
         cur = index.data(Qt.DisplayRole) or ""
         suggestions, note = [], ""
-        if self._df_provider is not None and self._this_col and self._context_col:
+        if self._df_provider is not None and self._this_col and self._context_cols:
             df = self._df_provider()
-            ctx_val, ctx_series = _resolve_row_context(
-                self._manager, self._sheet, df, self._context_col,
+            mask, label = _context_mask(
+                self._manager, self._sheet, df, self._context_cols,
                 index.model()._df, index.row())
-            suggestions = _get_array_suggestions(
-                df, self._this_col, self._context_col, ctx_val,
-                context_series=ctx_series)
-            note = f"來源：{self._context_col}＝{ctx_val} 的既有資料"
+            if mask is not None:
+                suggestions = _get_array_suggestions(
+                    df, self._this_col, None, None, mask=mask)
+                note = f"來源：{label} 的既有資料"
         dlg = ArrayEditDialog(cur, parent, suggestions=suggestions, source_note=note)
         if dlg.exec() == QDialog.Accepted:
             index.model().setData(index, dlg.value(), Qt.EditRole)
@@ -1610,7 +1703,7 @@ class FieldEditorWidget(QWidget):
                 w.changed.connect(
                     lambda c=col, _w=w: self.field_changed.emit(c, _w.value())
                 )
-                sug_ctx = col_conf.get("suggest_from", "")
+                sug_ctx = _suggest_sources(col_conf)
                 if sug_ctx:
                     # 建議值快速選填區（依當前列的 context 值於 load_row 時填入）
                     cap = QLabel("")
@@ -1841,13 +1934,20 @@ class FieldEditorWidget(QWidget):
         df = self._manager.tables.get(self._table_name)
         if df is None or self._row_idx not in df.index:
             return
+        try:
+            row_pos = df.index.get_loc(self._row_idx)
+        except KeyError:
+            return
         for col, sug in self._array_sug.items():
-            ctx_col = sug["ctx"]
-            ctx_val = str(df.at[self._row_idx, ctx_col]) \
-                if ctx_col in df.columns else ""
-            if self._array_sug_ctx.get(col) == ctx_val:
+            ctx_cols = sug["ctx"]        # list（母表欄位＝同列鄰欄，無 master.X）
+            # 目前這列各來源欄位的值做 signature，沒變就跳過重建
+            sig = tuple(str(df.at[self._row_idx, c]) if c in df.columns else ""
+                        for c in ctx_cols)
+            if self._array_sug_ctx.get(col) == sig:
                 continue
-            self._array_sug_ctx[col] = ctx_val
+            self._array_sug_ctx[col] = sig
+            mask, label = _context_mask(self._manager, "", df, ctx_cols,
+                                        df, row_pos)
             flow = sug["flow"]
             while flow.count():
                 it = flow.takeAt(0)
@@ -1855,12 +1955,12 @@ class FieldEditorWidget(QWidget):
                 if w is not None:
                     w.hide()
                     w.deleteLater()
-            toks = _get_array_suggestions(df, col, ctx_col, ctx_val)
+            toks = (_get_array_suggestions(df, col, None, None, mask=mask)
+                    if mask is not None else [])
             for tok in toks:
                 flow.addWidget(_suggest_chip_btn(tok, sug["chips"].add_token))
             sug["cap"].setText(
-                f"建議值（點一下加入）　來源：{ctx_col}＝{ctx_val} 的既有資料"
-                if toks else "")
+                f"建議值（點一下加入）　來源：{label} 的既有資料" if toks else "")
             sug["scroll"].setVisible(bool(toks))
             sug["cap"].setVisible(bool(toks))
             sug["box"].updateGeometry()
@@ -1985,14 +2085,13 @@ class SubTablePanel(QWidget):
                              self._manager.sub_tables.get(sheet))
                 self._view.setItemDelegateForColumn(c, ArrayDelegate(
                     self._view, df_provider=df_getter, this_col=col,
-                    context_col=col_conf.get("suggest_from", ""),
+                    context_cols=_suggest_sources(col_conf),
                     manager=self._manager, sheet=self._sheet))
-            elif col_conf.get("suggest_from"):
-                ctx = col_conf["suggest_from"]
+            elif _suggest_sources(col_conf):
                 df_getter = (lambda sheet=self._sheet:
                              self._manager.sub_tables.get(sheet))
                 self._view.setItemDelegateForColumn(c, SuggestDelegate(
-                    df_getter, col, ctx, self._view,
+                    df_getter, col, _suggest_sources(col_conf), self._view,
                     manager=self._manager, sheet=self._sheet
                 ))
 
@@ -6324,24 +6423,18 @@ class App(QMainWindow):
             note_edit.setPlaceholderText("欄位備註（可換行；滑鼠停留欄位標題時顯示）")
             note_edit.setPlainText(cfg_cols.get(col, {}).get("note", ""))
 
-            suggest_combo = _NoscrollCombo()
-            _sg_tip = "依此鄰欄的值過濾建議清單（空白為不啟用）"
-            if master_cols:
-                _sg_tip += "；選「母表：」欄位＝依這筆子表對應的父列取該欄值過濾"
-            suggest_combo.setToolTip(_sg_tip)
-            suggest_combo.setMaximumWidth(130)
-            suggest_combo.addItem("(無建議)", "")
+            # 建議來源（可多個，AND 過濾）：一個來源一列的多選編輯器
+            _sug_options = [("(選擇欄位…)", "")]
             if df_source is not None:
                 for sc in df_source.columns:
                     if str(sc) != col:
-                        suggest_combo.addItem(str(sc), str(sc))
+                        _sug_options.append((str(sc), str(sc)))
             if master_cols:
-                suggest_combo.insertSeparator(suggest_combo.count())
+                _sug_options.append(("──", None))   # 分隔線
                 for mc in master_cols:
-                    suggest_combo.addItem(f"母表：{mc}", f"master.{mc}")
-            cur_sg = cfg_cols.get(col, {}).get("suggest_from", "")
-            ix = suggest_combo.findData(cur_sg) if cur_sg else 0
-            suggest_combo.setCurrentIndex(max(ix, 0))
+                    _sug_options.append((f"母表：{mc}", f"master.{mc}"))
+            suggest_combo = _SuggestSourcesEditor(
+                _sug_options, _suggest_sources(cfg_cols.get(col, {})))
 
             def _labeled(label_text, *widgets, stretch_idx=None):
                 row = QWidget(); row.setStyleSheet("background:transparent;")
@@ -6357,7 +6450,7 @@ class App(QMainWindow):
 
             _rwv.addWidget(_labeled("型別", cb, opts_btn))
             _rwv.addWidget(_labeled("備註", note_edit, stretch_idx=0))
-            _rwv.addWidget(_labeled("建議來源", suggest_combo))
+            _rwv.addWidget(_labeled("建議來源", suggest_combo, stretch_idx=0))
 
             # per-column external text-ref source (only shown when type == text_ref)
             _tref = cfg_cols.get(col, {}).get("text_ref", {}) or {}
@@ -6656,16 +6749,21 @@ class App(QMainWindow):
 
         cfg.pop("text_ref_source", None)  # legacy table-level key removed (now per-column)
 
-        def _build_col_entry(t, opts_store, note="", suggest_from="", tref=None):
+        def _build_col_entry(t, opts_store, note="", suggest_from=None, tref=None):
             entry = {"type": t}
             if t == "enum" and opts_store[0]:
                 entry["options"] = opts_store[0]
             note = (note or "").strip()
             if note:
                 entry["note"] = note
-            sg = (suggest_from or "").strip()
-            if sg:
-                entry["suggest_from"] = sg
+            # 建議來源：單一存字串（相容舊格式），多個存陣列
+            srcs = suggest_from if isinstance(suggest_from, list) else (
+                [suggest_from] if str(suggest_from or "").strip() else [])
+            srcs = [s for s in srcs if s]
+            if len(srcs) == 1:
+                entry["suggest_from"] = srcs[0]
+            elif srcs:
+                entry["suggest_from"] = srcs
             if t == "text_ref" and tref is not None:
                 path = tref[0].text().strip()
                 if path:
@@ -6680,7 +6778,7 @@ class App(QMainWindow):
         for col, (cb, opts_store, note_edit, suggest_combo, tref) in main_col_widgets.items():
             cfg["columns"][col] = _build_col_entry(
                 cb.currentText(), opts_store, note_edit.toPlainText(),
-                suggest_combo.currentData(), tref
+                suggest_combo.value(), tref
             )
 
         cfg.setdefault("sub_tables", {})
@@ -6698,7 +6796,7 @@ class App(QMainWindow):
             for scol, (scb, opts_store, note_edit, suggest_combo, tref) in data["col_combos"].items():
                 st["columns"][scol] = _build_col_entry(
                     scb.currentText(), opts_store, note_edit.toPlainText(),
-                    suggest_combo.currentData(), tref
+                    suggest_combo.value(), tref
                 )
 
         self.manager.config[table_name] = cfg
