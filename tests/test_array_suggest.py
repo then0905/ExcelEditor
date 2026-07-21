@@ -121,9 +121,45 @@ def test_master_field_editor_suggestions():
     print("  PASS  test_master_field_editor_suggestions")
 
 
+def test_master_column_suggestions():
+    """子表欄位以 'master.<col>' 當建議來源：依父列的母表欄值過濾自身建議。"""
+    mgr = make_manager()
+    sub_cols = mgr.config["SkillData"]["sub_tables"]["Operation"]["columns"]
+    sub_cols["InfluenceStatus"]["suggest_from"] = "master.Type"
+    sheet = "SkillData.Operation"
+    sdf = mgr.sub_tables[sheet]
+
+    fk, pk2v = M._master_ctx(mgr, sheet, "master.Type")
+    assert pk2v == {"S1": "Active", "S2": "Active", "S3": "Passive"}, pk2v
+
+    pos = {str(sdf.iloc[i][fk]): i for i in range(len(sdf))}
+    # 編輯父為 Active 的子表列 → 建議＝所有 Active 父列的 InfluenceStatus token
+    ctx, series = M._resolve_row_context(mgr, sheet, sdf, "master.Type", sdf, pos["S1"])
+    assert ctx == "Active", ctx
+    out = M._get_array_suggestions(sdf, "InfluenceStatus", "master.Type", ctx,
+                                   context_series=series)
+    assert out == ["ATK", "DEF", "SPD"], out
+    # 編輯父為 Passive 的列 → 只剩 HP
+    ctx2, series2 = M._resolve_row_context(mgr, sheet, sdf, "master.Type", sdf, pos["S3"])
+    assert ctx2 == "Passive", ctx2
+    out2 = M._get_array_suggestions(sdf, "InfluenceStatus", "master.Type", ctx2,
+                                    context_series=series2)
+    assert out2 == ["HP"], out2
+    # delegate 有帶 manager/sheet（才能解析 master.）
+    panel = M.SubTablePanel(sheet, sub_cols, mgr)
+    panel.reload(sdf, sub_cols)
+    c = list(sdf.columns).index("InfluenceStatus")
+    d = panel._view.itemDelegateForColumn(c)
+    assert d._manager is mgr and d._sheet == sheet
+    # 找不到的 master 欄 → graceful
+    assert M._master_ctx(mgr, sheet, "master.Nope") == (None, None)
+    print("  PASS  test_master_column_suggestions")
+
+
 if __name__ == "__main__":
     tests = (test_get_array_suggestions, test_dialog_suggestion_block,
-             test_delegate_wiring, test_master_field_editor_suggestions)
+             test_delegate_wiring, test_master_field_editor_suggestions,
+             test_master_column_suggestions)
     failed = 0
     for fn in tests:
         try:

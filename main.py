@@ -931,12 +931,57 @@ class EnumDelegate(QStyledItemDelegate):
 
 # ── Suggest field: context-filtered autocomplete ──────────────────────────────
 
-def _get_suggestions(df, this_col, context_col, context_value):
+def _master_ctx(manager, sheet_full, context_col):
+    """When a sub-table column's suggest_from is 'master.<col>', return
+    (fk_col, {master_pk_value: master_col_value}) so the sub rows can be joined
+    back to a master column. Returns (None, None) when not a master ref or when
+    the referenced master column / keys can't be resolved."""
+    if not str(context_col or "").startswith("master.") or "." not in (sheet_full or ""):
+        return None, None
+    mcol = context_col[len("master."):]
+    master_table, sub_name = sheet_full.split(".", 1)
+    mdf = manager.tables.get(master_table)
+    mcfg = manager.config.get(master_table, {})
+    pk = mcfg.get("primary_key", "")
+    fk = (mcfg.get("sub_tables", {}).get(sub_name, {}) or {}).get("foreign_key") or pk
+    if mdf is None or not pk or pk not in mdf.columns or mcol not in mdf.columns:
+        return None, None
+    return fk, dict(zip(mdf[pk].astype(str), mdf[mcol].astype(str)))
+
+
+def _resolve_row_context(manager, sheet, df, context_col, row_df, row):
+    """Compute the context filter for the currently-edited sub-table cell.
+    Returns (context_value_for_this_row, context_series_or_None). A 'master.<col>'
+    suggest_from joins the sub FK to that master column; a plain name reads the
+    sibling column on the same sub row (original behaviour)."""
+    if manager is not None and str(context_col or "").startswith("master."):
+        fk, pk_to_val = _master_ctx(manager, sheet, context_col)
+        if pk_to_val is not None:
+            try:
+                fk_val = str(row_df.iloc[row][fk])
+            except Exception:
+                fk_val = ""
+            series = (df[fk].astype(str).map(pk_to_val)
+                      if df is not None and fk in df.columns else None)
+            return pk_to_val.get(fk_val, ""), series
+        return "", None
+    try:
+        return str(row_df.iloc[row][context_col]), None
+    except Exception:
+        return "", None
+
+
+def _get_suggestions(df, this_col, context_col, context_value, context_series=None):
     """Sorted, deduped previously-used values of `this_col` from `df`,
-       filtered by `df[context_col] == context_value` when context_col is set."""
+       filtered by `df[context_col] == context_value` when context_col is set.
+       `context_series` (per-row values aligned to df) overrides context_col —
+       used when the filter comes from a master column (see _master_ctx)."""
     if df is None or this_col not in df.columns:
         return []
-    if context_col and context_col in df.columns:
+    if context_series is not None:
+        mask = context_series.astype(str) == str(context_value)
+        vals = df.loc[mask, this_col]
+    elif context_col and context_col in df.columns:
         mask = df[context_col].astype(str) == str(context_value)
         vals = df.loc[mask, this_col]
     else:
@@ -949,11 +994,13 @@ def _get_suggestions(df, this_col, context_col, context_value):
     return sorted(out)
 
 
-def _get_array_suggestions(df, this_col, context_col, context_value, limit=60):
+def _get_array_suggestions(df, this_col, context_col, context_value, limit=60,
+                           context_series=None):
     """Array 欄位的建議「元素」：把既有資料的逗號字串拆成單一 token 去重，
     有 context_col（建議來源）時只看同 context 值的列。"""
     seen, out = set(), []
-    for cell in _get_suggestions(df, this_col, context_col, context_value):
+    for cell in _get_suggestions(df, this_col, context_col, context_value,
+                                 context_series=context_series):
         for tok in str(cell).split(","):
             tok = tok.strip()
             if tok and tok not in seen:
@@ -994,20 +1041,22 @@ class _SuggestLineEdit(QLineEdit):
 class SuggestDelegate(QStyledItemDelegate):
     """Sub-table cell editor: line edit + popup of previously-used values,
        filtered by a sibling 'context' column on the same row."""
-    def __init__(self, df_provider, this_col, context_col, parent=None):
+    def __init__(self, df_provider, this_col, context_col, parent=None,
+                 manager=None, sheet=""):
         super().__init__(parent)
         self._df_provider  = df_provider
         self._this_col     = this_col
         self._context_col  = context_col
+        self._manager      = manager
+        self._sheet        = sheet
 
     def createEditor(self, parent, option, index):
         df = self._df_provider()
-        ctx_val = ""
-        try:
-            ctx_val = str(index.model()._df.iloc[index.row()][self._context_col])
-        except Exception:
-            ctx_val = ""
-        items = _get_suggestions(df, self._this_col, self._context_col, ctx_val)
+        ctx_val, ctx_series = _resolve_row_context(
+            self._manager, self._sheet, df, self._context_col,
+            index.model()._df, index.row())
+        items = _get_suggestions(df, self._this_col, self._context_col, ctx_val,
+                                 context_series=ctx_series)
         editor = _SuggestLineEdit(parent)
         m = QStringListModel(items, editor)
         compl = QCompleter(m, editor)
@@ -1332,22 +1381,26 @@ class ArrayDelegate(QStyledItemDelegate):
     """Sub-table array cell — double-click opens the chips editor dialog.
     欄位設有建議來源（suggest_from）時，彈窗附建議值快速選填區。"""
 
-    def __init__(self, parent=None, df_provider=None, this_col="", context_col=""):
+    def __init__(self, parent=None, df_provider=None, this_col="", context_col="",
+                 manager=None, sheet=""):
         super().__init__(parent)
         self._df_provider = df_provider
         self._this_col    = this_col
         self._context_col = context_col
+        self._manager     = manager
+        self._sheet       = sheet
 
     def createEditor(self, parent, option, index):
         cur = index.data(Qt.DisplayRole) or ""
         suggestions, note = [], ""
         if self._df_provider is not None and self._this_col and self._context_col:
-            try:
-                ctx_val = str(index.model()._df.iloc[index.row()][self._context_col])
-            except Exception:
-                ctx_val = ""
+            df = self._df_provider()
+            ctx_val, ctx_series = _resolve_row_context(
+                self._manager, self._sheet, df, self._context_col,
+                index.model()._df, index.row())
             suggestions = _get_array_suggestions(
-                self._df_provider(), self._this_col, self._context_col, ctx_val)
+                df, self._this_col, self._context_col, ctx_val,
+                context_series=ctx_series)
             note = f"來源：{self._context_col}＝{ctx_val} 的既有資料"
         dlg = ArrayEditDialog(cur, parent, suggestions=suggestions, source_note=note)
         if dlg.exec() == QDialog.Accepted:
@@ -1932,13 +1985,15 @@ class SubTablePanel(QWidget):
                              self._manager.sub_tables.get(sheet))
                 self._view.setItemDelegateForColumn(c, ArrayDelegate(
                     self._view, df_provider=df_getter, this_col=col,
-                    context_col=col_conf.get("suggest_from", "")))
+                    context_col=col_conf.get("suggest_from", ""),
+                    manager=self._manager, sheet=self._sheet))
             elif col_conf.get("suggest_from"):
                 ctx = col_conf["suggest_from"]
                 df_getter = (lambda sheet=self._sheet:
                              self._manager.sub_tables.get(sheet))
                 self._view.setItemDelegateForColumn(c, SuggestDelegate(
-                    df_getter, col, ctx, self._view
+                    df_getter, col, ctx, self._view,
+                    manager=self._manager, sheet=self._sheet
                 ))
 
     def set_validation_cb(self, cb):
@@ -6236,8 +6291,10 @@ class App(QMainWindow):
             btn.clicked.connect(_open)
             return btn, opts_store
 
-        def _col_row(col, cfg_cols, parent_dlg, df_source=None):
-            """Return (row_widget, combo, opts_store, note_edit) for one column."""
+        def _col_row(col, cfg_cols, parent_dlg, df_source=None, master_cols=None):
+            """Return (row_widget, combo, opts_store, note_edit) for one column.
+            master_cols (sub-table columns only): master column names offered as
+            'master.<col>' entries in the suggest-source combo."""
             rw  = QFrame(); rw.setObjectName("colCard")
             rw.setStyleSheet(
                 f"QFrame#colCard {{ background:{_C['card']}; "
@@ -6268,13 +6325,20 @@ class App(QMainWindow):
             note_edit.setPlainText(cfg_cols.get(col, {}).get("note", ""))
 
             suggest_combo = _NoscrollCombo()
-            suggest_combo.setToolTip("依此鄰欄的值過濾建議清單（空白為不啟用）")
+            _sg_tip = "依此鄰欄的值過濾建議清單（空白為不啟用）"
+            if master_cols:
+                _sg_tip += "；選「母表：」欄位＝依這筆子表對應的父列取該欄值過濾"
+            suggest_combo.setToolTip(_sg_tip)
             suggest_combo.setMaximumWidth(130)
             suggest_combo.addItem("(無建議)", "")
             if df_source is not None:
                 for sc in df_source.columns:
                     if str(sc) != col:
                         suggest_combo.addItem(str(sc), str(sc))
+            if master_cols:
+                suggest_combo.insertSeparator(suggest_combo.count())
+                for mc in master_cols:
+                    suggest_combo.addItem(f"母表：{mc}", f"master.{mc}")
             cur_sg = cfg_cols.get(col, {}).get("suggest_from", "")
             ix = suggest_combo.findData(cur_sg) if cur_sg else 0
             suggest_combo.setCurrentIndex(max(ix, 0))
@@ -6536,7 +6600,7 @@ class App(QMainWindow):
 
                 col_combos: dict[str, tuple] = {}
                 for scol in list(sub_df.columns):
-                    rw, cb, opts_store, note_edit, suggest_combo, tref = _col_row(scol, sub_cols_cfg, dlg, df_source=sub_df)
+                    rw, cb, opts_store, note_edit, suggest_combo, tref = _col_row(scol, sub_cols_cfg, dlg, df_source=sub_df, master_cols=list(df.columns))
                     vlo.addWidget(rw)
                     col_combos[scol] = (cb, opts_store, note_edit, suggest_combo, tref)
 
