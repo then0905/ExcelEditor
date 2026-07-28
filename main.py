@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QInputDialog, QMessageBox, QStyledItemDelegate, QStyle,
     QAbstractItemDelegate,
     QDialog, QDialogButtonBox, QFormLayout, QLayout, QCompleter,
-    QTableWidget, QTableWidgetItem, QPlainTextEdit,
+    QTableWidget, QTableWidgetItem, QTableWidgetSelectionRange, QPlainTextEdit,
     QColorDialog, QSpinBox, QRadioButton, QButtonGroup, QToolButton,
     QListView, QGridLayout,
 )
@@ -4028,8 +4028,16 @@ class NotePage(QWidget):
                             ("＋ 欄", self._add_col), ("－ 欄", self._del_col)):
                 b = _mk_btn(txt, "ghost"); b.setFixedHeight(26); b.clicked.connect(fn)
                 bar.addWidget(b)
+            bar.addSpacing(10)
+            for txt, fn, tp in (("▲", self._move_row_up,   "上移選取的列 (Alt+↑)"),
+                                ("▼", self._move_row_down, "下移選取的列 (Alt+↓)"),
+                                ("◀", self._move_col_left, "左移選取的欄 (Alt+←)"),
+                                ("▶", self._move_col_right, "右移選取的欄 (Alt+→)")):
+                b = _mk_btn(txt, "ghost"); b.setFixedSize(30, 26)
+                b.setToolTip(tp); b.clicked.connect(fn)
+                bar.addWidget(b)
             bar.addStretch(1)
-            tip = QLabel("雙擊儲存格編輯；雙擊欄標題改名；可從 Excel 複製範圍 Ctrl+V 貼上")
+            tip = QLabel("雙擊編輯／改欄名　Ctrl+C·X·V 複製剪下貼上　Alt+方向鍵移動列欄　右鍵更多")
             tip.setStyleSheet(f"color:{_C['txt3']}; font-size:10px; background:transparent;")
             bar.addWidget(tip)
             v.addLayout(bar)
@@ -4051,7 +4059,15 @@ class NotePage(QWidget):
             self._tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
             self._tbl.horizontalHeader().setStretchLastSection(True)
             self._tbl.setSelectionMode(QAbstractItemView.ExtendedSelection)
-            self._tbl.keyPressEvent = self._table_key   # Excel-style copy/paste
+            self._tbl.keyPressEvent = self._table_key   # Excel-style copy/paste/move
+            self._tbl.setContextMenuPolicy(Qt.CustomContextMenu)
+            self._tbl.customContextMenuRequested.connect(self._table_menu)
+            hh = self._tbl.horizontalHeader()
+            hh.setContextMenuPolicy(Qt.CustomContextMenu)
+            hh.customContextMenuRequested.connect(self._hheader_menu)
+            vh = self._tbl.verticalHeader()
+            vh.setContextMenuPolicy(Qt.CustomContextMenu)
+            vh.customContextMenuRequested.connect(self._vheader_menu)
             v.addWidget(self._tbl, 1)
             # connect AFTER populating so initial fill doesn't mark dirty
             self._tbl.itemChanged.connect(lambda *_: self.changed.emit())
@@ -4104,6 +4120,13 @@ class NotePage(QWidget):
             self._paste_clipboard()
         elif event.matches(QKeySequence.Copy):
             self._copy_selection()
+        elif event.matches(QKeySequence.Cut):
+            self._cut_selection()
+        elif event.modifiers() == Qt.AltModifier and event.key() in (
+                Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right):
+            {Qt.Key_Up: self._move_row_up, Qt.Key_Down: self._move_row_down,
+             Qt.Key_Left: self._move_col_left,
+             Qt.Key_Right: self._move_col_right}[event.key()]()
         else:
             QTableWidget.keyPressEvent(self._tbl, event)
 
@@ -4148,6 +4171,178 @@ class NotePage(QWidget):
                 cells.append(it.text() if it else "")
             lines.append("\t".join(cells))
         QApplication.clipboard().setText("\n".join(lines))
+
+    def _cut_selection(self):
+        """Copy the selection out (Excel TSV) then blank the selected cells."""
+        self._copy_selection()
+        self._clear_selection()
+
+    def _clear_selection(self):
+        """Blank every selected cell; structure (rows/cols) untouched."""
+        ranges = self._tbl.selectedRanges()
+        if not ranges:
+            return
+        self._tbl.blockSignals(True)
+        for rng in ranges:
+            for r in range(rng.topRow(), rng.bottomRow() + 1):
+                for c in range(rng.leftColumn(), rng.rightColumn() + 1):
+                    it = self._tbl.item(r, c)
+                    if it is not None:
+                        it.setText("")
+        self._tbl.blockSignals(False)
+        self.changed.emit()
+
+    def _copy_whole_col(self, col):
+        """Copy one whole column as newline-separated values (a column in Excel)."""
+        lines = [(self._tbl.item(r, col).text() if self._tbl.item(r, col) else "")
+                 for r in range(self._tbl.rowCount())]
+        QApplication.clipboard().setText("\n".join(lines))
+
+    def _copy_whole_row(self, row):
+        """Copy one whole row as tab-separated values (a row in Excel)."""
+        cells = [(self._tbl.item(row, c).text() if self._tbl.item(row, c) else "")
+                 for c in range(self._tbl.columnCount())]
+        QApplication.clipboard().setText("\t".join(cells))
+
+    # ── row / column reordering ──
+    def _sel_rows(self):
+        """Sorted row indices spanned by the selection (current row as fallback)."""
+        rows = set()
+        for rng in self._tbl.selectedRanges():
+            rows.update(range(rng.topRow(), rng.bottomRow() + 1))
+        if not rows and self._tbl.currentRow() >= 0:
+            rows.add(self._tbl.currentRow())
+        return sorted(rows)
+
+    def _sel_cols(self):
+        """Sorted column indices spanned by the selection (current col fallback)."""
+        cols = set()
+        for rng in self._tbl.selectedRanges():
+            cols.update(range(rng.leftColumn(), rng.rightColumn() + 1))
+        if not cols and self._tbl.currentColumn() >= 0:
+            cols.add(self._tbl.currentColumn())
+        return sorted(cols)
+
+    def _move_row_up(self):    self._move_rows(-1)
+    def _move_row_down(self):  self._move_rows(1)
+    def _move_col_left(self):  self._move_cols(-1)
+    def _move_col_right(self): self._move_cols(1)
+
+    def _move_rows(self, delta):
+        """Move the selected row block (min..max of the selection) up/down by one,
+        carrying each row's whole set of cells; the block stays selected."""
+        rows = self._sel_rows()
+        if not rows:
+            return
+        top, bottom = rows[0], rows[-1]
+        ncols = self._tbl.columnCount()
+        if delta < 0:
+            if top <= 0:
+                return
+            src, dst = top - 1, bottom       # displaced row lands just below block
+        else:
+            if bottom >= self._tbl.rowCount() - 1:
+                return
+            src, dst = bottom + 1, top        # displaced row lands just above block
+        self._tbl.blockSignals(True)
+        items = [self._tbl.takeItem(src, c) for c in range(ncols)]
+        self._tbl.removeRow(src)
+        self._tbl.insertRow(dst)
+        for c, it in enumerate(items):
+            if it is not None:
+                self._tbl.setItem(dst, c, it)
+        self._tbl.blockSignals(False)
+        self._select_row_range(top + delta, bottom + delta)
+        self.changed.emit()
+
+    def _move_cols(self, delta):
+        """Move the selected column block left/right by one, carrying header +
+        cells; the block stays selected."""
+        cols = self._sel_cols()
+        if not cols:
+            return
+        left, right = cols[0], cols[-1]
+        nrows = self._tbl.rowCount()
+        if delta < 0:
+            if left <= 0:
+                return
+            src, dst = left - 1, right
+        else:
+            if right >= self._tbl.columnCount() - 1:
+                return
+            src, dst = right + 1, left
+        self._tbl.blockSignals(True)
+        hdr = self._tbl.takeHorizontalHeaderItem(src)
+        items = [self._tbl.takeItem(r, src) for r in range(nrows)]
+        self._tbl.removeColumn(src)
+        self._tbl.insertColumn(dst)
+        self._tbl.setHorizontalHeaderItem(
+            dst, hdr if hdr is not None else QTableWidgetItem(f"欄{dst + 1}"))
+        for r, it in enumerate(items):
+            if it is not None:
+                self._tbl.setItem(r, dst, it)
+        self._tbl.blockSignals(False)
+        self._select_col_range(left + delta, right + delta)
+        self.changed.emit()
+
+    def _select_row_range(self, top, bottom):
+        ncols = self._tbl.columnCount()
+        self._tbl.setCurrentCell(top, 0)
+        self._tbl.clearSelection()
+        if ncols > 0:
+            self._tbl.setRangeSelected(
+                QTableWidgetSelectionRange(top, 0, bottom, ncols - 1), True)
+
+    def _select_col_range(self, left, right):
+        nrows = self._tbl.rowCount()
+        self._tbl.setCurrentCell(0, left)
+        self._tbl.clearSelection()
+        if nrows > 0:
+            self._tbl.setRangeSelected(
+                QTableWidgetSelectionRange(0, left, nrows - 1, right), True)
+
+    # ── context menus ──
+    def _table_menu(self, pos):
+        m = QMenu(self)
+        m.addAction("複製\tCtrl+C", self._copy_selection)
+        m.addAction("剪下\tCtrl+X", self._cut_selection)
+        m.addAction("貼上\tCtrl+V", self._paste_clipboard)
+        m.addAction("清除內容", self._clear_selection)
+        m.addSeparator()
+        m.addAction("上移列\tAlt+↑", self._move_row_up)
+        m.addAction("下移列\tAlt+↓", self._move_row_down)
+        m.addSeparator()
+        m.addAction("左移欄\tAlt+←", self._move_col_left)
+        m.addAction("右移欄\tAlt+→", self._move_col_right)
+        m.exec(self._tbl.viewport().mapToGlobal(pos))
+
+    def _hheader_menu(self, pos):
+        col = self._tbl.horizontalHeader().logicalIndexAt(pos)
+        if col < 0:
+            return
+        if col not in self._sel_cols():
+            self._tbl.selectColumn(col)
+        m = QMenu(self)
+        m.addAction("複製整欄", lambda: self._copy_whole_col(col))
+        m.addSeparator()
+        m.addAction("左移欄\tAlt+←", self._move_col_left)
+        m.addAction("右移欄\tAlt+→", self._move_col_right)
+        m.addSeparator()
+        m.addAction("改名…", lambda: self._rename_col(col))
+        m.exec(self._tbl.horizontalHeader().mapToGlobal(pos))
+
+    def _vheader_menu(self, pos):
+        row = self._tbl.verticalHeader().logicalIndexAt(pos)
+        if row < 0:
+            return
+        if row not in self._sel_rows():
+            self._tbl.selectRow(row)
+        m = QMenu(self)
+        m.addAction("複製整列", lambda: self._copy_whole_row(row))
+        m.addSeparator()
+        m.addAction("上移列\tAlt+↑", self._move_row_up)
+        m.addAction("下移列\tAlt+↓", self._move_row_down)
+        m.exec(self._tbl.verticalHeader().mapToGlobal(pos))
 
     # ── group (inner sub-tab) operations ──
     def _add_child_page(self, child):
