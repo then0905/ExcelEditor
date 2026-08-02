@@ -27,7 +27,7 @@ from PySide6.QtGui import (
     QIcon, QPixmap, QFontDatabase, QCursor,
 )
 
-from json_data_manager import JsonDataManager
+from json_data_manager import JsonDataManager, new_row_defaults
 from validation import (new_rule as _v_new_rule, normalize_rule as _v_norm,
                         OPS as _V_OPS, OP_LABELS as _V_OP_LABELS,
                         COUNT_OP_LABELS as _V_COUNT_OPS,
@@ -2906,7 +2906,7 @@ class TableEditor(QWidget):
         name = name.strip()
         if name in self.df[self.cls_key].values:
             QMessageBox.warning(self, "錯誤", "此分類已存在"); return
-        new_row = {col: "" for col in self.df.columns}
+        new_row = new_row_defaults(self.df.columns, self.cfg.get("columns", {}))
         new_row[self.cls_key] = name
         if self.pk_key in self.df.columns and self.pk_key != self.cls_key:
             new_id, ok2 = QInputDialog.getText(self, "新增分類", f"首筆資料的 {self.pk_key}:")
@@ -3015,7 +3015,7 @@ class TableEditor(QWidget):
         new_id = new_id.strip()
         if new_id in self.df[self.pk_key].astype(str).values:
             QMessageBox.warning(self, "錯誤", "此 ID 已存在"); return
-        new_row = {col: "" for col in self.df.columns}
+        new_row = new_row_defaults(self.df.columns, self.cfg.get("columns", {}))
         new_row[self.cls_key] = self.current_cls_val
         new_row[self.pk_key]  = new_id
         cls_rows     = self.df[self.df[self.cls_key] == self.current_cls_val]
@@ -3323,7 +3323,7 @@ class TableEditor(QWidget):
         if sub_df is None: return
         sub_cfg  = self.cfg.get("sub_tables", {}).get(tab_name, {})
         fk_key   = sub_cfg.get("foreign_key", self.pk_key)
-        new_row  = {col: "" for col in sub_df.columns}
+        new_row  = new_row_defaults(sub_df.columns, sub_cfg.get("columns", {}))
         new_row[fk_key] = self.current_master_pk
         siblings = sub_df[sub_df[fk_key].astype(str) == str(self.current_master_pk)]
         insert_at = siblings.index.max() + 1 if not siblings.empty else len(sub_df)

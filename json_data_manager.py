@@ -11,6 +11,27 @@ from field_binding import FieldBindingEngine
 warnings.filterwarnings("ignore")
 
 
+# 新增資料列時，依欄位型別給的初始值（DataFrame 內一律是字串）。
+# 沒列在這裡的型別（string / enum / text_ref / array）維持空白。
+TYPE_DEFAULTS = {"int": "0", "float": "0.0", "bool": "false"}
+
+
+def default_for_type(col_type):
+    """回傳該型別新增列時的初始字串；無預設值的型別回空字串。"""
+    return TYPE_DEFAULTS.get(col_type or "string", "")
+
+
+def new_row_defaults(columns, cols_cfg):
+    """依 config 的 columns 型別，產生一列新資料的初始值 dict。"""
+    cols_cfg = cols_cfg or {}
+    out = {}
+    for col in columns:
+        cc = cols_cfg.get(col)
+        cc = cc if isinstance(cc, dict) else {}
+        out[col] = default_for_type(cc.get("type", "string"))
+    return out
+
+
 class JsonDataManager:
     def __init__(self, config_path="config.json", shared=None):
         # `shared` lets several managers (one per open file, for multi-document
